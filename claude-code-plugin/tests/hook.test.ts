@@ -204,6 +204,125 @@ describe("handleHook: stop", () => {
       await fs.unlink(tmp);
     }
   });
+
+  it("only sends new turns on the second Stop (cursor incremental capture)", async () => {
+    // Two-turn transcript, fire Stop once. Then append a third turn and fire
+    // Stop again. The second call must POST only the new turn — without the
+    // cursor a long session would re-write every turn on each Stop.
+    const captureTurn = vi.fn(async () => null);
+    const client = makeFakeClient({
+      captureTurn,
+    } as Partial<GatewayClient>);
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    const os = await import("node:os");
+    const tmp = path.join(os.tmpdir(), `tx-cursor-${Date.now()}.jsonl`);
+    const lines = [
+      '{"type":"user","message":{"role":"user","content":"q1"},"uuid":"u1"}',
+      '{"type":"assistant","message":{"role":"assistant","content":"a1"},"uuid":"a1"}',
+      '{"type":"user","message":{"role":"user","content":"q2"},"uuid":"u2"}',
+      '{"type":"assistant","message":{"role":"assistant","content":"a2"},"uuid":"a2"}',
+    ];
+    await fs.writeFile(tmp, lines.join("\n"));
+    try {
+      const stdin = JSON.stringify({
+        session_id: "cursor-test",
+        transcript_path: tmp,
+        cwd: "/tmp/proj",
+        stop_hook_active: false,
+      });
+      await handleHook("stop", { stdin, client });
+      expect(captureTurn).toHaveBeenCalledTimes(1);
+      const first = captureTurn.mock.calls[0][0];
+      expect(first.messages).toHaveLength(4); // 2 turns × (user + assistant)
+
+      // Append a third turn and fire Stop again.
+      await fs.appendFile(
+        tmp,
+        "\n" +
+          [
+            '{"type":"user","message":{"role":"user","content":"q3"},"uuid":"u3"}',
+            '{"type":"assistant","message":{"role":"assistant","content":"a3"},"uuid":"a3"}',
+          ].join("\n"),
+      );
+      await handleHook("stop", { stdin, client });
+      expect(captureTurn).toHaveBeenCalledTimes(2);
+      const second = captureTurn.mock.calls[1][0];
+      // Cursor should have skipped the first 2 turns — only q3/a3 sent.
+      expect(second.messages).toHaveLength(2);
+      expect(second.user_content).toBe("q3");
+      expect(second.assistant_content).toBe("a3");
+    } finally {
+      await fs.unlink(tmp);
+    }
+  });
+
+  it("skips captureTurn when no new turns since last cursor", async () => {
+    const captureTurn = vi.fn(async () => null);
+    const client = makeFakeClient({
+      captureTurn,
+    } as Partial<GatewayClient>);
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    const os = await import("node:os");
+    const tmp = path.join(os.tmpdir(), `tx-nochange-${Date.now()}.jsonl`);
+    await fs.writeFile(
+      tmp,
+      [
+        '{"type":"user","message":{"role":"user","content":"q"},"uuid":"u"}',
+        '{"type":"assistant","message":{"role":"assistant","content":"a"},"uuid":"a"}',
+      ].join("\n"),
+    );
+    try {
+      const stdin = JSON.stringify({
+        session_id: "nochange-test",
+        transcript_path: tmp,
+        cwd: "/tmp/proj",
+        stop_hook_active: false,
+      });
+      await handleHook("stop", { stdin, client });
+      await handleHook("stop", { stdin, client });
+      // Second Stop sees the same transcript → cursor already at end → no call.
+      expect(captureTurn).toHaveBeenCalledTimes(1);
+    } finally {
+      await fs.unlink(tmp);
+    }
+  });
+
+  it("caps first capture at MAX_CAPTURE_TURNS (50) when transcript is long", async () => {
+    const captureTurn = vi.fn(async () => null);
+    const client = makeFakeClient({
+      captureTurn,
+    } as Partial<GatewayClient>);
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    const os = await import("node:os");
+    const tmp = path.join(os.tmpdir(), `tx-cap-${Date.now()}.jsonl`);
+    const lines: string[] = [];
+    for (let i = 0; i < 60; i++) {
+      lines.push(`{"type":"user","message":{"role":"user","content":"q${i}"},"uuid":"u${i}"}`);
+      lines.push(`{"type":"assistant","message":{"role":"assistant","content":"a${i}"},"uuid":"a${i}"}`);
+    }
+    await fs.writeFile(tmp, lines.join("\n"));
+    try {
+      const stdin = JSON.stringify({
+        session_id: "cap-test",
+        transcript_path: tmp,
+        cwd: "/tmp/proj",
+        stop_hook_active: false,
+      });
+      await handleHook("stop", { stdin, client });
+      expect(captureTurn).toHaveBeenCalledTimes(1);
+      const call = captureTurn.mock.calls[0][0];
+      // Capped at 50 turns × (user + assistant) = 100 messages.
+      expect(call.messages).toHaveLength(100);
+      // Cap takes the LAST 50 turns; lastTurn is q59/a59.
+      expect(call.user_content).toBe("q59");
+      expect(call.assistant_content).toBe("a59");
+    } finally {
+      await fs.unlink(tmp);
+    }
+  });
 });
 
 describe("handleHook: post-tool-use", () => {

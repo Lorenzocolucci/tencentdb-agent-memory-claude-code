@@ -113,3 +113,37 @@ describe("DaemonManager probe", () => {
     expect(await mgr.probe()).toBe(false);
   });
 });
+
+describe("DaemonManager ensureRunning ccPid mismatch", () => {
+  // Confirms reuseExisting refuses a state.json whose ccPid differs from the
+  // caller's ccPid — guards against picking up a daemon spawned by a different
+  // cc instance on a shared box.
+  it("does NOT reuse a daemon recorded for a foreign ccPid", async () => {
+    const tokenPath = join(dataDir, "token");
+    await writeFile(tokenPath, "secret-foreign", { mode: 0o600 });
+    await writeDaemonState(dataDir, {
+      pid: 12345,
+      port: 18999, // nothing actually listening here
+      ccPid: 999_999, // some other cc
+      startedAt: "2026-05-15T10:00:00Z",
+      tokenPath,
+    });
+
+    const mgr = new DaemonManager({ dataDir, portStart: 18500, portEnd: 18510 });
+    // Stub spawn to a thin marker so we don't actually fork a daemon.
+    let spawnCalls = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mgr as any).spawn = async () => {
+      spawnCalls++;
+      return {
+        pid: 1,
+        port: 18500,
+        ccPid: process.pid,
+        startedAt: new Date().toISOString(),
+        tokenPath,
+      };
+    };
+    await mgr.ensureRunning(process.pid);
+    expect(spawnCalls).toBe(1);
+  });
+});

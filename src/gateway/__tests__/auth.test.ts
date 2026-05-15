@@ -6,10 +6,11 @@ async function request(
   port: number,
   path: string,
   headers: Record<string, string> = {},
-): Promise<{ status: number; body: string }> {
+  method = "GET",
+): Promise<{ status: number; body: string; wwwAuth: string | undefined }> {
   return new Promise((resolve, reject) => {
     const req = http.request(
-      { host: "127.0.0.1", port, path, method: "GET", headers },
+      { host: "127.0.0.1", port, path, method, headers },
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (c) => chunks.push(c));
@@ -17,6 +18,7 @@ async function request(
           resolve({
             status: res.statusCode ?? 0,
             body: Buffer.concat(chunks).toString("utf-8"),
+            wwwAuth: res.headers["www-authenticate"] as string | undefined,
           }),
         );
       },
@@ -66,6 +68,49 @@ describe("Gateway optional Bearer token", () => {
       Authorization: `Bearer ${TOKEN}`,
     });
     expect(res.status).toBe(200);
+  });
+
+  it("includes WWW-Authenticate header on 401 per RFC 6750 §3", async () => {
+    const res = await request(PORT, "/health");
+    expect(res.status).toBe(401);
+    expect(res.wwwAuth).toMatch(/^Bearer\s+realm=/);
+  });
+
+  it("accepts case-insensitive 'Bearer' scheme keyword per RFC 6750 §2.1", async () => {
+    for (const scheme of ["Bearer", "bearer", "BEARER", "BeArEr"]) {
+      const res = await request(PORT, "/health", {
+        Authorization: `${scheme} ${TOKEN}`,
+      });
+      expect(res.status, `scheme=${scheme}`).toBe(200);
+    }
+  });
+
+  it("rejects mangled Authorization headers", async () => {
+    const cases = [
+      `Basic ${TOKEN}`,
+      `Bearer`,
+      `Bearer `,
+      `Bearer  ${TOKEN}  extra`,
+      ``,
+      `Bearer ${TOKEN}x`,
+      `Bearer x${TOKEN}`,
+    ];
+    for (const h of cases) {
+      const res = await request(PORT, "/health", { Authorization: h });
+      expect(res.status, `auth=${JSON.stringify(h)}`).toBe(401);
+    }
+  });
+
+  it.each([
+    ["POST", "/recall"],
+    ["POST", "/capture"],
+    ["POST", "/search/memories"],
+    ["POST", "/search/conversations"],
+    ["POST", "/session/end"],
+    ["POST", "/seed"],
+  ])("enforces auth on %s %s (no token → 401)", async (method, path) => {
+    const res = await request(PORT, path, {}, method);
+    expect(res.status).toBe(401);
   });
 
   it("allows OPTIONS preflight without token (CORS)", async () => {
