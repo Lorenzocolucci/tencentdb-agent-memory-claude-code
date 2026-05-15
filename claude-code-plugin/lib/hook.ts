@@ -275,7 +275,11 @@ async function handleSearchStdin(rawStdin: string, client: GatewayClient): Promi
 
 async function handleStatus(client: GatewayClient): Promise<string> {
   const ok = await client.health();
-  return ok ? "TDAI memory daemon: healthy" : "TDAI memory daemon: unreachable";
+  const dataDir = resolveDataDir();
+  const hookLog = join(dataDir, "hook.log");
+  const daemonLog = join(dataDir, "daemon.log");
+  const header = ok ? "TDAI memory daemon: healthy" : "TDAI memory daemon: unreachable";
+  return `${header}\nhook log:   ${hookLog}\ndaemon log: ${daemonLog}`;
 }
 
 async function handleClearSession(data: HookStdin, client: GatewayClient): Promise<string> {
@@ -454,6 +458,7 @@ async function main(): Promise<void> {
       baseUrl: `http://127.0.0.1:${state.port}`,
       token,
       timeoutMs: event === "user-prompt-submit" ? 4_000 : 10_000,
+      logPath,
     });
 
     const out = await handleHook(event, { stdin, client, args });

@@ -1,16 +1,21 @@
 /**
  * HTTP client for the TDAI Gateway, with Bearer token authentication and
  * silent-failure semantics suitable for cc hook handlers (any error returns
- * an empty / no-op response rather than throwing).
+ * an empty / no-op response rather than throwing). Failures are also
+ * appended to an optional log file so the daemon's health can be diagnosed
+ * via /memory-status without re-attaching a debugger.
  */
 
 import http from "node:http";
+import { appendFile } from "node:fs/promises";
 import { URL } from "node:url";
 
 export interface GatewayClientConfig {
   baseUrl: string;
   token: string;
   timeoutMs?: number;
+  /** If set, every fallthrough error is appended here as one line. */
+  logPath?: string;
 }
 
 export interface RecallResult {
@@ -42,18 +47,40 @@ export class GatewayClient {
   private baseUrl: URL;
   private token: string;
   private timeoutMs: number;
+  private logPath?: string;
 
   constructor(config: GatewayClientConfig) {
     this.baseUrl = new URL(config.baseUrl);
     this.token = config.token;
     this.timeoutMs = config.timeoutMs ?? 5_000;
+    this.logPath = config.logPath;
+  }
+
+  private async logFailure(method: string, path: string, detail: string): Promise<void> {
+    if (!this.logPath) return;
+    try {
+      await appendFile(
+        this.logPath,
+        `[${new Date().toISOString()}] gateway-client ${method} ${path}: ${detail}\n`,
+      );
+    } catch {
+      // unable to log — nothing else we can do from a hook handler
+    }
+  }
+
+  private describeStatus(status: number, body: string): string {
+    const trimmed = body.length > 200 ? body.slice(0, 200) + "…" : body;
+    return `HTTP ${status} ${trimmed}`;
   }
 
   async health(): Promise<boolean> {
     try {
-      const { status } = await this.request("GET", "/health");
-      return status === 200;
-    } catch {
+      const { status, body } = await this.request("GET", "/health");
+      if (status === 200) return true;
+      await this.logFailure("GET", "/health", this.describeStatus(status, body));
+      return false;
+    } catch (err) {
+      await this.logFailure("GET", "/health", err instanceof Error ? err.message : String(err));
       return false;
     }
   }
@@ -64,14 +91,18 @@ export class GatewayClient {
         query,
         session_key: sessionKey,
       });
-      if (status !== 200) return { context: "" };
+      if (status !== 200) {
+        await this.logFailure("POST", "/recall", this.describeStatus(status, body));
+        return { context: "" };
+      }
       const parsed = JSON.parse(body) as RecallResult;
       return {
         context: parsed.context ?? "",
         strategy: parsed.strategy,
         memory_count: parsed.memory_count,
       };
-    } catch {
+    } catch (err) {
+      await this.logFailure("POST", "/recall", err instanceof Error ? err.message : String(err));
       return { context: "" };
     }
   }
@@ -79,9 +110,13 @@ export class GatewayClient {
   async captureTurn(payload: CaptureTurnPayload): Promise<CaptureTurnResult | null> {
     try {
       const { status, body } = await this.request("POST", "/capture", payload);
-      if (status !== 200) return null;
+      if (status !== 200) {
+        await this.logFailure("POST", "/capture", this.describeStatus(status, body));
+        return null;
+      }
       return JSON.parse(body) as CaptureTurnResult;
-    } catch {
+    } catch (err) {
+      await this.logFailure("POST", "/capture", err instanceof Error ? err.message : String(err));
       return null;
     }
   }
@@ -97,9 +132,13 @@ export class GatewayClient {
         type: opts?.type,
         scene: opts?.scene,
       });
-      if (status !== 200) return { results: "", total: 0 };
+      if (status !== 200) {
+        await this.logFailure("POST", "/search/memories", this.describeStatus(status, body));
+        return { results: "", total: 0 };
+      }
       return JSON.parse(body) as SearchResult;
-    } catch {
+    } catch (err) {
+      await this.logFailure("POST", "/search/memories", err instanceof Error ? err.message : String(err));
       return { results: "", total: 0 };
     }
   }
@@ -114,18 +153,25 @@ export class GatewayClient {
         limit: opts?.limit,
         session_key: opts?.sessionKey,
       });
-      if (status !== 200) return { results: "", total: 0 };
+      if (status !== 200) {
+        await this.logFailure("POST", "/search/conversations", this.describeStatus(status, body));
+        return { results: "", total: 0 };
+      }
       return JSON.parse(body) as SearchResult;
-    } catch {
+    } catch (err) {
+      await this.logFailure("POST", "/search/conversations", err instanceof Error ? err.message : String(err));
       return { results: "", total: 0 };
     }
   }
 
   async sessionEnd(sessionKey: string): Promise<void> {
     try {
-      await this.request("POST", "/session/end", { session_key: sessionKey });
-    } catch {
-      // silent
+      const { status, body } = await this.request("POST", "/session/end", { session_key: sessionKey });
+      if (status !== 200) {
+        await this.logFailure("POST", "/session/end", this.describeStatus(status, body));
+      }
+    } catch (err) {
+      await this.logFailure("POST", "/session/end", err instanceof Error ? err.message : String(err));
     }
   }
 
