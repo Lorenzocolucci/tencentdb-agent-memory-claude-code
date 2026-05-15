@@ -8,7 +8,7 @@
 
 ### 📦 新功能
 
-- **Claude Code + Codex CLI 插件**（`claude-code-plugin/`）：通过 Claude Code `/plugin install tdai-memory` 或 Codex CLI marketplace 一键启用，不修改用户 `~/.claude/settings.json` 或 `~/.codex/config.toml`。提供 3 个 hooks（`SessionStart` 异步预热、`UserPromptSubmit` 同步召回并通过 `additionalContext` 注入、`Stop` 异步捕获），3 个 slash skills（`/memory-search`、`/memory-status`、`/memory-clear-session`），以及一个总览 skill `tdai-memory`。Daemon 通过 `gateway-entry.ts` wrapper 绑定父进程生命周期。插件携带双 manifest（`.claude-plugin/plugin.json` 与 `.codex-plugin/plugin.json`），共享同一份 `hooks/hooks.json` 与 `skills/` —— cc v2026.4+ 与 Codex CLI v0.117+ 实现了对齐的 hook 协议，因此一套源码同时服务两个宿主。
+- **Claude Code + Codex CLI 插件**（`claude-code-plugin/`）：通过 Claude Code `/plugin install tdai-memory` 或 Codex CLI marketplace 一键启用，不修改用户 `~/.claude/settings.json` 或 `~/.codex/config.toml`。提供 3 个 hooks（`SessionStart` 异步预热、`UserPromptSubmit` 同步召回并通过 `additionalContext` 注入、`Stop` 异步捕获），3 个 slash skills（`/memory-search`、`/memory-status`、`/memory-clear-session`），以及一个总览 skill `tdai-memory`。Daemon 通过 `gateway-entry.ts` wrapper 绑定父进程生命周期。插件携带双 manifest（`.claude-plugin/plugin.json` 与 `.codex-plugin/plugin.json`），共享同一份 `hooks/hooks.json` 与 `skills/`。Claude Code（v2026.4+）是当前的一等宿主，端到端完整可用；Codex CLI（v0.130+）在 schema 层（hook 事件名、handler config 字段、`${CLAUDE_PLUGIN_ROOT}` 环境变量）已对齐，但当前部分阻塞——三层 blocker 详见 `claude-code-plugin/README.md`（discovery 层 [openai/codex#22078](https://github.com/openai/codex/issues/22078)、`async` 行为层 Codex 未实现、transcript 解析层只支持 cc 格式）。
 
 ### 🔧 兼容性 / 安全增强
 
@@ -26,7 +26,7 @@
 - **transcript 等待逻辑**：Stop hook 等待 cc 落盘从硬 sleep(800ms) 改为 `waitForTranscriptStable(2s)`：每 100ms 轮询 `stat().size`，连续两次相同字节数即视为 flush 完成；慢盘场景更稳。
 - **L0 jsonl 直查内存压力**：`searchL0JsonlDirect` 从 `readFile` 整体加载改为 `readline + createReadStream` 流式扫描，避免长会话 jsonl 触发 OOM；文件遍历从字符串排序+reverse（依赖 `YYYY-MM-DD.jsonl` 命名）改为 mtime 倒序，对 cc UUID 命名也工作正常。
 - **GatewayClient silent-failure 可观测**：所有 catch 块新增 `logPath` 失败追加，handleStatus 在 `/memory-status` 输出 `hook.log` / `daemon.log` 路径；daemon spawn 的 stdio stderr 重定向到 `daemon.log` 替代静默丢弃。
-- **Codex CLI plugin 端 hooks 注册补全**：`.codex-plugin/plugin.json` 之前只声明了 `"skills": "./skills/"`，缺 `"hooks": "./hooks/hooks.json"` —— Codex CLI 与 Claude Code 不同，plugin-local hooks 不走"约定俗成路径"，而是强制从 manifest 的 `hooks` 字段读取（见 `codex-rs/core-plugins/src/manifest.rs::RawPluginManifest`）。补上字段后，已声明的 `SessionStart`/`UserPromptSubmit`/`Stop` 三个 hook 与现有 `${CLAUDE_PLUGIN_ROOT}` env var 在 Codex 侧均原生兼容（Codex `hooks/src/engine/discovery.rs` 注入了 `CLAUDE_PLUGIN_ROOT` backcompat alias，同时配 `PLUGIN_ROOT` 新名）。
+- **Codex CLI plugin 端 hooks 注册补全**：`.codex-plugin/plugin.json` 之前只声明了 `"skills": "./skills/"`，缺 `"hooks": "./hooks/hooks.json"` —— Codex CLI 与 Claude Code 不同，plugin-local hooks 不走"约定俗成路径"，而是强制从 manifest 的 `hooks` 字段读取（见 `codex-rs/core-plugins/src/manifest.rs::RawPluginManifest`）。补上字段后 schema 层全部对齐：`SessionStart`/`UserPromptSubmit`/`Stop` 事件名、`command`/`timeout`/`statusMessage` handler 字段、`${CLAUDE_PLUGIN_ROOT}` 环境变量在 Codex 端都能解析（discovery.rs 注入了 `CLAUDE_PLUGIN_ROOT` backcompat alias，同时配 `PLUGIN_ROOT` 新名）。**注意 schema 层兼容 ≠ runtime 行为对齐**：Codex 解析 `async` 字段但实际硬编码为 sync 执行（`HookExecutionMode::Sync`，`core/src/hook_runtime.rs` 与 `hooks/src/engine/` 都没有消费 `r#async` 字段的代码），与 cc 的真异步行为不同；详见 README 中的 Codex 状态说明。
 
 ### ✅ 测试
 
@@ -37,7 +37,12 @@
 ### 📚 文档
 
 - `claude-code-plugin/README.md` 与 `README_CN.md`：安装、配置、数据布局、排障与安全模型完整说明，新增 `TDAI_TOKEN_PATH` / `TDAI_GATEWAY_ALLOW_REMOTE` / `TDAI_GATEWAY_CORS_ORIGIN` / Windows 兼容性说明。
-- `claude-code-plugin/README.md` 与 `README_CN.md`：Codex CLI 安装段下新增"已知限制"小节，标注 Codex CLI ≤ v0.130 通过 `source_type = "local"` marketplace 安装时受上游 [openai/codex#22078](https://github.com/openai/codex/issues/22078) 影响，`skills/` 与 `hooks/` 不会暴露到 session；插件这一侧 manifest + hook 协议已就绪，等上游修复或本插件正式发布到 `source_type = "git"` marketplace 后即恢复。
+- `claude-code-plugin/README.md` 与 `README_CN.md`：Codex CLI 安装段下重写 "Codex CLI 当前状态：部分阻塞" 小节，披露与 cc 对等之前的三层 blocker：
+  1. **Discovery 层（上游阻塞）**：`source_type = "local"` 安装受上游 [openai/codex#22078](https://github.com/openai/codex/issues/22078) 影响，manifest 解析正常但 `skills/` 与 `hooks/hooks.json` 在运行时被静默丢弃，hook 根本不会触发；
+  2. **`async` 行为层（Codex 不实现）**：Codex 解析 `async` 字段但 `HookRunSummary` 硬编码 `HookExecutionMode::Sync`，cc 端 `SessionStart`/`Stop` 上的 `async: true + timeout: 30` 在 Codex 修复 #22078 后会变成同步 30s 阻塞；计划用单独 `hooks/codex-hooks.json` 差异化 timeout（待办）；
+  3. **Transcript 解析层（plugin 端未适配）**：Codex rollout jsonl schema `{timestamp, type, payload}` 与 cc transcript `{type, message, sessionId, parentUuid, …}` 完全不同，当前 `lib/transcript.ts` 仅解析 cc 格式，即使 Stop 在 Codex 上触发也会静默生成空 capture；Codex parser 是后续工作，等 #22078 修复后基于真实 Codex session 实现。
+  
+  当前 Codex 上真正能用的部分：manifest 解析、`/plugin` 可见可切换、`lib/daemon.ts` 宿主无关 daemon spawn 与 cc 共用同一段代码。同时同步降级 README 与 CHANGELOG 顶部"双宿主对齐"的过度乐观表述。
 
 ---
 

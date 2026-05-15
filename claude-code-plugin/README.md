@@ -2,7 +2,7 @@
 
 Long-term + symbolic short-term memory for [Claude Code](https://claude.com/claude-code) and [OpenAI Codex CLI](https://developers.openai.com/codex/cli), powered by [TencentDB Agent Memory](https://github.com/Tencent/TencentDB-Agent-Memory).
 
-The plugin ships dual manifests (`.claude-plugin/plugin.json` and `.codex-plugin/plugin.json`) and reuses the same `hooks/hooks.json` and `skills/` — both Claude Code (v2026.4+) and Codex CLI (v0.117+) implement the same hook protocol, so a single source tree serves both hosts.
+The plugin ships dual manifests (`.claude-plugin/plugin.json` and `.codex-plugin/plugin.json`) and reuses the same `hooks/hooks.json` and `skills/`. Claude Code (v2026.4+) and Codex CLI (v0.130+) share the hook protocol at the schema layer (event names, handler config fields, `${CLAUDE_PLUGIN_ROOT}` env var). **Claude Code is the first-class target today; Codex CLI is partially blocked** — see the [Codex CLI](#codex-cli) install section below for current status.
 
 [中文版](./README_CN.md)
 
@@ -41,7 +41,15 @@ codex plugin marketplace add <marketplace-url>
 
 (Once published to the Codex marketplace, this becomes a one-liner.)
 
-> **Known limitation (Codex CLI ≤ v0.130).** Installing this plugin from a `source_type = "local"` marketplace is currently affected by Codex upstream issue [openai/codex#22078](https://github.com/openai/codex/issues/22078): the plugin manifest is parsed and the plugin is toggleable in `/plugin`, but the declared `skills/` and `hooks/hooks.json` are not exposed to the running session. This is a Codex-side discovery bug unrelated to the plugin itself — our `.codex-plugin/plugin.json` already declares both `skills` and `hooks`, and Codex accepts the existing hook event names + `${CLAUDE_PLUGIN_ROOT}` env var via its `hooks/src/engine/discovery.rs` backcompat path. Workaround: use Claude Code for now, or wait for the upcoming `source_type = "git"` marketplace publication.
+> **Codex CLI status (≤ v0.130): partially blocked.** Three layered blockers separate the current Codex experience from Claude Code parity:
+>
+> 1. **Plugin discovery (upstream blocker).** `source_type = "local"` marketplace installs are affected by Codex issue [openai/codex#22078](https://github.com/openai/codex/issues/22078): the manifest parses, the plugin appears in `/plugin` and is toggleable, but the declared `skills/` and `hooks/hooks.json` are silently dropped at runtime. Hooks never fire on Codex today.
+>
+> 2. **`async` hook field is parsed but not honored.** Codex deserializes the `async` field on hook commands (`codex-rs/config/src/hook_config.rs::HookHandlerConfig::Command`), but no code in `core/src/hook_runtime.rs` or `hooks/src/engine/` consumes it — `HookRunSummary` is hardcoded to `HookExecutionMode::Sync`. Our `SessionStart` and `Stop` hooks declare `async: true, timeout: 30`. Once #22078 ships, this means a Codex session start will block synchronously on first-run daemon spawn, and every Stop will block on capture. Planned mitigation: a separate `hooks/codex-hooks.json` referenced from `.codex-plugin/plugin.json` with shorter timeouts.
+>
+> 3. **`lib/transcript.ts` only parses the Claude Code transcript format.** Codex records sessions to `~/.codex/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl` with shape `{timestamp, type: "session_meta" | …, payload: {…}}`, completely different from Claude Code's `{type, message, sessionId, parentUuid, …}`. Even if Stop fired on Codex, capture would silently produce empty turns. A Codex JSONL parser is planned once #22078 lets us validate end-to-end against a live Codex session.
+>
+> **What works today on Codex:** `.codex-plugin/plugin.json` is parsed correctly, the plugin is visible and toggleable in `/plugin`, and the shared daemon spawn / discovery logic in `lib/daemon.ts` is host-agnostic (same code path as Claude Code). Use Claude Code for actual memory functionality; track #22078 for the upstream fix.
 
 ---
 

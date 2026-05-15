@@ -2,7 +2,7 @@
 
 为 [Claude Code](https://claude.com/claude-code) 与 [OpenAI Codex CLI](https://developers.openai.com/codex/cli) 提供长期记忆 + 符号化短期记忆，由 [TencentDB Agent Memory](https://github.com/Tencent/TencentDB-Agent-Memory) 驱动。
 
-插件携带双 manifest（`.claude-plugin/plugin.json` 与 `.codex-plugin/plugin.json`），共享同一份 `hooks/hooks.json` 与 `skills/`。Claude Code（v2026.4+）与 Codex CLI（v0.117+）实现了同一份 hook 协议，因此一套源码同时服务两个宿主。
+插件携带双 manifest（`.claude-plugin/plugin.json` 与 `.codex-plugin/plugin.json`），共享同一份 `hooks/hooks.json` 与 `skills/`。Claude Code（v2026.4+）与 Codex CLI（v0.130+）在 **schema 层**对齐 hook 协议（事件名、handler 配置字段、`${CLAUDE_PLUGIN_ROOT}` 环境变量）。**Claude Code 是当前的一等宿主，Codex CLI 部分阻塞** —— 当前状态详见下方 [Codex CLI](#codex-cli) 安装段。
 
 [English version](./README.md)
 
@@ -41,7 +41,15 @@ codex plugin marketplace add <marketplace-url>
 
 （一旦发布到 Codex marketplace，将变为一条命令安装。）
 
-> **已知限制（Codex CLI ≤ v0.130）。** 通过 `source_type = "local"` 的本地 marketplace 安装本插件，目前受 Codex 上游 issue [openai/codex#22078](https://github.com/openai/codex/issues/22078) 影响：插件 manifest 能被正确解析、`/plugin` 列表里可见并可切换，但声明的 `skills/` 与 `hooks/hooks.json` 不会暴露到运行中的 session。这是 Codex 侧的 plugin discovery bug，与本插件无关——我们的 `.codex-plugin/plugin.json` 已经同时声明了 `skills` 与 `hooks`，且现有 hook 事件名与 `${CLAUDE_PLUGIN_ROOT}` 环境变量在 Codex `hooks/src/engine/discovery.rs` 的 backcompat 分支里已经支持。绕过办法：暂用 Claude Code 安装，或等本插件发布到 `source_type = "git"` marketplace。
+> **Codex CLI 当前状态（≤ v0.130）：部分阻塞。** 距离与 Claude Code 完全对等还有三层阻塞：
+>
+> 1. **Plugin discovery（上游阻塞）。** `source_type = "local"` marketplace 安装受 Codex issue [openai/codex#22078](https://github.com/openai/codex/issues/22078) 影响：manifest 能被解析、`/plugin` 中可见并可切换，但声明的 `skills/` 与 `hooks/hooks.json` 在运行时被静默丢弃。今天 Codex 上 hook 根本不会触发。
+>
+> 2. **`async` hook 字段被解析但未实际生效。** Codex 在 `codex-rs/config/src/hook_config.rs::HookHandlerConfig::Command` 中反序列化 `async` 字段，但 `core/src/hook_runtime.rs` 与 `hooks/src/engine/` 没有消费它的代码——`HookRunSummary` 硬编码为 `HookExecutionMode::Sync`。我们的 `SessionStart` 与 `Stop` hook 标了 `async: true, timeout: 30`。等 #22078 修复后，这意味着：Codex session 首次启动会同步阻塞等 daemon spawn，每次 Stop 会同步阻塞等 capture。计划绕过办法：单独拷一份 `hooks/codex-hooks.json` 给 `.codex-plugin/plugin.json` 引用，配较短 timeout。
+>
+> 3. **`lib/transcript.ts` 只解析 Claude Code transcript 格式。** Codex 把 session 录到 `~/.codex/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl`，形态是 `{timestamp, type: "session_meta" | …, payload: {…}}`，跟 cc 的 `{type, message, sessionId, parentUuid, …}` 完全是两套 schema。即使 Stop 在 Codex 上触发了，capture 也只会静默生成空 turn。Codex JSONL parser 是后续工作，等 #22078 修复让我们能基于真实 Codex session 做端到端验证后再实现。
+>
+> **当前真正能用的部分：** `.codex-plugin/plugin.json` 解析正常、插件在 `/plugin` 中可见可切换、`lib/daemon.ts` 的 daemon spawn / discovery 逻辑是宿主无关的（与 cc 共用同一段代码）。当前阶段记忆功能请用 Claude Code，Codex 那边追 #22078 上游修复。
 
 ---
 
