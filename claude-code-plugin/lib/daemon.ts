@@ -6,8 +6,8 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdir, writeFile, readFile, stat, unlink } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { mkdir, writeFile, readFile, stat, unlink, open, rename } from "node:fs/promises";
+import { existsSync, openSync } from "node:fs";
 import { join } from "node:path";
 import http from "node:http";
 import net from "node:net";
@@ -43,9 +43,11 @@ export async function readDaemonState(dataDir: string): Promise<DaemonState | nu
 
 export async function writeDaemonState(dataDir: string, state: DaemonState): Promise<void> {
   await mkdir(dataDir, { recursive: true });
-  await writeFile(join(dataDir, STATE_FILE), JSON.stringify(state, null, 2), {
-    mode: 0o600,
-  });
+  // Atomic write: a concurrent reader never observes a half-written JSON.
+  const tmp = join(dataDir, `${STATE_FILE}.tmp`);
+  const final = join(dataDir, STATE_FILE);
+  await writeFile(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
+  await rename(tmp, final);
 }
 
 export async function clearDaemonState(dataDir: string): Promise<void> {
@@ -155,31 +157,95 @@ export class DaemonManager {
   }
 
   async ensureRunning(ccPid: number): Promise<DaemonState> {
-    const existing = await readDaemonState(this.dataDir);
-    if (existing) {
-      // Refuse to reuse a daemon spawned for a different cc instance. Without
-      // this check, a stale state.json from a previous user/session on a shared
-      // box could route this session's recall/capture to someone else's daemon.
-      const ccPidMatches = existing.ccPid === ccPid;
-      let existingToken = "";
+    const reuseExisting = async (): Promise<DaemonState | null> => {
+      const existing = await readDaemonState(this.dataDir);
+      if (!existing) return null;
+      if (existing.ccPid !== ccPid) return null;
+      let token = "";
       try {
-        existingToken = await this.readToken(existing.tokenPath);
+        token = await this.readToken(existing.tokenPath);
       } catch {
-        // fallthrough to spawn
+        return null;
       }
-      if (ccPidMatches && existingToken) {
-        // First probe.
-        if (await this.healthCheck(existing.port, existingToken)) return existing;
-        // Daemon may still be coming up (another hook just spawned it).
-        // Wait briefly and retry once before deciding to respawn.
-        const deadline = Date.now() + 10_000;
-        while (Date.now() < deadline) {
-          await sleep(500);
-          if (await this.healthCheck(existing.port, existingToken)) return existing;
-        }
+      if (!token) return null;
+      if (await this.healthCheck(existing.port, token)) return existing;
+      // Daemon may still be coming up (another hook just spawned it).
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        await sleep(500);
+        if (await this.healthCheck(existing.port, token)) return existing;
       }
+      return null;
+    };
+
+    const reused = await reuseExisting();
+    if (reused) return reused;
+
+    // O_CREAT|O_EXCL spawn lock — only one concurrent hook actually invokes
+    // spawn(). Other hooks block on it and recover the spawned state.
+    const lock = await this.acquireSpawnLock();
+    if (!lock) {
+      // Lock held by a peer hook. Wait up to 35s for it to write state.json
+      // and bring the daemon up.
+      const deadline = Date.now() + 35_000;
+      while (Date.now() < deadline) {
+        await sleep(500);
+        const r = await reuseExisting();
+        if (r) return r;
+      }
+      throw new Error("daemon spawn lock contention timed out");
     }
-    return this.spawn(ccPid);
+    try {
+      // Re-check inside the lock — a peer might have finished between our
+      // first reuseExisting and acquireSpawnLock.
+      const r = await reuseExisting();
+      if (r) return r;
+      return await this.spawn(ccPid);
+    } finally {
+      await lock.release();
+    }
+  }
+
+  /**
+   * Returns a held lock handle, or null if another process owns the lock.
+   * Stale locks (>60s old) are forcibly broken so a crashed hook never wedges
+   * the daemon-up path.
+   */
+  private async acquireSpawnLock(): Promise<{ release(): Promise<void> } | null> {
+    await mkdir(this.dataDir, { recursive: true });
+    const lockPath = join(this.dataDir, "spawn.lock");
+    const tryCreate = async (): Promise<{ release(): Promise<void> } | null> => {
+      try {
+        const fh = await open(lockPath, "wx"); // O_CREAT|O_EXCL|O_WRONLY
+        await fh.write(`${process.pid}\n`);
+        await fh.close();
+        return {
+          release: async () => {
+            try {
+              await unlink(lockPath);
+            } catch {
+              // already gone
+            }
+          },
+        };
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "EEXIST") return null;
+        throw err;
+      }
+    };
+    const first = await tryCreate();
+    if (first) return first;
+    try {
+      const st = await stat(lockPath);
+      if (Date.now() - st.mtimeMs > 60_000) {
+        await unlink(lockPath).catch(() => {});
+        return tryCreate();
+      }
+    } catch {
+      // race: lock disappeared, retry once
+      return tryCreate();
+    }
+    return null;
   }
 
   /**
@@ -203,13 +269,36 @@ export class DaemonManager {
     // initial environment block and exposes it via /proc/<pid>/environ /
     // `ps -E` to any peer process with the same UID — a token file gated by
     // 0600 + owner check is a smaller attack surface.
-    const childEnv = { ...process.env, TDAI_GATEWAY_PORT: String(port), TDAI_CC_PID: String(ccPid), TDAI_TOKEN_PATH: tokenPath } as NodeJS.ProcessEnv;
+    //
+    // Also pin TDAI_DATA_DIR explicitly: without it the gateway resolves its
+    // data dir against process.cwd() of the spawning hook, which can be any
+    // arbitrary user directory and would split data across cwds.
+    const childEnv = {
+      ...process.env,
+      TDAI_GATEWAY_PORT: String(port),
+      TDAI_CC_PID: String(ccPid),
+      TDAI_TOKEN_PATH: tokenPath,
+      TDAI_DATA_DIR: process.env.TDAI_DATA_DIR ?? this.dataDir,
+    } as NodeJS.ProcessEnv;
     delete childEnv.TDAI_GATEWAY_TOKEN;
+
+    // Redirect stderr (and stdout) into daemon.log so cold-start crashes are
+    // not swallowed silently. detached + unref keeps the daemon alive past
+    // the hook process exit; the log fds are independent of our stdio.
+    await mkdir(this.dataDir, { recursive: true });
+    const logPath = join(this.dataDir, "daemon.log");
+    let logFd: number | "ignore" = "ignore";
+    try {
+      logFd = openSync(logPath, "a");
+    } catch {
+      // fall back to discarding stderr if we can't open the log
+    }
 
     const child: ChildProcess = spawn(command, args, {
       env: childEnv,
+      cwd: this.dataDir,
       detached: true,
-      stdio: ["ignore", "ignore", "ignore"],
+      stdio: ["ignore", logFd, logFd],
     });
     child.unref();
 

@@ -427,7 +427,7 @@ async function main(): Promise<void> {
   const event = (process.argv[2] ?? "") as HookEvent;
   const args = process.argv.slice(3);
 
-  const dataDir = process.env.CLAUDE_PLUGIN_DATA ?? join(process.env.HOME ?? ".", ".tdai-memory");
+  const dataDir = resolveDataDir();
   const logPath = join(dataDir, "hook.log");
 
   try {

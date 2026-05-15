@@ -84,6 +84,9 @@ async function main(): Promise<void> {
 
   const ccPid = parseInt(process.env.TDAI_CC_PID ?? "0", 10);
   if (Number.isFinite(ccPid) && ccPid > 0) {
+    // Poll every 15s — short enough that a vanished cc doesn't keep the
+    // daemon alive long enough to collide with a fresh hook spawning a
+    // replacement, long enough that the syscall load stays negligible.
     const timer = setInterval(() => {
       try {
         process.kill(ccPid, 0);
@@ -94,7 +97,7 @@ async function main(): Promise<void> {
           void shutdown("parent-exit");
         }
       }
-    }, 60_000);
+    }, 15_000);
     timer.unref();
   }
 }
