@@ -41,7 +41,7 @@ Everything below is in this repository (see the commit history for exact diffs):
 - **Claude Code**.
 - An **OpenAI-compatible LLM API key** for the L1/L2/L3 extraction. I use **Kimi/Moonshot**; **DeepSeek** or any OpenAI-compatible endpoint works just as well.
 - An **OpenAI embeddings key** for semantic search. I use **`text-embedding-3-small`** (1536 dims); any OpenAI-compatible embeddings endpoint works.
-- **On ARM64:** a `vec0` (sqlite-vec) extension built for `win32-arm64` — see [Semantic search on ARM64](#semantic-search-on-arm64).
+- **On ARM64:** nothing extra — the `vec0` (sqlite-vec) extension for `win32-arm64` is **bundled** and installed automatically (see [Semantic search on ARM64](#semantic-search-on-arm64)).
 
 ## Installation
 
@@ -110,14 +110,17 @@ Before each prompt the plugin recalls the most relevant memories (semantic vecto
 
 ## Semantic search on ARM64
 
-`sqlite-vec` (the vector extension behind semantic search) and `node-llama-cpp` (the bundled *local* embedding option) **ship no `win32-arm64` prebuilt binary**. On ARM64 you therefore need:
+`sqlite-vec` (the vector extension behind semantic search) ships **no `win32-arm64` prebuilt binary** — upstream publishes only macOS, Linux, and Windows x86_64. So this fork **includes a precompiled `vec0.dll` for Windows ARM64**:
 
-1. a **remote embedding provider** (e.g. OpenAI — set `OPENAI_API_KEY`), and
-2. a **`vec0` extension compiled for `win32-arm64`** so SQLite can load the vector tables.
+- **Binary:** [`vendor/win32-arm64/vec0.dll`](./vendor/win32-arm64/vec0.dll) — sqlite-vec `v0.1.7-alpha.2`, compiled with `zig` `0.14.1` for the `aarch64-windows` target (SHA-256 `d1e996e5…09f89b`).
+- **Wired automatically:** it's declared as a `file:` optional dependency in the root `package.json`, so `npm install` places it exactly where the sqlite-vec loader looks (`node_modules/sqlite-vec-windows-arm64/`). No manual step.
+- **Provenance & verification:** [`vendor/win32-arm64/BUILD.md`](./vendor/win32-arm64/BUILD.md) documents the exact source, version, target, full SHA-256, how to verify it (`vec_version()` + a KNN round-trip), and how to rebuild an equivalent binary yourself with zig. It is sqlite-vec (MIT OR Apache-2.0, © Alex Garcia) — see [`vendor/win32-arm64/NOTICE`](./vendor/win32-arm64/NOTICE).
 
-> **Honest heads-up:** this repository does **not** currently bundle a prebuilt `vec0.dll`. You need to supply a `win32-arm64` build of the sqlite-vec `vec0` extension for vector search to work on ARM64. Without it the gateway still runs, but semantic search degrades to keyword-only (and now says so in the log). *If a prebuilt binary is shipped here later, this section will point to it.*
+You still need a **remote embedding provider** on ARM64 (set `OPENAI_API_KEY`); the bundled *local* embedding option (`node-llama-cpp`) also has no `win32-arm64` build.
 
-You can confirm embeddings are actually live with the health check in [windows/README.md](./windows/README.md) (`stores.embeddingService` should be `true`).
+**Prefer to compile your own?** Follow [BUILD.md](./vendor/win32-arm64/BUILD.md) and drop your `vec0.dll` into `node_modules/sqlite-vec-windows-arm64/`.
+
+Confirm embeddings are live with the health check in [windows/README.md](./windows/README.md) (`stores.embeddingService` should be `true`).
 
 ## Rebuilding from source
 
@@ -133,7 +136,7 @@ The plugin's `claude-code-plugin/dist/` is committed so the plugin works the mom
 
 - **Early-adopter software.** It works on my machine (Windows 11 ARM64) and I use it daily, but it's young — expect rough edges.
 - **Based on an unmerged upstream PR.** This fork builds on the upstream `feat/claude-code-plugin` work (PR #7), which is not yet merged into TencentDB Agent Memory.
-- **ARM64 semantic search needs a `vec0` build you supply** (see above).
+- **ARM64 semantic search relies on a bundled, unofficial `vec0.dll`** (sqlite-vec has no official ARM64 build). If you'd rather not trust a precompiled binary, verify or rebuild it via [BUILD.md](./vendor/win32-arm64/BUILD.md).
 - **No support guarantee.** Provided **as-is**, with no warranty and no guaranteed support. Issues and PRs are welcome, but please don't expect SLA-style help.
 - **Codex CLI support is partial** — see [PLUGIN-REFERENCE.md](./PLUGIN-REFERENCE.md#codex-cli).
 
