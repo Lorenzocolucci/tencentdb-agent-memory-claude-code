@@ -50,8 +50,9 @@ docs/superpowers/
 # Per-developer Claude Code project instructions (contributor-only)
 CLAUDE.md
 
-# Plugin build output
-claude-code-plugin/dist/
+# Plugin build output: COMMITTED on purpose so the plugin runs the moment it is
+# cloned/installed, with no build step (mirrors the precompiled ARM64 vec0.dll we
+# ship). To rebuild from source: npm install && npm run build (in claude-code-plugin/).
 
 # Windows launcher secrets (provider API keys) - NEVER commit, local only
 gateway.secrets.env
