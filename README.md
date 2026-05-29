@@ -1,3 +1,9 @@
+<!-- FORK NOTICE -->
+> **🔱 Fork — Windows / ARM64 + Claude Code.**
+> This is a community fork maintained by [Lorenzo Colucci](https://github.com/Lorenzocolucci) that makes TencentDB Agent Memory run end-to-end on **Windows 11 (incl. ARM64)** with **Claude Code**. For what this fork adds and how to install it, see **[claude-code-plugin/README.md](./claude-code-plugin/README.md)**. The original project and its documentation (below) are by Tencent — all credit and the MIT license are preserved.
+
+---
+
 <div align="center">
 
 <img src="./assets/images/logo.png" alt="TencentDB Agent Memory" width="880" />

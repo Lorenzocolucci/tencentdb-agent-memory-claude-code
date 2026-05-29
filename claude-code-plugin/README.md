@@ -1,125 +1,151 @@
-# TencentDB Agent Memory — Coding Agent Plugin
+# TencentDB Agent Memory — Claude Code plugin (Windows-ready fork)
 
-Long-term + symbolic short-term memory for [Claude Code](https://claude.com/claude-code) and [OpenAI Codex CLI](https://developers.openai.com/codex/cli), powered by [TencentDB Agent Memory](https://github.com/Tencent/TencentDB-Agent-Memory).
+> Persistent, semantic long-term memory for **Claude Code**: relevant past memories are recalled before every prompt, and your turns are captured and distilled (facts → scenes → persona) after every reply. This is my fork that makes the whole stack actually run on **Windows 11, including ARM64**.
 
-The plugin ships dual manifests (`.claude-plugin/plugin.json` and `.codex-plugin/plugin.json`) and reuses the same `hooks/hooks.json` and `skills/`. Claude Code (v2026.4+) and Codex CLI (v0.130+) share the hook protocol at the schema layer (event names, handler config fields, `${CLAUDE_PLUGIN_ROOT}` env var). **Claude Code is the first-class target today; Codex CLI is partially blocked** — see the [Codex CLI](#codex-cli) install section below for current status.
-
-[中文版](./README_CN.md)
-
-## What this gives you
-
-- **Automatic recall** before every prompt — relevant past memories injected into context
-- **Automatic capture** after every turn — L0 conversation written, L1/L2/L3 extracted in the background
-- **Manual control** via slash skills: `/memory-search`, `/memory-status`, `/memory-clear-session`
-- **Project-level isolation** by default (sessionKey = hash of cwd) — your `react-app` memories don't leak into your `golang-svc` work
-- **Bearer-secured local daemon** — no plaintext localhost API
-
-## Installation
-
-### Prerequisite
-
-Install the gateway runtime (the `tdai-memory-gateway` bin) globally — the plugin spawns the daemon via `npx tdai-memory-gateway`:
-
-```bash
-npm install -g @tencentdb-agent-memory/memory-tencentdb
-```
-
-This npm package contains the actual `TdaiGateway` (SQLite + sqlite-vec + LLM pipeline). The plugin itself is a thin shim that owns hooks, skills, and the per-session sessionKey — it does NOT bundle the heavy deps.
-
-### Claude Code
-
-```bash
-/plugin install tdai-memory
-```
-
-### Codex CLI
-
-```bash
-codex plugin marketplace add <marketplace-url>
-# then enable in the TUI: /plugin → toggle tdai-memory
-```
-
-(Once published to the Codex marketplace, this becomes a one-liner.)
-
-> **Codex CLI status (≤ v0.130): partially blocked.** Three layered blockers separate the current Codex experience from Claude Code parity:
->
-> 1. **Plugin discovery (upstream blocker).** `source_type = "local"` marketplace installs are affected by Codex issue [openai/codex#22078](https://github.com/openai/codex/issues/22078): the manifest parses, the plugin appears in `/plugin` and is toggleable, but the declared `skills/` and `hooks/hooks.json` are silently dropped at runtime. Hooks never fire on Codex today.
->
-> 2. **`async` hook field is parsed but not honored.** Codex deserializes the `async` field on hook commands (`codex-rs/config/src/hook_config.rs::HookHandlerConfig::Command`), but no code in `core/src/hook_runtime.rs` or `hooks/src/engine/` consumes it — `HookRunSummary` is hardcoded to `HookExecutionMode::Sync`. Our `SessionStart` and `Stop` hooks declare `async: true, timeout: 30`. Once #22078 ships, this means a Codex session start will block synchronously on first-run daemon spawn, and every Stop will block on capture. Planned mitigation: a separate `hooks/codex-hooks.json` referenced from `.codex-plugin/plugin.json` with shorter timeouts.
->
-> 3. **`lib/transcript.ts` only parses the Claude Code transcript format.** Codex records sessions to `~/.codex/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl` with shape `{timestamp, type: "session_meta" | …, payload: {…}}`, completely different from Claude Code's `{type, message, sessionId, parentUuid, …}`. Even if Stop fired on Codex, capture would silently produce empty turns. A Codex JSONL parser is planned once #22078 lets us validate end-to-end against a live Codex session.
->
-> **What works today on Codex:** `.codex-plugin/plugin.json` is parsed correctly, the plugin is visible and toggleable in `/plugin`, and the shared daemon spawn / discovery logic in `lib/daemon.ts` is host-agnostic (same code path as Claude Code). Use Claude Code for actual memory functionality; track #22078 for the upstream fix.
+**Maintained fork by [Lorenzo Colucci](https://github.com/Lorenzocolucci).** Built on Tencent's [TencentDB Agent Memory](https://github.com/Tencent/TencentDB-Agent-Memory) and its Claude Code plugin adapter by 李冠辰 (liguanchen) — see [Credits](#credits--attribution).
 
 ---
 
-No `~/.claude/settings.json` or `~/.codex/config.toml` mutation. The first time a session starts after installation, the plugin spawns the local daemon (via `npx tdai-memory-gateway`) on port 8421–8430 with a randomly generated Bearer token. State persists under `${CLAUDE_PLUGIN_DATA}`.
+## What is this? (30 seconds)
+
+- **What:** a Claude Code plugin that gives Claude long-term memory. It recalls relevant history before each prompt and, after each turn, stores the conversation and extracts structured facts, scenes, and a persona profile in the background.
+- **Who it's for:** Claude Code users — especially on **Windows 11 / ARM64** — who want memory that survives across sessions and projects.
+- **Why this fork:** upstream targets Linux/macOS; on Windows (ARM64 in particular) the gateway wouldn't stay alive, semantic search degraded silently, and `/memory-search` returned empty. I fixed those. *(Other platforms should work too, but Windows 11 ARM64 is what I run and test.)*
+
+## Why this fork exists
+
+I wanted persistent memory for Claude Code, and I work on **Windows 11 ARM64**. The upstream project is excellent, but the moment I tried to run it on my machine I hit a wall:
+
+- The memory **gateway is session-bound**: the plugin spawns it with a watchdog that kills the process ~15 seconds after the spawning session ends. On Windows the spawn also goes through `cmd.exe → npx`, so the tracked PID is a throwaway wrapper and the gateway suicided almost immediately.
+- **`sqlite-vec` has no `win32-arm64` build**, so the vector extension that powers semantic search can't load on ARM64 out of the box.
+- **Provider API keys set with `setx` weren't reaching the running gateway**, so it silently started with embeddings disabled and every search quietly fell back to keyword matching.
+- `/memory-search` and `/memory-status` returned **empty** whenever another plugin was installed, because the data directory was resolved from an environment variable that Claude Code populates with a *different* plugin's path.
+
+So I fixed each of these. This fork is the result: the first setup I know of where TencentDB Agent Memory + Claude Code runs end-to-end on Windows 11 ARM64.
+
+## What this fork adds
+
+Everything below is in this repository (see the commit history for exact diffs):
+
+- **Robust data-directory resolution.** `/memory-search` and `/memory-status` no longer trust the (often wrong) `CLAUDE_PLUGIN_DATA` env var that Claude Code injects into shell commands. The plugin now locates its own data directory from the script's real path and picks the one whose gateway PID is actually alive (most-recent state as fallback) — so the manual skills work even with other plugins installed.
+- **A permanent Windows gateway.** `windows/start-gateway.ps1` runs the gateway directly with `node`, **without** the watchdog PID, so it stays up until you stop it or reboot. `windows/install-autostart.ps1` registers a hidden Scheduled Task (`TDAI Memory Gateway`) that starts it at logon — no admin rights needed.
+- **Windows-specific plugin fixes:** `spawn` with `shell: true` so `npx.cmd` resolves on win32; correct main-module detection for Windows drive-letter paths; an *externally-managed gateway* guard so the launcher-owned gateway is never killed or re-spawned by a session; and stale-state recovery on session start.
+- **Reliable L3 persona generation.** The persona prompt now names the file tools the *active* runner actually exposes (`write_to_file`/`replace_in_file` vs `write`/`edit`), forces the write via tool call, and falls back to persisting the model's text answer if it replies with text instead of a tool call — so weaker tool-callers (Kimi/Moonshot, DeepSeek) reliably produce `persona.md`.
+- **A loud warning instead of a silent footgun.** When an embedding provider is configured but the embedding service fails to initialize (typically an unresolved API key), the gateway now logs a clear WARN explaining that search will fall back to keyword-only — instead of degrading silently.
+- **Network resilience:** extra retry headroom for transient DNS/network blips during LLM calls.
+
+## Requirements
+
+- **Windows 11** — tested on **ARM64**. (x64 Windows, Linux, and macOS should work, but ARM64 is what I test.)
+- **Node.js 22.16+** — the gateway uses the built-in `node:sqlite`, which requires Node 22+.
+- **Claude Code**.
+- An **OpenAI-compatible LLM API key** for the L1/L2/L3 extraction. I use **Kimi/Moonshot**; **DeepSeek** or any OpenAI-compatible endpoint works just as well.
+- An **OpenAI embeddings key** for semantic search. I use **`text-embedding-3-small`** (1536 dims); any OpenAI-compatible embeddings endpoint works.
+- **On ARM64:** a `vec0` (sqlite-vec) extension built for `win32-arm64` — see [Semantic search on ARM64](#semantic-search-on-arm64).
+
+## Installation
+
+```powershell
+# 1. Clone the fork
+git clone https://github.com/Lorenzocolucci/tencentdb-agent-memory-claude-code.git
+cd tencentdb-agent-memory-claude-code
+
+# 2. Build the gateway from this fork (it carries my core fixes).
+#    The plugin's own dist/ is committed, so the plugin runs without this step,
+#    but the gateway (dist/src/gateway/cli.mjs) is produced here.
+npm install
+npm run build
+```
+
+Then install the plugin in Claude Code (from this local clone / your marketplace), and on Windows start the gateway:
+
+```powershell
+cd claude-code-plugin\windows
+
+# Configure provider keys (gitignored, never committed)
+copy gateway.secrets.env.example gateway.secrets.env
+notepad gateway.secrets.env        # set OPENAI_API_KEY=...
+
+# Start the permanent gateway (idempotent: a no-op if already healthy)
+powershell -NoProfile -ExecutionPolicy Bypass -File .\start-gateway.ps1
+
+# Optional: auto-start it at every logon
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-autostart.ps1
+```
+
+Full plugin install/config details (Claude Code marketplace, all env vars, data layout, security model, Codex CLI status) live in **[PLUGIN-REFERENCE.md](./PLUGIN-REFERENCE.md)**.
 
 ## Configuration
 
-The plugin reads these optional environment variables:
+Provider keys live in `claude-code-plugin/windows/gateway.secrets.env` (gitignored) and are injected into the gateway process by `start-gateway.ps1`:
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `TDAI_SESSION_KEY` | `hash(cwd)` | Override the per-project memory partition |
-| `TDAI_TOKEN_PATH` | auto-generated 0o600 file | Path to a file the daemon reads the Bearer token from (preferred over `TDAI_GATEWAY_TOKEN`; the env-var form puts the token into `/proc/<pid>/environ` and `ps -E`) |
-| `TDAI_GATEWAY_TOKEN` | unset | Bearer token via env (fallback for the Hermes sidecar mode) |
-| `TDAI_GATEWAY_HOST` | `127.0.0.1` | Daemon bind host. Non-loopback values are refused unless `TDAI_GATEWAY_ALLOW_REMOTE=1` is set, to avoid exposing the memory port to the LAN. |
-| `TDAI_GATEWAY_ALLOW_REMOTE` | unset | Opt-in switch required to bind a non-loopback `TDAI_GATEWAY_HOST` |
-| `TDAI_GATEWAY_CORS_ORIGIN` | unset | When set, enables CORS with the given Origin; the default disables CORS so cross-origin pages cannot probe the daemon's port. |
-| `TDAI_GATEWAY_COMMAND` | `npx` | Override daemon spawn command (advanced; e.g. `node /path/to/cli.mjs` for development) |
+```ini
+# Embeddings (semantic search). Any OpenAI-compatible embeddings endpoint.
+OPENAI_API_KEY=sk-...
 
-Most users never need to set any of these. `TDAI_SESSION_KEY=shared-with-other-project` is the most common power-user override.
+# Extraction LLM for L1/L2/L3. Any OpenAI-compatible endpoint —
+# e.g. Kimi/Moonshot or DeepSeek:
+# TDAI_LLM_BASE_URL=https://api.moonshot.cn/v1
+# TDAI_LLM_API_KEY=sk-...
+# TDAI_LLM_MODEL=kimi-k2-...
+```
 
-## Data location
+- **Extraction LLM (L1/L2/L3):** I use Kimi/Moonshot; DeepSeek or any OpenAI-compatible API works. Set `TDAI_LLM_BASE_URL`, `TDAI_LLM_API_KEY`, `TDAI_LLM_MODEL`.
+- **Embeddings:** I use OpenAI `text-embedding-3-small` (1536 dims) via `OPENAI_API_KEY`. Any OpenAI-compatible embeddings endpoint works.
 
-- `${CLAUDE_PLUGIN_DATA}/state.json` — daemon PID + port (tmp+rename atomic)
-- `${CLAUDE_PLUGIN_DATA}/token` — Bearer token (chmod 600, owner-uid checked)
-- `${CLAUDE_PLUGIN_DATA}/spawn.lock` — O_CREAT|O_EXCL daemon-spawn mutex (stale after 60s)
-- `${CLAUDE_PLUGIN_DATA}/cursors/<sessionId>.json` — per-cc-session `lastSentIndex` so Stop only POSTs new turns
-- `${CLAUDE_PLUGIN_DATA}/memory-tdai/` — SQLite + sqlite-vec database, scene blocks, persona snapshots
-- `${CLAUDE_PLUGIN_DATA}/hook.log` — hook diagnostic log (gateway-client failures, etc.)
-- `${CLAUDE_PLUGIN_DATA}/daemon.log` — daemon stderr/stdout (cold-start crashes, etc.)
+**Why a secrets file and not `setx`?** On Windows, a key set *after* the gateway (or its Scheduled Task) has started is not inherited by the running process — the gateway would come up with embeddings disabled and search would silently fall back to keyword. The launcher reads the file and injects the keys explicitly. See [windows/README.md](./windows/README.md).
 
 ## How it works
 
+Memory is built in four tiers, all extracted in the background so they never block your conversation:
+
 ```
-User prompt → UserPromptSubmit hook → POST /recall → cc injects context
-cc replies   → Stop hook            → POST /capture → L0 + L1/L2/L3 pipeline
-Session end  → daemon detects parent cc exit → graceful shutdown
+L0  raw conversation   ← captured after every turn
+L1  facts / atoms      ← extracted by the LLM
+L2  scenes             ← clustered episodes
+L3  persona            ← a rolling profile of you
 ```
 
-All hook handlers fail silently (writing to `hook.log`) — memory is never on the critical path of your conversation.
+Before each prompt the plugin recalls the most relevant memories (semantic vector search + keyword) and injects them into Claude's context. Memory is partitioned per project by default (a hash of the working directory). The gateway is a local HTTP service on `127.0.0.1`, protected by a Bearer token.
 
-## Troubleshooting
+## Semantic search on ARM64
 
-**`/memory-status` says "unreachable"**:
-- Check `${CLAUDE_PLUGIN_DATA}/hook.log` (gateway-client request failures) and `${CLAUDE_PLUGIN_DATA}/daemon.log` (daemon cold-start crashes)
-- Restart your cc session — the SessionStart hook re-probes and re-spawns the daemon
+`sqlite-vec` (the vector extension behind semantic search) and `node-llama-cpp` (the bundled *local* embedding option) **ship no `win32-arm64` prebuilt binary**. On ARM64 you therefore need:
 
-**Multiple cc terminals on the same project**:
-- All terminals share one daemon. The first to launch spawns it; subsequent terminals discover and reuse it via `state.json`.
+1. a **remote embedding provider** (e.g. OpenAI — set `OPENAI_API_KEY`), and
+2. a **`vec0` extension compiled for `win32-arm64`** so SQLite can load the vector tables.
 
-**Memory doesn't recall what I expect**:
-- Run `/memory-search <topic>` directly to see what's stored
-- Note that L1/L2/L3 extraction runs asynchronously — fresh conversations may need a few minutes before they appear in recall
+> **Honest heads-up:** this repository does **not** currently bundle a prebuilt `vec0.dll`. You need to supply a `win32-arm64` build of the sqlite-vec `vec0` extension for vector search to work on ARM64. Without it the gateway still runs, but semantic search degrades to keyword-only (and now says so in the log). *If a prebuilt binary is shipped here later, this section will point to it.*
 
-## Security model
+You can confirm embeddings are actually live with the health check in [windows/README.md](./windows/README.md) (`stores.embeddingService` should be `true`).
 
-- The daemon listens only on `127.0.0.1` by default. Non-loopback `TDAI_GATEWAY_HOST` is refused unless `TDAI_GATEWAY_ALLOW_REMOTE=1` is also set.
-- Every request requires `Authorization: Bearer <token>`. Comparison is timing-safe; the scheme keyword is RFC 6750 §2.1 case-insensitive; 401 responses include `WWW-Authenticate: Bearer realm="tdai-gateway"`.
-- The token is generated freshly at each daemon spawn, written to `${CLAUDE_PLUGIN_DATA}/token` (chmod 600), and passed to the daemon child process **by file path** (`TDAI_TOKEN_PATH`) rather than as an env var, so the token does not surface via `/proc/<pid>/environ` or `ps -E`. Token-file owner is checked against the current uid on read.
-- The `memory-search` skill passes the user query to the daemon over **stdin** via a heredoc, never as a shell argv element — this avoids the literal-`replaceAll` `$ARGUMENTS` injection surface in cc (anthropics/claude-code#16163).
-- On Windows the 0o077 mode check is skipped (Node's `fs` returns fixed mode bits there); the OS-provided NTFS ACL on the token file is relied on instead.
+## Rebuilding from source
 
-## Building from source
-
-```bash
-pnpm install
-pnpm build:cc-plugin
-pnpm test:cc-plugin
+```powershell
+npm install
+npm run build             # builds the gateway / core (dist/)
+npm run build:cc-plugin   # builds the Claude Code plugin (claude-code-plugin/dist/)
 ```
+
+The plugin's `claude-code-plugin/dist/` is committed so the plugin works the moment you clone it — rebuild only if you change the source.
+
+## Known limitations
+
+- **Early-adopter software.** It works on my machine (Windows 11 ARM64) and I use it daily, but it's young — expect rough edges.
+- **Based on an unmerged upstream PR.** This fork builds on the upstream `feat/claude-code-plugin` work (PR #7), which is not yet merged into TencentDB Agent Memory.
+- **ARM64 semantic search needs a `vec0` build you supply** (see above).
+- **No support guarantee.** Provided **as-is**, with no warranty and no guaranteed support. Issues and PRs are welcome, but please don't expect SLA-style help.
+- **Codex CLI support is partial** — see [PLUGIN-REFERENCE.md](./PLUGIN-REFERENCE.md#codex-cli).
+
+## Credits & attribution
+
+This fork stands entirely on the work of others:
+
+- **[TencentDB Agent Memory](https://github.com/Tencent/TencentDB-Agent-Memory)** by Tencent — the memory engine, the L0–L3 pipeline, and the gateway.
+- The **Claude Code plugin adapter** by **李冠辰 (liguanchen)** — the upstream `feat/claude-code-plugin` work (PR #7) this fork is based on.
+
+My contribution is the Windows/ARM64 enablement and the fixes listed in [What this fork adds](#what-this-fork-adds). All original copyright and the MIT license are preserved.
 
 ## License
 
-MIT — see [LICENSE](../LICENSE).
+MIT — inherited from the upstream project. See [LICENSE](../LICENSE). Original copyright remains with the TencentDB Agent Memory authors.
