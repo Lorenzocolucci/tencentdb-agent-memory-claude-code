@@ -32,6 +32,8 @@ benchmark-runs/
 # Dev-only scripts & lockfile (not shipped in MR)
 install-plugin.sh
 package-lock.json
+# ...except the published fork plugin's lockfile (committed for reproducible installs)
+!claude-code-plugin/package-lock.json
 pnpm-lock.yaml
 yarn.lock
 test-offload.sh
@@ -50,3 +52,7 @@ CLAUDE.md
 
 # Plugin build output
 claude-code-plugin/dist/
+
+# Windows launcher secrets (provider API keys) - NEVER commit, local only
+gateway.secrets.env
+*.secrets.env

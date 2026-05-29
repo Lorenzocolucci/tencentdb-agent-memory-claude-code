@@ -1,0 +1,42 @@
+{
+  "name": "tdai-memory",
+  "version": "0.1.0",
+  "description": "Long-term + symbolic short-term memory for Claude Code, powered by TencentDB Agent Memory.",
+  "type": "module",
+  "license": "MIT",
+  "author": {
+    "name": "李冠辰",
+    "email": "liguanchen@xiaomi.com"
+  },
+  "contributors": [
+    {
+      "name": "Lorenzo Colucci",
+      "url": "https://github.com/Lorenzocolucci"
+    }
+  ],
+  "homepage": "https://github.com/Lorenzocolucci/tencentdb-agent-memory-claude-code",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Lorenzocolucci/tencentdb-agent-memory-claude-code"
+  },
+  "files": [
+    "dist",
+    "hooks",
+    "skills",
+    ".claude-plugin",
+    ".codex-plugin",
+    "README.md",
+    "README_CN.md"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "build:cc-plugin": "tsdown",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "tsdown": "^0.21.10"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

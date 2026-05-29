@@ -6,8 +6,14 @@
     "name": "李冠辰",
     "email": "liguanchen@xiaomi.com"
   },
-  "homepage": "https://github.com/Tencent/TencentDB-Agent-Memory",
-  "repository": "https://github.com/Tencent/TencentDB-Agent-Memory",
+  "contributors": [
+    {
+      "name": "Lorenzo Colucci",
+      "url": "https://github.com/Lorenzocolucci"
+    }
+  ],
+  "homepage": "https://github.com/Lorenzocolucci/tencentdb-agent-memory-claude-code",
+  "repository": "https://github.com/Lorenzocolucci/tencentdb-agent-memory-claude-code",
   "license": "MIT",
   "keywords": [
     "memory",
