@@ -232,14 +232,16 @@ export async function writeMemory(params: {
         `content="${record.content.slice(0, 80)}..."`,
       );
 
-      let embedding: Float32Array | undefined;
+      // Chunk long content into N vectors so the WHOLE record is indexable
+      // (no silent truncation of the tail). upsertL1 stores one vector per chunk.
+      let embedding: Float32Array[] | undefined;
 
       if (embeddingService) {
         try {
-          embedding = await embeddingService.embed(record.content);
+          embedding = await embeddingService.embedChunks(record.content);
           logger?.debug?.(
-            `${TAG} [vec-dual-write] Embedding OK: dims=${embedding.length}, ` +
-            `norm=${Math.sqrt(Array.from(embedding).reduce((s, v) => s + v * v, 0)).toFixed(4)}`,
+            `${TAG} [vec-dual-write] Embedding OK: chunks=${embedding.length}` +
+            (embedding[0] ? `, dims=${embedding[0].length}` : ""),
           );
         } catch (embedErr) {
           // Embedding failed — pass undefined to upsert() which writes

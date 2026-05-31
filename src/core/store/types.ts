@@ -257,7 +257,12 @@ export interface IMemoryStore {
 
   // ── L1 Write ─────────────────────────────────────────────
 
-  upsertL1(record: MemoryRecord, embedding?: Float32Array): MaybePromise<boolean>;
+  /**
+   * Persist an L1 record's vector(s).  `embedding` may be a single Float32Array
+   * (one vector) or an array of chunk vectors (one per chunk of a long text);
+   * all chunks are stored against the same record id.
+   */
+  upsertL1(record: MemoryRecord, embedding?: Float32Array | Float32Array[]): MaybePromise<boolean>;
   deleteL1(recordId: string): MaybePromise<boolean>;
   deleteL1Batch(recordIds: string[]): MaybePromise<boolean>;
   deleteL1Expired(cutoffIso: string): MaybePromise<number>;
@@ -281,9 +286,12 @@ export interface IMemoryStore {
 
   // ── L0 Write ─────────────────────────────────────────────
 
-  upsertL0(record: L0Record, embedding?: Float32Array): MaybePromise<boolean>;
-  /** Update only the vector embedding for an existing L0 record (sqlite background path). */
-  updateL0Embedding?(recordId: string, embedding: Float32Array): MaybePromise<boolean>;
+  upsertL0(record: L0Record, embedding?: Float32Array | Float32Array[]): MaybePromise<boolean>;
+  /**
+   * Update only the vector embedding for an existing L0 record (sqlite background path).
+   * Accepts a single vector or an array of chunk vectors.
+   */
+  updateL0Embedding?(recordId: string, embedding: Float32Array | Float32Array[]): MaybePromise<boolean>;
   deleteL0(recordId: string): MaybePromise<boolean>;
   deleteL0Expired(cutoffIso: string): MaybePromise<number>;
 
@@ -306,7 +314,7 @@ export interface IMemoryStore {
   // ── Re-index ─────────────────────────────────────────────
 
   reindexAll(
-    embedFn: (text: string) => Promise<Float32Array>,
+    embedFn: (text: string) => Promise<Float32Array | Float32Array[]>,
     onProgress?: (done: number, total: number, layer: "L1" | "L0") => void,
   ): Promise<{ l1Count: number; l0Count: number }>;
 

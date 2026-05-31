@@ -10,6 +10,7 @@
 
 import type { Command } from "commander";
 import { registerSeedCommand } from "./commands/seed.js";
+import { registerReindexCommand } from "./commands/reindex.js";
 
 // ============================
 // Context type
@@ -54,6 +55,7 @@ export interface SeedCliContext {
 export function registerMemoryTdaiCli(program: Command, ctx: SeedCliContext): void {
   // Register subcommands
   registerSeedCommand(program, ctx);
+  registerReindexCommand(program, ctx);
 
   // Future: registerQueryCommand(program, ctx);
   // Future: registerStatsCommand(program, ctx);

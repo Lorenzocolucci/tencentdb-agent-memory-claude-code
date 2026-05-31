@@ -99,6 +99,9 @@ export function createStoreBundle(
           model: config.embedding.model,
           dimensions: config.embedding.dimensions,
           maxInputChars: config.embedding.maxInputChars,
+          chunkSize: config.embedding.chunkSize,
+          chunkOverlap: config.embedding.chunkOverlap,
+          maxChunksPerText: config.embedding.maxChunksPerText,
         }, logger);
       } else if (config.embedding.provider !== "none" && config.embedding.provider !== "local") {
         // A remote embedding provider was configured but the service was NOT

@@ -13,6 +13,15 @@
  * - Throws on failure; callers decide fallback strategy.
  */
 
+import {
+  resolveChunkOptions,
+  splitIntoChunks,
+  DEFAULT_CHUNK_SIZE,
+  DEFAULT_CHUNK_OVERLAP,
+  DEFAULT_MAX_CHUNKS_PER_TEXT,
+  type ChunkOptions,
+} from "./chunking.js";
+
 // ============================
 // Types
 // ============================
@@ -30,8 +39,20 @@ export interface OpenAIEmbeddingConfig {
   dimensions: number;
   /** Local proxy URL (only for provider="qclaw") — requests are forwarded through this proxy with Remote-URL header */
   proxyUrl?: string;
-  /** Max input text length in characters before truncation (default: 5000). */
+  /**
+   * Legacy backstop only.  Individual embed inputs are now bounded by chunking
+   * (`chunkSize`), so long texts are split into overlapping chunks instead of
+   * being truncated.  When set, `maxInputChars` is treated as an upper bound on
+   * the effective chunk size (the smaller of `chunkSize` and `maxInputChars`
+   * wins) — it never silently drops the tail of a text any more.
+   */
   maxInputChars?: number;
+  /** Target chunk size in characters for long inputs (default: 2000). */
+  chunkSize?: number;
+  /** Overlap between consecutive chunks in characters (default: 200, must be < chunkSize). */
+  chunkOverlap?: number;
+  /** Maximum number of chunks produced from a single text (default: 50). */
+  maxChunksPerText?: number;
   /** Timeout per API call in milliseconds (default: 10000). */
   timeoutMs?: number;
 }
@@ -60,10 +81,26 @@ export interface EmbeddingCallOptions {
 }
 
 export interface EmbeddingService {
-  /** Get embedding for a single text */
+  /**
+   * Get embedding for a single text.
+   *
+   * Returns ONE vector.  For long texts (e.g. recall queries that happen to be
+   * long) the text is chunked and the FIRST chunk's vector is returned, so the
+   * 1-vector contract this method has always had is preserved.  To index a long
+   * text in full (one vector per chunk), use {@link embedChunks}.
+   */
   embed(text: string, options?: EmbeddingCallOptions): Promise<Float32Array>;
-  /** Get embeddings for multiple texts (batched API call) */
+  /** Get embeddings for multiple texts (batched API call) — ONE vector per input text. */
   embedBatch(texts: string[], options?: EmbeddingCallOptions): Promise<Float32Array[]>;
+  /**
+   * Get embeddings for a single text split into overlapping chunks.
+   *
+   * Returns N vectors (N >= 1), one per chunk, so the WHOLE text is indexable —
+   * the tail is never silently truncated.  Callers persist all returned vectors
+   * against the same parent record id.  An empty / whitespace-only input yields
+   * an empty array.
+   */
+  embedChunks(text: string, options?: EmbeddingCallOptions): Promise<Float32Array[]>;
   /** Return the configured vector dimensions */
   getDimensions(): number;
   /** Return provider + model identifiers for change detection */
@@ -256,6 +293,35 @@ export class LocalEmbeddingService implements EmbeddingService {
   }
 
   /**
+   * Get embeddings for a single text split into overlapping chunks.
+   *
+   * The local model has a tiny 256-token context window, so we chunk on
+   * LOCAL_MAX_INPUT_CHARS instead of silently truncating — every part of the
+   * text gets its own vector.
+   */
+  async embedChunks(text: string, _options?: EmbeddingCallOptions): Promise<Float32Array[]> {
+    this.assertReady();
+    const opts: ChunkOptions = resolveChunkOptions({
+      chunkSize: LOCAL_MAX_INPUT_CHARS,
+      chunkOverlap: Math.min(DEFAULT_CHUNK_OVERLAP, Math.floor(LOCAL_MAX_INPUT_CHARS / 4)),
+      maxChunks: DEFAULT_MAX_CHUNKS_PER_TEXT,
+    });
+    const { chunks, truncated, originalLength } = splitIntoChunks(text, opts);
+    if (truncated) {
+      this.logger?.warn(
+        `${TAG} Local embedChunks: input of ${originalLength} chars hit maxChunks=${opts.maxChunks} cap ` +
+        `(chunkSize=${opts.chunkSize}); tail beyond ~${opts.maxChunks * opts.chunkSize} chars NOT indexed.`,
+      );
+    }
+    const results: Float32Array[] = [];
+    for (const chunk of chunks) {
+      const embedding = await this.embeddingContext!.getEmbeddingFor(chunk);
+      results.push(sanitizeAndNormalize(embedding.vector));
+    }
+    return results;
+  }
+
+  /**
    * Release the node-llama-cpp embedding context and model resources.
    * Safe to call multiple times (idempotent).
    */
@@ -409,6 +475,7 @@ export class OpenAIEmbeddingService implements EmbeddingService {
   private readonly providerName: string;
   private readonly proxyUrl?: string;
   private readonly maxInputChars?: number;
+  private readonly chunkOptions: ChunkOptions;
   private readonly timeoutMs: number;
   private readonly logger?: Logger;
 
@@ -432,6 +499,18 @@ export class OpenAIEmbeddingService implements EmbeddingService {
     this.providerName = config.provider || "openai";
     this.proxyUrl = config.proxyUrl?.trim() || undefined;
     this.maxInputChars = config.maxInputChars && config.maxInputChars > 0 ? config.maxInputChars : undefined;
+    // Chunk size is the real per-input bound now.  When a (legacy) maxInputChars
+    // is set we treat it as an upper bound on chunk size so existing configs that
+    // lowered maxInputChars keep producing chunks no larger than they asked for.
+    const requestedChunkSize = config.chunkSize && config.chunkSize > 0 ? config.chunkSize : DEFAULT_CHUNK_SIZE;
+    const effectiveChunkSize = this.maxInputChars
+      ? Math.min(requestedChunkSize, this.maxInputChars)
+      : requestedChunkSize;
+    this.chunkOptions = resolveChunkOptions({
+      chunkSize: effectiveChunkSize,
+      chunkOverlap: config.chunkOverlap ?? DEFAULT_CHUNK_OVERLAP,
+      maxChunks: config.maxChunksPerText ?? DEFAULT_MAX_CHUNKS_PER_TEXT,
+    });
     this.timeoutMs = config.timeoutMs && config.timeoutMs > 0 ? config.timeoutMs : DEFAULT_API_TIMEOUT_MS;
     this.logger = logger;
   }
@@ -462,35 +541,64 @@ export class OpenAIEmbeddingService implements EmbeddingService {
   async embedBatch(texts: string[], options?: EmbeddingCallOptions): Promise<Float32Array[]> {
     if (texts.length === 0) return [];
 
-    // Truncate texts exceeding maxInputChars limit
-    const processedTexts = this.maxInputChars
-      ? texts.map((t) => this.truncateInput(t))
-      : texts;
+    // ONE vector per input text.  For texts longer than the chunk size we embed
+    // only the FIRST chunk here (preserving the historical 1:1 contract) — long
+    // texts that must be indexed in full go through embedChunks() instead.
+    const firstChunks = texts.map((t) => this.firstChunk(t));
 
-    // Split into sub-batches if needed
-    if (processedTexts.length > MAX_BATCH_SIZE) {
+    // Split into sub-batches if needed (OpenAI batch-size limit).
+    if (firstChunks.length > MAX_BATCH_SIZE) {
       const results: Float32Array[] = [];
-      for (let i = 0; i < processedTexts.length; i += MAX_BATCH_SIZE) {
-        const chunk = processedTexts.slice(i, i + MAX_BATCH_SIZE);
-        const chunkResults = await this._callApi(chunk, options?.timeoutMs);
-        results.push(...chunkResults);
+      for (let i = 0; i < firstChunks.length; i += MAX_BATCH_SIZE) {
+        const sub = firstChunks.slice(i, i + MAX_BATCH_SIZE);
+        const subResults = await this._callApi(sub, options?.timeoutMs);
+        results.push(...subResults);
       }
       return results;
     }
 
-    return this._callApi(processedTexts, options?.timeoutMs);
+    return this._callApi(firstChunks, options?.timeoutMs);
+  }
+
+  async embedChunks(text: string, options?: EmbeddingCallOptions): Promise<Float32Array[]> {
+    const { chunks, truncated, originalLength } = splitIntoChunks(text, this.chunkOptions);
+    if (chunks.length === 0) return [];
+    if (truncated) {
+      this.logger?.warn?.(
+        `${TAG} embedChunks: input of ${originalLength} chars hit maxChunks=${this.chunkOptions.maxChunks} cap ` +
+        `(chunkSize=${this.chunkOptions.chunkSize}, overlap=${this.chunkOptions.chunkOverlap}); ` +
+        `tail beyond the cap was NOT indexed. Raise maxChunksPerText if full coverage is required.`,
+      );
+    }
+    if (chunks.length > 1) {
+      this.logger?.debug?.(
+        `${TAG} embedChunks: split ${originalLength} chars into ${chunks.length} chunk(s) ` +
+        `(chunkSize=${this.chunkOptions.chunkSize}, overlap=${this.chunkOptions.chunkOverlap})`,
+      );
+    }
+
+    // Sub-batch the chunks through the OpenAI batch-size limit, preserving order.
+    if (chunks.length > MAX_BATCH_SIZE) {
+      const results: Float32Array[] = [];
+      for (let i = 0; i < chunks.length; i += MAX_BATCH_SIZE) {
+        const sub = chunks.slice(i, i + MAX_BATCH_SIZE);
+        const subResults = await this._callApi(sub, options?.timeoutMs);
+        results.push(...subResults);
+      }
+      return results;
+    }
+
+    return this._callApi(chunks, options?.timeoutMs);
   }
 
   /**
-   * Truncate input text to stay within the configured maxInputChars limit.
-   * Logs a warning when truncation occurs.
+   * Return the first chunk of a text (the whole text if it fits in one chunk).
+   * Used by the single-vector embed()/embedBatch() path. No silent truncation:
+   * callers that need the full text indexed use embedChunks().
    */
-  private truncateInput(text: string): string {
-    if (!this.maxInputChars || text.length <= this.maxInputChars) return text;
-    this.logger?.warn?.(
-      `${TAG} Input truncated from ${text.length} to ${this.maxInputChars} chars (maxInputChars limit)`,
-    );
-    return text.slice(0, this.maxInputChars);
+  private firstChunk(text: string): string {
+    const { chunks } = splitIntoChunks(text, this.chunkOptions);
+    return chunks[0] ?? text;
   }
 
   private async _callApi(texts: string[], timeoutOverride?: number): Promise<Float32Array[]> {
@@ -631,6 +739,12 @@ export class NoopEmbeddingService implements EmbeddingService {
 
   embedBatch(texts: string[]): Promise<Float32Array[]> {
     return Promise.resolve(texts.map(() => new Float32Array(0)));
+  }
+
+  embedChunks(text: string): Promise<Float32Array[]> {
+    // Server-side embedding generates vectors from text during upsert; emit a
+    // single empty placeholder for non-empty input to keep the 1+ contract.
+    return Promise.resolve(text.trim().length === 0 ? [] : [new Float32Array(0)]);
   }
 
   getDimensions(): number {

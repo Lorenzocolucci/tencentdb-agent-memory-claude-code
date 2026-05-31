@@ -390,7 +390,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
 
   // ── L1 Write Operations ──────────────────────────────────
 
-  async upsertL1(record: MemoryRecord, _embedding?: Float32Array): Promise<boolean> {
+  async upsertL1(record: MemoryRecord, _embedding?: Float32Array | Float32Array[]): Promise<boolean> {
     try {
       await this._upsertL1Async(record);
       return true;
@@ -713,7 +713,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
 
   // ── L0 Write Operations ──────────────────────────────────
 
-  async upsertL0(record: { id: string; sessionKey: string; sessionId: string; role: string; messageText: string; recordedAt: string; timestamp: number }, _embedding?: Float32Array): Promise<boolean> {
+  async upsertL0(record: { id: string; sessionKey: string; sessionId: string; role: string; messageText: string; recordedAt: string; timestamp: number }, _embedding?: Float32Array | Float32Array[]): Promise<boolean> {
     try {
       await this._upsertL0Async(record);
       return true;
@@ -1122,7 +1122,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
   // ── Re-index ─────────────────────────────────────────────
 
   async reindexAll(
-    _embedFn: (text: string) => Promise<Float32Array>,
+    _embedFn: (text: string) => Promise<Float32Array | Float32Array[]>,
     _onProgress?: (done: number, total: number, layer: "L1" | "L0") => void,
   ): Promise<{ l1Count: number; l0Count: number }> {
     // TCVDB uses server-side embedding — reindex means rebuild Collection.
