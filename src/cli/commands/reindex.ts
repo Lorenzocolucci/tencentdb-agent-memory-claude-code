@@ -32,7 +32,7 @@ const TAG = "[memory-tdai] [reindex-cmd]";
 /** Best-effort TCP probe timeout for the live-gateway guard. */
 const GATEWAY_PROBE_TIMEOUT_MS = 300;
 
-interface ReindexCommandOptions {
+export interface ReindexCommandOptions {
   /** Directory containing the store (vectors.db). Required — never guessed. */
   dataDir: string;
   /** Path to a config override file (JSON, deep-merged on top of plugin config). */
@@ -77,7 +77,7 @@ Notes:
 // Command handler
 // ============================
 
-async function runReindexCommand(opts: ReindexCommandOptions, ctx: SeedCliContext): Promise<void> {
+export async function runReindexCommand(opts: ReindexCommandOptions, ctx: SeedCliContext): Promise<void> {
   const { logger } = ctx;
 
   const dataDir = path.resolve(opts.dataDir);
