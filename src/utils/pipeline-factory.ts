@@ -699,6 +699,22 @@ export async function createPipeline(opts: PipelineFactoryOptions): Promise<Pipe
   const stores = await initStores(cfg, pluginDataDir, logger);
   const { vectorStore, embeddingService } = stores;
 
+  // Surface a needs-reindex condition at runtime. The legacy-vec-schema
+  // migration in sqlite.ts DROPs + recreates the vec0 tables (they come back
+  // EMPTY), so semantic recall returns nothing until the operator runs the
+  // reindex CLI. needsReindex was previously only emitted at debug level and
+  // then discarded — leaving the operator unaware their semantic recall is
+  // silently empty. We WARN (do NOT auto-reindex: re-embedding all records at
+  // startup would be unbounded and could race the live gateway). Keyword (FTS)
+  // recall still works, so this is partial — not total — degradation.
+  if (stores.needsReindex) {
+    logger.warn(
+      `${TAG} Vector index was rebuilt/cleared (reason: ${stores.reindexReason ?? "unknown"}). ` +
+      `Semantic recall is EMPTY until you run: openclaw memory-tdai reindex --data-dir ${pluginDataDir}. ` +
+      `Keyword recall still works.`,
+    );
+  }
+
   // Create pipeline manager
   const scheduler = createPipelineManager(cfg, logger, sessionFilter);
 
