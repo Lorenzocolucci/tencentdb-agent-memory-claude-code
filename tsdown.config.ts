@@ -11,7 +11,7 @@ function collectExternalDependencies(): string[] {
 }
 
 export default defineConfig({
-  entry: ["./index.ts", "./src/gateway/cli.ts"],
+  entry: ["./index.ts", "./src/gateway/cli.ts", "./src/cli/reindex-standalone.ts"],
   outDir: "./dist",
   format: "esm",
   platform: "node",

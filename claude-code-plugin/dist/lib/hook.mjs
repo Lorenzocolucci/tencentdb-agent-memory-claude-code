@@ -15,17 +15,50 @@ import { homedir } from "node:os";
 * an empty / no-op response rather than throwing). Failures are also
 * appended to an optional log file so the daemon's health can be diagnosed
 * via /memory-status without re-attaching a debugger.
+*
+* RESILIENCE NOTES (Phase 3):
+* - Timeouts are named constants (see below) so they are easy to tune.
+* - The capture/write path (POST /capture) gets a separate, more generous
+*   timeout than recall, so transient gateway slowness during session save
+*   does not silently drop the session.
+* - On 401 (stale token after gateway restart) the client re-reads the token
+*   file once and retries the request automatically.
+* - On any capture failure the caller (hook.ts) emits a loud stderr warning
+*   visible in the Claude Code UI — not just a hidden log file.
 */
+/** Recall timeout: must not hang the prompt; kept short and non-blocking. */
+const RECALL_TIMEOUT_MS = 4e3;
+/** Capture timeout: session save is more important; allow extra time for a
+*  slow gateway write-through before declaring the save lost. */
+const CAPTURE_TIMEOUT_MS = 12e3;
 var GatewayClient = class {
 	baseUrl;
 	token;
 	timeoutMs;
 	logPath;
+	/** Path to the token file; when set, token is always read fresh from disk. */
+	tokenPath;
 	constructor(config) {
 		this.baseUrl = new URL(config.baseUrl);
 		this.token = config.token;
 		this.timeoutMs = config.timeoutMs ?? 5e3;
 		this.logPath = config.logPath;
+		this.tokenPath = config.tokenPath;
+	}
+	/**
+	* Read the current token from disk (Phase 3: TOKEN/AUTH — no cached token).
+	* Falls back to the in-memory token if the file cannot be read.
+	*/
+	async freshToken() {
+		if (!this.tokenPath) return this.token;
+		try {
+			const t = (await readFile(this.tokenPath, "utf-8")).trim();
+			if (t) {
+				this.token = t;
+				return t;
+			}
+		} catch {}
+		return this.token;
 	}
 	async logFailure(method, path, detail) {
 		if (!this.logPath) return;
@@ -38,7 +71,8 @@ var GatewayClient = class {
 	}
 	async health() {
 		try {
-			const { status, body } = await this.request("GET", "/health");
+			const token = await this.freshToken();
+			const { status, body } = await this.rawRequest("GET", "/health", void 0, token);
 			if (status === 200) return true;
 			await this.logFailure("GET", "/health", this.describeStatus(status, body));
 			return false;
@@ -49,10 +83,11 @@ var GatewayClient = class {
 	}
 	async recall(query, sessionKey) {
 		try {
-			const { status, body } = await this.request("POST", "/recall", {
+			const token = await this.freshToken();
+			const { status, body } = await this.rawRequest("POST", "/recall", {
 				query,
 				session_key: sessionKey
-			});
+			}, token, RECALL_TIMEOUT_MS);
 			if (status !== 200) {
 				await this.logFailure("POST", "/recall", this.describeStatus(status, body));
 				return { context: "" };
@@ -68,9 +103,33 @@ var GatewayClient = class {
 			return { context: "" };
 		}
 	}
+	/**
+	* POST /capture — uses CAPTURE_TIMEOUT_MS (generous) so slow gateway writes
+	* are not falsely treated as failures (Phase 3: HOOK CLIENT TIMEOUT).
+	*
+	* Returns null on failure; the caller (handleStop in hook.ts) is responsible
+	* for emitting a LOUD user-visible warning in that case (Phase 3: NO SILENT
+	* FAILURE).
+	*/
 	async captureTurn(payload) {
+		const result = await this.captureTurnOnce(payload);
+		if (result !== null) return result;
+		await new Promise((r) => setTimeout(r, 2e3));
+		return this.captureTurnOnce(payload);
+	}
+	/** Single attempt at POST /capture; returns null (and logs) on any error. */
+	async captureTurnOnce(payload) {
 		try {
-			const { status, body } = await this.request("POST", "/capture", payload);
+			const token = await this.freshToken();
+			const { status, body } = await this.rawRequest("POST", "/capture", payload, token, CAPTURE_TIMEOUT_MS);
+			if (status === 401 && this.tokenPath) {
+				this.token = "";
+				const freshTok = await this.freshToken();
+				const retry = await this.rawRequest("POST", "/capture", payload, freshTok, CAPTURE_TIMEOUT_MS);
+				if (retry.status === 200) return JSON.parse(retry.body);
+				await this.logFailure("POST", "/capture", `401 after token refresh: ${this.describeStatus(retry.status, retry.body)}`);
+				return null;
+			}
 			if (status !== 200) {
 				await this.logFailure("POST", "/capture", this.describeStatus(status, body));
 				return null;
@@ -83,12 +142,13 @@ var GatewayClient = class {
 	}
 	async searchMemories(query, opts) {
 		try {
-			const { status, body } = await this.request("POST", "/search/memories", {
+			const token = await this.freshToken();
+			const { status, body } = await this.rawRequest("POST", "/search/memories", {
 				query,
 				limit: opts?.limit,
 				type: opts?.type,
 				scene: opts?.scene
-			});
+			}, token);
 			if (status !== 200) {
 				await this.logFailure("POST", "/search/memories", this.describeStatus(status, body));
 				return {
@@ -107,11 +167,12 @@ var GatewayClient = class {
 	}
 	async searchConversations(query, opts) {
 		try {
-			const { status, body } = await this.request("POST", "/search/conversations", {
+			const token = await this.freshToken();
+			const { status, body } = await this.rawRequest("POST", "/search/conversations", {
 				query,
 				limit: opts?.limit,
 				session_key: opts?.sessionKey
-			});
+			}, token);
 			if (status !== 200) {
 				await this.logFailure("POST", "/search/conversations", this.describeStatus(status, body));
 				return {
@@ -130,15 +191,16 @@ var GatewayClient = class {
 	}
 	async sessionEnd(sessionKey) {
 		try {
-			const { status, body } = await this.request("POST", "/session/end", { session_key: sessionKey });
+			const token = await this.freshToken();
+			const { status, body } = await this.rawRequest("POST", "/session/end", { session_key: sessionKey }, token);
 			if (status !== 200) await this.logFailure("POST", "/session/end", this.describeStatus(status, body));
 		} catch (err) {
 			await this.logFailure("POST", "/session/end", err instanceof Error ? err.message : String(err));
 		}
 	}
-	request(method, path, bodyObj) {
+	rawRequest(method, path, bodyObj, token = this.token, timeoutMs = this.timeoutMs) {
 		return new Promise((resolve, reject) => {
-			const bodyStr = bodyObj ? JSON.stringify(bodyObj) : void 0;
+			const bodyStr = bodyObj !== void 0 ? JSON.stringify(bodyObj) : void 0;
 			const opts = {
 				protocol: this.baseUrl.protocol,
 				hostname: this.baseUrl.hostname,
@@ -146,7 +208,7 @@ var GatewayClient = class {
 				method,
 				path,
 				headers: {
-					Authorization: `Bearer ${this.token}`,
+					Authorization: `Bearer ${token}`,
 					...bodyStr ? {
 						"Content-Type": "application/json",
 						"Content-Length": Buffer.byteLength(bodyStr).toString()
@@ -161,8 +223,8 @@ var GatewayClient = class {
 					body: Buffer.concat(chunks).toString("utf-8")
 				}));
 			});
-			req.setTimeout(this.timeoutMs, () => {
-				req.destroy(/* @__PURE__ */ new Error(`Timeout after ${this.timeoutMs}ms`));
+			req.setTimeout(timeoutMs, () => {
+				req.destroy(/* @__PURE__ */ new Error(`Timeout after ${timeoutMs}ms`));
 			});
 			req.on("error", reject);
 			if (bodyStr) req.write(bodyStr);
@@ -598,13 +660,17 @@ async function handleStop(data, client) {
 		content: t.assistant
 	}]);
 	const lastTurn = newTurns[newTurns.length - 1];
-	await client.captureTurn({
+	if (await client.captureTurn({
 		user_content: lastTurn.user,
 		assistant_content: lastTurn.assistant,
 		messages,
 		session_key: sessionKey,
 		session_id: data.session_id
-	});
+	}) === null) {
+		process.stderr.write("⚠️ TencentDB: session NOT saved — gateway may be down or the token is stale. Run C:\\Users\\lo\\tdai-gateway\\start-gateway.ps1 to restart it.\n");
+		await safeLog(join(dataDir, "hook.log"), "stop: captureTurn failed after retry — session not saved");
+		return "";
+	}
 	await writeCursor(dataDir, cursorId, allTurns.length);
 	return "";
 }
@@ -895,8 +961,9 @@ async function main() {
 			client: new GatewayClient({
 				baseUrl: `http://127.0.0.1:${state.port}`,
 				token,
-				timeoutMs: event === "user-prompt-submit" ? 4e3 : 1e4,
-				logPath
+				timeoutMs: event === "user-prompt-submit" ? RECALL_TIMEOUT_MS : CAPTURE_TIMEOUT_MS,
+				logPath,
+				tokenPath: state.tokenPath
 			}),
 			args
 		});

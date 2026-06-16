@@ -259,13 +259,13 @@ export async function performAutoCapture(params: {
       const bgPromise: Promise<void> = (async () => {
         const tBgStart = performance.now();
         try {
-          const texts = bgSnapshot.map((r) => r.content);
-          const embeddings = await bgEmbeddingService.embedBatch(texts);
-
           let bgUpdated = 0;
           for (let i = 0; i < bgSnapshot.length; i++) {
             try {
-              const ok = await bgVectorStore.updateL0Embedding!(bgSnapshot[i].recordId, embeddings[i]);
+              // Chunk each message so long L0 messages are indexed in full
+              // (one vector per chunk against the same record id).
+              const chunkVectors = await bgEmbeddingService.embedChunks(bgSnapshot[i].content);
+              const ok = await bgVectorStore.updateL0Embedding!(bgSnapshot[i].recordId, chunkVectors);
               if (ok) bgUpdated++;
             } catch (err) {
               bgLogger?.warn?.(

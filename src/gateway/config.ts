@@ -90,7 +90,10 @@ export function loadGatewayConfig(overrides?: Partial<GatewayConfig>): GatewayCo
     baseUrl: env("TDAI_LLM_BASE_URL") ?? str(llmConfig, "baseUrl") ?? "https://api.openai.com/v1",
     apiKey: env("TDAI_LLM_API_KEY") ?? str(llmConfig, "apiKey") ?? "",
     model: env("TDAI_LLM_MODEL") ?? str(llmConfig, "model") ?? "gpt-4o",
-    maxTokens: envInt("TDAI_LLM_MAX_TOKENS") ?? num(llmConfig, "maxTokens") ?? 4096,
+    // RC5: default 16000 (was 4096) to stop silent truncation of long L1 JSON.
+    maxTokens: envInt("TDAI_LLM_MAX_TOKENS") ?? num(llmConfig, "maxTokens") ?? 16000,
+    // RC5: default temperature 1 (Kimi/Moonshot requires exactly 1).
+    temperature: envFloat("TDAI_LLM_TEMPERATURE") ?? num(llmConfig, "temperature") ?? 1,
     timeoutMs: envInt("TDAI_LLM_TIMEOUT_MS") ?? num(llmConfig, "timeoutMs") ?? 120_000,
   };
 
@@ -181,6 +184,13 @@ function envInt(key: string): number | undefined {
   const v = env(key);
   if (!v) return undefined;
   const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function envFloat(key: string): number | undefined {
+  const v = env(key);
+  if (!v) return undefined;
+  const n = parseFloat(v);
   return Number.isFinite(n) ? n : undefined;
 }
 

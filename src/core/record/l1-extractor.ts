@@ -121,7 +121,11 @@ export async function extractL1Memories(params: {
   const maxNewMessages = options.maxMessagesPerExtraction ?? 10;
   const maxBgMessages = options.maxBackgroundMessages ?? 5;
   const enableDedup = options.enableDedup ?? true;
-  const maxMemoriesPerSession = options.maxMemoriesPerSession ?? 10;
+  // Default 30 (was 10): with technical work-facts now first-class episodic
+  // memories, a dense coding session easily produces >10 atomic facts
+  // (decisions + bugs + fixes + config changes). A cap of 10 would silently
+  // truncate them at the slice below. 30 covers realistic dense sessions.
+  const maxMemoriesPerSession = options.maxMemoriesPerSession ?? 30;
 
   if (messages.length === 0) {
     logger?.debug?.(`${TAG} No messages to extract from`);
@@ -185,10 +189,28 @@ export async function extractL1Memories(params: {
         logger?.warn?.(`${TAG} Skipping memory with invalid type "${mem.type}"`);
         continue;
       }
+      // RC4 defense-in-depth: cap per-memory content length and clamp priority.
+      // 1000 chars leaves headroom for rich technical episodic facts (typically
+      // ~400-600 chars: file:line + function + numbers + error text), while
+      // multi-paragraph config/CLAUDE.md dumps (which the prompt already forbids)
+      // are still rejected here too.
+      const MAX_MEMORY_CONTENT_CHARS = 1000;
+      const rawContent = typeof mem.content === "string" ? mem.content.trim() : "";
+      if (rawContent.length === 0 || rawContent.length > MAX_MEMORY_CONTENT_CHARS) {
+        logger?.warn?.(
+          `${TAG} Skipping memory: content length ${rawContent.length} out of [1, ${MAX_MEMORY_CONTENT_CHARS}] ` +
+          `(type=${memType}, preview="${rawContent.slice(0, 80)}")`,
+        );
+        continue;
+      }
+      // The -1 (死命令) priority band was removed from the extraction prompt
+      // (Deliverable 2a), so clamp to [0, 100].
+      const rawPriority = typeof mem.priority === "number" ? mem.priority : 50;
+      const clampedPriority = Math.max(0, Math.min(100, Math.round(rawPriority)));
       allExtracted.push({
-        content: mem.content,
+        content: rawContent,
         type: memType,
-        priority: typeof mem.priority === "number" ? mem.priority : 50,
+        priority: clampedPriority,
         source_message_ids: Array.isArray(mem.source_message_ids) ? mem.source_message_ids : [],
         metadata: mem.metadata ?? {},
         scene_name: scene.scene_name,

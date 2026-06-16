@@ -74,6 +74,11 @@ export interface LLMRunParams {
   /** Max output tokens (optional — defaults to model catalog value). */
   maxTokens?: number;
   /**
+   * Sampling temperature (optional). When omitted, the standalone runner
+   * defaults to 1 (required by Kimi/Moonshot for stable structured output).
+   */
+  temperature?: number;
+  /**
    * Working directory for tool-enabled runs.
    * When `enableTools` is true, the LLM's file tools resolve paths relative to this dir.
    * When omitted, a clean empty workspace is used.

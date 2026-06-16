@@ -106,8 +106,19 @@ export interface EmbeddingConfig {
   conflictRecallTopK: number;
   /** Proxy URL for qclaw provider — when provider="qclaw", requests are forwarded through this local proxy */
   proxyUrl?: string;
-  /** Max input text length in characters before truncation (default: 5000). Texts exceeding this limit are truncated with a warning. */
+  /**
+   * Legacy backstop on input length (default: 5000).  Long texts are now SPLIT
+   * INTO OVERLAPPING CHUNKS (see chunkSize/chunkOverlap) instead of being
+   * truncated; maxInputChars only acts as an upper bound on the effective chunk
+   * size, never as a silent cut.
+   */
   maxInputChars: number;
+  /** Target chunk size in characters for long inputs (default: 2000). */
+  chunkSize: number;
+  /** Overlap between consecutive chunks in characters (default: 200, must be < chunkSize). */
+  chunkOverlap: number;
+  /** Maximum number of chunks produced from a single text (default: 50). */
+  maxChunksPerText: number;
   /** Timeout per embedding API call in milliseconds (default: 10000). */
   timeoutMs: number;
   /** Override timeoutMs for recall-path embedding calls (user-facing, should be shorter). Falls back to timeoutMs. */
@@ -188,8 +199,13 @@ export interface StandaloneLLMOverrideConfig {
   apiKey: string;
   /** Model name (e.g. "gpt-4o", "deepseek-v3", "claude-sonnet-4-6"). */
   model: string;
-  /** Max output tokens (default: 4096). */
+  /** Max output tokens (default: 16000). */
   maxTokens: number;
+  /**
+   * Sampling temperature (optional, default: 1). Kimi/Moonshot extraction
+   * requires exactly 1; the standalone runner enforces 1 when omitted.
+   */
+  temperature?: number;
   /** Request timeout in milliseconds (default: 120000). */
   timeoutMs: number;
 }
@@ -500,6 +516,9 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       conflictRecallTopK: num(embeddingGroup, "conflictRecallTopK") ?? 5,
       proxyUrl: embeddingProxyUrl,
       maxInputChars: num(embeddingGroup, "maxInputChars") ?? 5000,
+      chunkSize: num(embeddingGroup, "chunkSize") ?? 2000,
+      chunkOverlap: num(embeddingGroup, "chunkOverlap") ?? 200,
+      maxChunksPerText: num(embeddingGroup, "maxChunksPerText") ?? 50,
       timeoutMs: num(embeddingGroup, "timeoutMs") ?? 10_000,
       recallTimeoutMs: num(embeddingGroup, "recallTimeoutMs") ?? undefined,
       captureTimeoutMs: num(embeddingGroup, "captureTimeoutMs") ?? undefined,
@@ -533,7 +552,10 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
         baseUrl: str(llmGroup, "baseUrl") ?? "https://api.openai.com/v1",
         apiKey: str(llmGroup, "apiKey") ?? "",
         model: str(llmGroup, "model") ?? "gpt-4o",
-        maxTokens: num(llmGroup, "maxTokens") ?? 4096,
+        // RC5: default 16000 (was 4096) to stop silent truncation of long L1 JSON.
+        maxTokens: num(llmGroup, "maxTokens") ?? 16000,
+        // RC5: default temperature 1 (Kimi/Moonshot requires exactly 1).
+        temperature: num(llmGroup, "temperature") ?? 1,
         timeoutMs: num(llmGroup, "timeoutMs") ?? 120_000,
       };
     })(),

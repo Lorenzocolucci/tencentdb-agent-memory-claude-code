@@ -382,10 +382,18 @@ export class VectorStore implements IMemoryStore {
   private stmtL0DeleteMeta!: StatementSync;
   private stmtL0GetMeta!: StatementSync;
   private stmtL0SearchVec?: StatementSync;   // optional — only set when vecTablesReady
-  /** L0 query for L1 runner: all messages for a session key */
+  /** L0 query for L1 runner: all messages for a session key (DESC, newest-first) */
   private stmtL0QueryAll!: StatementSync;
+  /** L0 query for L1 runner: cold-start read, OLDEST-first.
+   *  Used on the first-ever L1 (cursor=0) so a LIMIT-bounded read returns the
+   *  OLDEST un-extracted window and never skips the oldest backlog messages. */
+  private stmtL0QueryAllAsc!: StatementSync;
   /** L0 query for L1 runner: messages after a timestamp cursor */
   private stmtL0QueryAfter!: StatementSync;
+  /** L0 query for L1 runner: messages after a cursor, OLDEST-first.
+   *  Used for incremental reads so a partial (LIMIT-bounded) read never skips
+   *  the oldest un-extracted messages — the cursor advances over them in order. */
+  private stmtL0QueryAfterAsc!: StatementSync;
   /** L1 cursor-based pagination for migration (by PK) */
   private stmtL1QueryMigrationCursor!: StatementSync;
   /** L0 cursor-based pagination for migration (by PK) */
@@ -503,6 +511,27 @@ export class VectorStore implements IMemoryStore {
     let needsReindex = false;
     let reindexReason: string | undefined;
 
+    // ── Chunk-schema migration ──────────────────────────────
+    // Older DBs created the vec0 tables with `record_id TEXT PRIMARY KEY`, which
+    // allows only ONE vector per record (long texts were truncated).  The new
+    // schema uses `chunk_id TEXT PRIMARY KEY` + `record_id TEXT partition key`
+    // so a record can own N chunk-vectors.  When we detect the legacy shape we
+    // DROP the vec0 tables (metadata tables l1_records / l0_conversations are
+    // preserved) and flag a reindex so vectors get rebuilt with chunking.
+    if (this.dimensions > 0 && this.vecSchemaIsLegacy()) {
+      this.logger?.info(
+        `${TAG} Legacy vec0 schema detected (single-vector-per-record). ` +
+        `Dropping vector tables to migrate to chunked schema (metadata preserved)...`,
+      );
+      this.dropVectorTables();
+      const hasData =
+        this.tableRowCount("l1_records") > 0 || this.tableRowCount("l0_conversations") > 0;
+      if (hasData) {
+        needsReindex = true;
+        reindexReason = "vec0 schema migrated to chunked (chunk_id PK + record_id partition key)";
+      }
+    }
+
     const savedMeta = this.readEmbeddingMeta();
 
     if (providerInfo) {
@@ -596,10 +625,17 @@ export class VectorStore implements IMemoryStore {
     // Vector virtual table (cosine distance) — only created when dimensions > 0.
     // When provider="none", dimensions=0 and vec0 tables are deferred until a
     // real embedding provider is configured.
+    // Chunked vector schema: one row PER CHUNK.
+    //   chunk_id     — PK, "<record_id>#<index>" (unique per chunk).
+    //   record_id    — partition key, so DELETE/lookups by record touch all chunks.
+    //   embedding    — the chunk vector (KEEP the `float[N]` substring intact:
+    //                  getVecTableDimensions() parses N from this DDL).
+    //   updated_time — metadata column, used by deleteL1Expired range deletes.
     if (this.dimensions > 0) {
       this.db.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS l1_vec USING vec0(
-          record_id TEXT PRIMARY KEY,
+          chunk_id TEXT PRIMARY KEY,
+          record_id TEXT partition key,
           embedding float[${this.dimensions}] distance_metric=cosine,
           updated_time TEXT DEFAULT ''
         )
@@ -626,8 +662,12 @@ export class VectorStore implements IMemoryStore {
     `);
 
     if (this.dimensions > 0) {
+      // DELETE by partition key removes ALL chunk rows for a record.
       this.stmtDeleteVec = this.db.prepare("DELETE FROM l1_vec WHERE record_id = ?");
-      this.stmtInsertVec = this.db.prepare("INSERT INTO l1_vec (record_id, embedding, updated_time) VALUES (?, ?, ?)");
+      // INSERT one chunk row (chunk_id is "<record_id>#<index>").
+      this.stmtInsertVec = this.db.prepare(
+        "INSERT INTO l1_vec (chunk_id, record_id, embedding, updated_time) VALUES (?, ?, ?, ?)",
+      );
     }
     this.stmtDeleteMeta = this.db.prepare("DELETE FROM l1_records WHERE record_id = ?");
 
@@ -638,8 +678,10 @@ export class VectorStore implements IMemoryStore {
     `);
 
     if (this.dimensions > 0) {
+      // Return record_id (partition key) so multiple chunks of the same record
+      // can be de-duped to the best-scoring chunk at recall time.
       this.stmtSearchVec = this.db.prepare(`
-        SELECT record_id, distance
+        SELECT chunk_id, record_id, distance
         FROM l1_vec
         WHERE embedding MATCH ?
           AND k = ?
@@ -676,11 +718,13 @@ export class VectorStore implements IMemoryStore {
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_l0_recorded ON l0_conversations(recorded_at)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_l0_timestamp ON l0_conversations(timestamp)");
 
-    // L0 vector virtual table (cosine distance, same dimensions as L1) — deferred when dimensions=0
+    // L0 vector virtual table (cosine distance, same dimensions as L1) — deferred when dimensions=0.
+    // Chunked schema: one row per chunk (chunk_id PK), record_id partition key.
     if (this.dimensions > 0) {
       this.db.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS l0_vec USING vec0(
-          record_id TEXT PRIMARY KEY,
+          chunk_id TEXT PRIMARY KEY,
+          record_id TEXT partition key,
           embedding float[${this.dimensions}] distance_metric=cosine,
           recorded_at TEXT DEFAULT ''
         )
@@ -699,8 +743,11 @@ export class VectorStore implements IMemoryStore {
     `);
 
     if (this.dimensions > 0) {
+      // DELETE by partition key removes ALL chunk rows for a record.
       this.stmtL0DeleteVec = this.db.prepare("DELETE FROM l0_vec WHERE record_id = ?");
-      this.stmtL0InsertVec = this.db.prepare("INSERT INTO l0_vec (record_id, embedding, recorded_at) VALUES (?, ?, ?)");
+      this.stmtL0InsertVec = this.db.prepare(
+        "INSERT INTO l0_vec (chunk_id, record_id, embedding, recorded_at) VALUES (?, ?, ?, ?)",
+      );
     }
     this.stmtL0DeleteMeta = this.db.prepare("DELETE FROM l0_conversations WHERE record_id = ?");
 
@@ -711,7 +758,7 @@ export class VectorStore implements IMemoryStore {
 
     if (this.dimensions > 0) {
       this.stmtL0SearchVec = this.db.prepare(`
-        SELECT record_id, distance
+        SELECT chunk_id, record_id, distance
         FROM l0_vec
         WHERE embedding MATCH ?
           AND k = ?
@@ -730,11 +777,38 @@ export class VectorStore implements IMemoryStore {
       LIMIT ?
     `);
 
+    // Cold-start read, OLDEST-first. On the FIRST-EVER L1 for a session (cursor
+    // = 0) we must read the OLDEST N messages, not the newest. The newest-N
+    // (DESC) variant above would skip every message older than the newest N
+    // forever, because the cursor then advances to the newest message read.
+    // ASC returns the oldest un-extracted window first, so paging + per-window
+    // cursor advancement walks the whole backlog across triggers without loss.
+    this.stmtL0QueryAllAsc = this.db.prepare(`
+      SELECT record_id, session_key, session_id, role, message_text, recorded_at, timestamp
+      FROM l0_conversations
+      WHERE session_key = ?
+      ORDER BY recorded_at ASC
+      LIMIT ?
+    `);
+
     this.stmtL0QueryAfter = this.db.prepare(`
       SELECT record_id, session_key, session_id, role, message_text, recorded_at, timestamp
       FROM l0_conversations
       WHERE session_key = ? AND recorded_at > ?
       ORDER BY recorded_at DESC
+      LIMIT ?
+    `);
+
+    // Incremental cursor read, OLDEST-first. The DESC variant above keeps the
+    // NEWEST N when a backlog exceeds LIMIT — for a cursor-based reader that
+    // SKIPS the oldest un-extracted messages permanently (the cursor then jumps
+    // past them). ASC returns the oldest un-extracted window first, so paging +
+    // cursor advancement processes the whole backlog across successive triggers.
+    this.stmtL0QueryAfterAsc = this.db.prepare(`
+      SELECT record_id, session_key, session_id, role, message_text, recorded_at, timestamp
+      FROM l0_conversations
+      WHERE session_key = ? AND recorded_at > ?
+      ORDER BY recorded_at ASC
       LIMIT ?
     `);
 
@@ -935,6 +1009,14 @@ export class VectorStore implements IMemoryStore {
    */
   private static readonly ZERO_VEC_BUFFER = 10;
 
+  /**
+   * Multiplier applied to topK when over-fetching vec0 candidates, to ensure
+   * enough DISTINCT records survive de-dup after multiple chunks of the same
+   * record are collapsed.  A value of 4 tolerates up to ~4 matching chunks per
+   * record before distinct-record recall could be starved.
+   */
+  private static readonly CHUNK_RECALL_FANOUT = 4;
+
   /** Default result limit for FTS5 keyword searches. */
   private static readonly FTS_DEFAULT_LIMIT = 20;
 
@@ -976,6 +1058,29 @@ export class VectorStore implements IMemoryStore {
   }
 
   /**
+   * Detect whether the existing vec0 tables use the LEGACY single-vector schema
+   * (`record_id TEXT PRIMARY KEY`) rather than the chunked schema
+   * (`chunk_id TEXT PRIMARY KEY` + `record_id ... partition key`).
+   *
+   * Returns `true` only when an `l1_vec` (or `l0_vec`) table exists AND its DDL
+   * lacks a `chunk_id` column.  Returns `false` when no vec table exists yet
+   * (fresh DB — the chunked schema will be created directly) or when the table
+   * already uses the chunked schema.
+   */
+  private vecSchemaIsLegacy(): boolean {
+    try {
+      const row = this.db
+        .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name IN ('l1_vec','l0_vec') LIMIT 1")
+        .get() as { sql: string } | undefined;
+      if (!row?.sql) return false; // no vec table yet → not legacy, create fresh
+      // Chunked schema always declares a chunk_id column; legacy schema never does.
+      return !/\bchunk_id\b/i.test(row.sql);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Drop both L1 and L0 vector virtual tables.
    * Metadata tables (l1_records, l0_conversations) are preserved — only
    * the vec0 tables need to be rebuilt with the new dimensions.
@@ -984,6 +1089,30 @@ export class VectorStore implements IMemoryStore {
     this.db.exec("DROP TABLE IF EXISTS l1_vec");
     this.db.exec("DROP TABLE IF EXISTS l0_vec");
     this.logger?.info(`${TAG} Dropped vector tables (l1_vec, l0_vec)`);
+  }
+
+  /**
+   * Normalize an embedding argument into an array of NON-ZERO chunk vectors.
+   *
+   * Accepts the historical single-`Float32Array` form (treated as one chunk) or
+   * the chunked `Float32Array[]` form (one element per chunk).  Zero vectors are
+   * filtered out — they are placeholders from embedding failures and must never
+   * pollute the vec0 index (they yield NULL/NaN cosine distance).
+   *
+   * Returns an empty array when there is nothing valid to write (caller should
+   * then skip the vec write and persist metadata + FTS only).
+   */
+  private static toChunkVectors(
+    embedding: Float32Array | Float32Array[] | undefined,
+  ): Float32Array[] {
+    if (!embedding) return [];
+    const arr = Array.isArray(embedding) ? embedding : [embedding];
+    return arr.filter((v) => v.length > 0 && !v.every((x) => x === 0));
+  }
+
+  /** Stable, unique chunk id for a given record + chunk index. */
+  private static chunkId(recordId: string, index: number): string {
+    return `${recordId}#${index}`;
   }
 
   /**
@@ -1001,7 +1130,7 @@ export class VectorStore implements IMemoryStore {
    * failure never propagates to the caller / main OpenClaw flow.
    * Returns `true` on success, `false` on failure (logged as warning).
    */
-  upsertL1(record: MemoryRecord, embedding: Float32Array | undefined): boolean {
+  upsertL1(record: MemoryRecord, embedding: Float32Array | Float32Array[] | undefined): boolean {
     if (this.degraded) {
       this.logger?.warn(`${TAG} [L1-upsert] SKIPPED (degraded mode) id=${record.id}`);
       return false;
@@ -1018,15 +1147,16 @@ export class VectorStore implements IMemoryStore {
           ? timestamps.reduce((a, b) => (a > b ? a : b))
           : tsStr;
 
-      const skipVec = !embedding || embedding.every(v => v === 0) || !this.vecTablesReady;
+      // Normalize to N non-zero chunk vectors (single Float32Array → 1 chunk).
+      const chunkVectors = VectorStore.toChunkVectors(embedding);
+      const skipVec = chunkVectors.length === 0 || !this.vecTablesReady;
 
       this.logger?.debug?.(
         `${TAG} [L1-upsert] START id=${recordId}, type=${record.type}, ` +
         `content="${record.content.slice(0, 60)}..."` +
         (embedding
-          ? `, embeddingDims=${embedding.length}, ` +
-            `embeddingNorm=${Math.sqrt(Array.from(embedding).reduce((s, v) => s + v * v, 0)).toFixed(4)}` +
-            `${skipVec ? " (ZERO VECTOR or vec tables not ready — vec write will be skipped)" : ""}`
+          ? `, chunks=${chunkVectors.length}` +
+            `${skipVec ? " (no valid vectors or vec tables not ready — vec write will be skipped)" : ""}`
           : " (no embedding — metadata-only write)"),
       );
 
@@ -1050,12 +1180,20 @@ export class VectorStore implements IMemoryStore {
         );
 
         if (!skipVec) {
-          // vec0 does not support ON CONFLICT → delete then insert
+          // vec0 has no ON CONFLICT and a record may own N chunks → delete ALL
+          // chunk rows for the record (by partition key), then insert one per chunk.
           this.stmtDeleteVec!.run(recordId);
-          this.stmtInsertVec!.run(recordId, Buffer.from(embedding!.buffer), record.updatedAt);
+          for (let i = 0; i < chunkVectors.length; i++) {
+            this.stmtInsertVec!.run(
+              VectorStore.chunkId(recordId, i),
+              recordId,
+              Buffer.from(chunkVectors[i].buffer),
+              record.updatedAt,
+            );
+          }
         } else {
           this.logger?.debug?.(
-            `${TAG} [L1-upsert] Skipping vec write (${embedding ? "zero vector" : "no embedding"}) id=${recordId}`,
+            `${TAG} [L1-upsert] Skipping vec write (${embedding ? "no valid vectors / vec tables not ready" : "no embedding"}) id=${recordId}`,
           );
         }
 
@@ -1115,15 +1253,14 @@ export class VectorStore implements IMemoryStore {
       return [];
     }
     try {
-      // Over-retrieve to compensate for legacy zero-vector placeholders that
-      // may still exist in the vec0 table.  New zero vectors are no longer
-      // inserted (upsert() skips vec write for zero vectors since v3.x), but
-      // older data may still contain them — they surface as NULL/NaN distance
-      // in KNN results.  A small buffer of 10 is sufficient for remnants.
+      // Over-retrieve because (a) legacy zero-vector placeholders may surface
+      // with NULL/NaN distance and (b) a single record can now own MULTIPLE
+      // chunk rows — without de-dup those would crowd out other records before
+      // the topK trim.  We fetch (topK * chunk-fan-out + buffer) candidates and
+      // collapse to the best (lowest-distance) chunk per record_id below.
       // NOTE: "AND distance IS NOT NULL" is NOT usable because vec0 does not
       // support that constraint — it causes an empty result set.
-      const ZERO_VEC_BUFFER = 10;
-      const retrieveCount = topK + ZERO_VEC_BUFFER;
+      const retrieveCount = topK * VectorStore.CHUNK_RECALL_FANOUT + VectorStore.ZERO_VEC_BUFFER;
 
       this.logger?.debug?.(
         `${TAG} [L1-search] START topK=${topK}, retrieveCount=${retrieveCount}, ` +
@@ -1134,13 +1271,16 @@ export class VectorStore implements IMemoryStore {
       const rows = this.stmtSearchVec!.all(
         Buffer.from(queryEmbedding.buffer),
         retrieveCount,
-      ) as Array<{ record_id: string; distance: number }>;
+      ) as Array<{ chunk_id: string; record_id: string; distance: number }>;
 
       this.logger?.debug?.(`${TAG} [L1-search] vec0 returned ${rows.length} candidate(s)`);
 
       if (rows.length === 0) return [];
 
       const results: VectorSearchResult[] = [];
+      // De-dup by record_id: rows arrive ORDER BY distance ASC, so the first
+      // chunk seen for a record is its best-scoring one — keep that, skip the rest.
+      const seenRecords = new Set<string>();
 
       for (const { record_id, distance } of rows) {
         // sqlite-vec returns null distance for zero vectors (cosine undefined when ‖v‖=0).
@@ -1151,6 +1291,10 @@ export class VectorStore implements IMemoryStore {
           );
           continue;
         }
+
+        // Collapse multiple chunks of the same record to a single result.
+        if (seenRecords.has(record_id)) continue;
+        seenRecords.add(record_id);
 
         const meta = this.stmtGetMeta.get(record_id) as
           | {
@@ -1413,21 +1557,22 @@ export class VectorStore implements IMemoryStore {
    * **Fault-tolerant**: catches all errors internally, never throws.
    * Returns `true` on success, `false` on failure (logged as warning).
    */
-  upsertL0(record: L0Record, embedding: Float32Array | undefined): boolean {
+  upsertL0(record: L0Record, embedding: Float32Array | Float32Array[] | undefined): boolean {
     if (this.degraded) {
       this.logger?.warn(`${TAG} [L0-upsert] SKIPPED (degraded mode) id=${record.id}`);
       return false;
     }
     try {
-      const skipVec = !embedding || embedding.every(v => v === 0) || !this.vecTablesReady;
+      // Normalize to N non-zero chunk vectors (single Float32Array → 1 chunk).
+      const chunkVectors = VectorStore.toChunkVectors(embedding);
+      const skipVec = chunkVectors.length === 0 || !this.vecTablesReady;
 
       this.logger?.debug?.(
         `${TAG} [L0-upsert] START id=${record.id}, session=${record.sessionKey}, role=${record.role}, ` +
         `text="${record.messageText.slice(0, 60)}..."` +
         (embedding
-          ? `, embeddingDims=${embedding.length}, ` +
-            `embeddingNorm=${Math.sqrt(Array.from(embedding).reduce((s, v) => s + v * v, 0)).toFixed(4)}` +
-            `${skipVec ? " (ZERO VECTOR or vec tables not ready — vec write will be skipped)" : ""}`
+          ? `, chunks=${chunkVectors.length}` +
+            `${skipVec ? " (no valid vectors or vec tables not ready — vec write will be skipped)" : ""}`
           : " (no embedding — metadata-only write)"),
       );
 
@@ -1444,12 +1589,20 @@ export class VectorStore implements IMemoryStore {
         );
 
         if (!skipVec) {
-          // vec0 does not support ON CONFLICT → delete then insert
+          // vec0 has no ON CONFLICT and a record may own N chunks → delete ALL
+          // chunk rows for the record (by partition key), then insert one per chunk.
           this.stmtL0DeleteVec!.run(record.id);
-          this.stmtL0InsertVec!.run(record.id, Buffer.from(embedding!.buffer), record.recordedAt);
+          for (let i = 0; i < chunkVectors.length; i++) {
+            this.stmtL0InsertVec!.run(
+              VectorStore.chunkId(record.id, i),
+              record.id,
+              Buffer.from(chunkVectors[i].buffer),
+              record.recordedAt,
+            );
+          }
         } else {
           this.logger?.debug?.(
-            `${TAG} [L0-upsert] Skipping vec write (${embedding ? "zero vector" : "no embedding"}) id=${record.id}`,
+            `${TAG} [L0-upsert] Skipping vec write (${embedding ? "no valid vectors / vec tables not ready" : "no embedding"}) id=${record.id}`,
           );
         }
 
@@ -1498,17 +1651,21 @@ export class VectorStore implements IMemoryStore {
    *
    * This is used by the background embedding task in auto-capture:
    *   1. upsertL0() writes metadata + FTS synchronously (no embedding)
-   *   2. Background task calls embedBatch() then updateL0Embedding() for each record
+   *   2. Background task calls embedChunks() then updateL0Embedding() for each record
+   *
+   * Accepts either a single Float32Array (1 chunk) or an array of chunk vectors;
+   * delete-all-chunks-then-insert-N keeps the operation idempotent.
    *
    * **Fault-tolerant**: catches all errors internally, never throws.
    * Returns `true` on success, `false` on failure.
    */
-  updateL0Embedding(recordId: string, embedding: Float32Array): boolean {
+  updateL0Embedding(recordId: string, embedding: Float32Array | Float32Array[]): boolean {
     if (this.degraded || !this.vecTablesReady) {
       return false;
     }
-    if (!embedding || embedding.every(v => v === 0)) {
-      this.logger?.debug?.(`${TAG} [L0-update-embedding] Skipping zero vector for ${recordId}`);
+    const chunkVectors = VectorStore.toChunkVectors(embedding);
+    if (chunkVectors.length === 0) {
+      this.logger?.debug?.(`${TAG} [L0-update-embedding] Skipping (no valid vectors) for ${recordId}`);
       return false;
     }
     try {
@@ -1522,7 +1679,14 @@ export class VectorStore implements IMemoryStore {
       this.db.exec("BEGIN");
       try {
         this.stmtL0DeleteVec!.run(recordId);
-        this.stmtL0InsertVec!.run(recordId, Buffer.from(embedding.buffer), meta.recorded_at);
+        for (let i = 0; i < chunkVectors.length; i++) {
+          this.stmtL0InsertVec!.run(
+            VectorStore.chunkId(recordId, i),
+            recordId,
+            Buffer.from(chunkVectors[i].buffer),
+            meta.recorded_at,
+          );
+        }
         this.db.exec("COMMIT");
       } catch (err) {
         try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
@@ -1549,14 +1713,13 @@ export class VectorStore implements IMemoryStore {
       return [];
     }
     try {
-      // Over-retrieve to compensate for legacy zero-vector placeholders that
-      // may still exist in the vec0 table.  New zero vectors are no longer
-      // inserted (upsertL0() skips vec write for zero vectors since v3.x), but
-      // older data may still contain them — they surface as NULL/NaN distance
-      // in KNN results.
+      // Over-retrieve because (a) legacy zero-vector placeholders surface with
+      // NULL/NaN distance and (b) a record can own MULTIPLE chunk rows.  We
+      // fetch (topK * chunk-fan-out + buffer) and collapse to the best chunk per
+      // record_id below.
       // NOTE: "AND distance IS NOT NULL" is NOT usable because vec0 does not
       // support that constraint — it causes an empty result set.
-      const retrieveCount = topK + VectorStore.ZERO_VEC_BUFFER;
+      const retrieveCount = topK * VectorStore.CHUNK_RECALL_FANOUT + VectorStore.ZERO_VEC_BUFFER;
 
       this.logger?.debug?.(
         `${TAG} [L0-search] START topK=${topK}, retrieveCount=${retrieveCount}, ` +
@@ -1567,13 +1730,16 @@ export class VectorStore implements IMemoryStore {
       const rows = this.stmtL0SearchVec!.all(
         Buffer.from(queryEmbedding.buffer),
         retrieveCount,
-      ) as Array<{ record_id: string; distance: number }>;
+      ) as Array<{ chunk_id: string; record_id: string; distance: number }>;
 
       this.logger?.debug?.(`${TAG} [L0-search] vec0 returned ${rows.length} candidate(s)`);
 
       if (rows.length === 0) return [];
 
       const results: L0VectorSearchResult[] = [];
+      // De-dup by record_id: rows arrive ORDER BY distance ASC → first chunk of
+      // a record is its best-scoring one; keep that, skip the rest.
+      const seenRecords = new Set<string>();
 
       for (const { record_id, distance } of rows) {
         // sqlite-vec returns null distance for zero vectors (cosine undefined when ‖v‖=0).
@@ -1584,6 +1750,10 @@ export class VectorStore implements IMemoryStore {
           );
           continue;
         }
+
+        // Collapse multiple chunks of the same record to a single result.
+        if (seenRecords.has(record_id)) continue;
+        seenRecords.add(record_id);
 
         const meta = this.stmtL0GetMeta.get(record_id) as
           | {
@@ -1776,11 +1946,15 @@ export class VectorStore implements IMemoryStore {
    * This method reads every text from the metadata tables and writes fresh
    * embeddings into the new vector tables.
    *
-   * @param embedFn  A function that converts text → Float32Array embedding.
+   * @param embedFn  A function that converts text → one or more chunk vectors.
+   *   Returning `Float32Array[]` writes one vector per chunk against the same
+   *   record id (long texts are indexed in full); a single `Float32Array` is
+   *   treated as one chunk.  Delete-all-chunks-then-insert-N makes re-runs
+   *   IDEMPOTENT.
    * @param onProgress  Optional callback for progress reporting.
    */
   async reindexAll(
-    embedFn: (text: string) => Promise<Float32Array>,
+    embedFn: (text: string) => Promise<Float32Array | Float32Array[]>,
     onProgress?: (done: number, total: number, layer: "L1" | "L0") => void,
   ): Promise<{ l1Count: number; l0Count: number }> {
     if (this.degraded || !this.vecTablesReady) {
@@ -1794,12 +1968,20 @@ export class VectorStore implements IMemoryStore {
       let l1Done = 0;
       for (const { record_id, content, updated_time } of l1Rows) {
         try {
-          const embedding = await embedFn(content);
-          // Wrap delete+insert in a transaction to prevent orphan vectors
+          const chunkVectors = VectorStore.toChunkVectors(await embedFn(content));
+          // Wrap delete+insert in a transaction to prevent orphan vectors.
+          // Delete-all-chunks-then-insert-N → idempotent on re-run.
           this.db.exec("BEGIN");
           try {
             this.stmtDeleteVec!.run(record_id);
-            this.stmtInsertVec!.run(record_id, Buffer.from(embedding.buffer), updated_time);
+            for (let i = 0; i < chunkVectors.length; i++) {
+              this.stmtInsertVec!.run(
+                VectorStore.chunkId(record_id, i),
+                record_id,
+                Buffer.from(chunkVectors[i].buffer),
+                updated_time,
+              );
+            }
             this.db.exec("COMMIT");
           } catch (txErr) {
             try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
@@ -1819,12 +2001,19 @@ export class VectorStore implements IMemoryStore {
       let l0Done = 0;
       for (const { record_id, message_text, recorded_at } of l0Rows) {
         try {
-          const embedding = await embedFn(message_text);
-          // Wrap delete+insert in a transaction to prevent orphan vectors
+          const chunkVectors = VectorStore.toChunkVectors(await embedFn(message_text));
+          // Wrap delete+insert in a transaction to prevent orphan vectors.
           this.db.exec("BEGIN");
           try {
             this.stmtL0DeleteVec!.run(record_id);
-            this.stmtL0InsertVec!.run(record_id, Buffer.from(embedding.buffer), recorded_at);
+            for (let i = 0; i < chunkVectors.length; i++) {
+              this.stmtL0InsertVec!.run(
+                VectorStore.chunkId(record_id, i),
+                record_id,
+                Buffer.from(chunkVectors[i].buffer),
+                recorded_at,
+              );
+            }
             this.db.exec("COMMIT");
           } catch (txErr) {
             try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
@@ -1878,23 +2067,30 @@ export class VectorStore implements IMemoryStore {
       return [];
     }
     try {
-      // Query newest-first (DESC) with LIMIT, then reverse to chronological order
       let rows: Array<Record<string, unknown>>;
-      if (afterRecordedAtMs && afterRecordedAtMs > 0) {
+      // BOTH paths now read OLDEST-first (ASC) so a LIMIT-bounded read always
+      // returns the OLDEST un-extracted window and never skips messages:
+      //  - incremental (cursor>0): rows AFTER the cursor, oldest-first;
+      //  - cold-start (cursor=0/falsy): the OLDEST N for the session.
+      // Why cold-start must be ASC too: the runner advances the cursor to the
+      // newest message it read. A DESC (newest-N) cold-start read would skip
+      // every message older than the newest N forever. ASC lets paging +
+      // per-window cursor advancement walk the whole backlog across triggers.
+      const incremental = Boolean(afterRecordedAtMs && afterRecordedAtMs > 0);
+      if (incremental) {
         // Convert epoch ms to ISO string for recorded_at comparison
-        const afterRecordedAtIso = new Date(afterRecordedAtMs).toISOString();
-        rows = this.stmtL0QueryAfter.all(sessionKey, afterRecordedAtIso, limit) as Array<Record<string, unknown>>;
+        const afterRecordedAtIso = new Date(afterRecordedAtMs!).toISOString();
+        rows = this.stmtL0QueryAfterAsc.all(sessionKey, afterRecordedAtIso, limit) as Array<Record<string, unknown>>;
       } else {
-        rows = this.stmtL0QueryAll.all(sessionKey, limit) as Array<Record<string, unknown>>;
+        rows = this.stmtL0QueryAllAsc.all(sessionKey, limit) as Array<Record<string, unknown>>;
       }
 
       this.logger?.info(
         `${TAG} [L0-query] session=${sessionKey}, afterRecordedAtMs=${afterRecordedAtMs ?? "(all)"}, ` +
-        `limit=${limit}, returned ${rows.length} row(s)`,
+        `limit=${limit}, order=ASC, returned ${rows.length} row(s)`,
       );
 
-      // Reverse: SQL returns newest-first (DESC), callers expect chronological order
-      return rows.map((r) => ({
+      const mapped = rows.map((r) => ({
         record_id: r.record_id as string,
         session_key: r.session_key as string,
         session_id: (r.session_id as string) || "",
@@ -1902,7 +2098,9 @@ export class VectorStore implements IMemoryStore {
         message_text: r.message_text as string,
         recorded_at: (r.recorded_at as string) || "",
         timestamp: (r.timestamp as number) || 0,
-      })).reverse();
+      }));
+      // Both paths are already chronological (ASC) — return as-is.
+      return mapped;
     } catch (err) {
       this.logger?.warn(
         `${TAG} [L0-query] FAILED (non-fatal, returning empty): ${err instanceof Error ? err.message : String(err)}`,

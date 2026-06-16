@@ -450,8 +450,9 @@ export interface SessionIdMessageGroup {
  * instances (e.g. after /reset). L1 extraction should process each group independently
  * so that each group's sessionId is correctly associated with its extracted memories.
  *
- * When `limit` is provided, only the **newest** `limit` messages (across all groups)
- * are retained — matching the DB path's `ORDER BY recorded_at DESC LIMIT ?` behavior.
+ * When `limit` is provided, only the **oldest** `limit` messages (across all groups)
+ * are retained — matching the DB path's `ORDER BY recorded_at ASC LIMIT ?` behavior,
+ * so paging + cursor advancement never skips the oldest un-extracted backlog.
  * Groups that become empty after truncation are dropped.
  *
  * Groups are returned in chronological order (by earliest message timestamp).
@@ -484,13 +485,22 @@ export async function readConversationMessagesGroupedBySessionId(
   // by recordedAt, but messages within may not be perfectly sorted by timestamp.
   allMessages.sort((a, b) => a.msg.timestamp - b.msg.timestamp);
 
-  // Truncate to newest `limit` messages (keep tail)
+  // Truncate to `limit` messages. We ALWAYS keep the OLDEST `limit` (head),
+  // both for incremental cursor reads AND for cold start (no cursor). A reader
+  // that kept the newest would skip the oldest un-extracted messages
+  // permanently once the cursor advances past the returned batch — and on cold
+  // start that would drop every message older than the newest `limit` forever,
+  // because the cursor then jumps to the newest message read. Keeping the
+  // oldest head lets paging + per-window cursor advancement walk the whole
+  // backlog across triggers. This mirrors the SQLite path's ASC reads.
   let selected = allMessages;
   if (limit != null && limit > 0 && allMessages.length > limit) {
+    const incremental = Boolean(afterRecordedAtMs && afterRecordedAtMs > 0);
     logger?.debug?.(
-      `${TAG} readConversationMessagesGroupedBySessionId: truncating ${allMessages.length} → ${limit} (newest)`,
+      `${TAG} readConversationMessagesGroupedBySessionId: truncating ${allMessages.length} → ${limit} ` +
+      `(oldest head — ${incremental ? "incremental cursor" : "cold start"})`,
     );
-    selected = allMessages.slice(-limit);
+    selected = allMessages.slice(0, limit);
   }
 
   // Re-group by sessionId

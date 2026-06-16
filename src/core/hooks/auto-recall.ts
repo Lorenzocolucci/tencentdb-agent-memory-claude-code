@@ -19,7 +19,7 @@ import type { MemoryRecord } from "../record/l1-reader.js";
 import type { IMemoryStore, L1SearchResult, L1FtsResult } from "../store/types.js";
 import { buildFtsQuery } from "../store/sqlite.js";
 import type { EmbeddingService, EmbeddingCallOptions } from "../store/embedding.js";
-import { sanitizeText } from "../../utils/sanitize.js";
+import { sanitizeText, escapeXmlTags } from "../../utils/sanitize.js";
 
 const TAG = "[memory-tdai] [recall]";
 
@@ -47,6 +47,50 @@ interface Logger {
   info: (message: string) => void;
   warn: (message: string) => void;
   error: (message: string) => void;
+}
+
+// ============================
+// RC3 — hybrid recall ranking tuning
+// ============================
+
+/**
+ * Recency boost weight applied to the fused (RRF) score in the hybrid path.
+ * The booster is multiplicative: finalScore = rrfScore * (1 + RECENCY_WEIGHT * decay).
+ * Kept small (0.15) so RELEVANCE stays dominant — recency only re-orders results
+ * that are already similarly relevant. With decay in [0,1], a brand-new memory
+ * gets at most +15% to its fused score; an old memory gets ~+0%.
+ */
+export const RECENCY_WEIGHT = 0.15;
+
+/**
+ * Half-life (in days) of the recency boost. A memory RECENCY_HALFLIFE_DAYS old
+ * gets half the maximum boost; older memories decay toward zero boost. 30 days
+ * keeps the boost meaningful for recent activity without penalizing stable facts.
+ */
+export const RECENCY_HALFLIFE_DAYS = 30;
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * Exponential time-decay factor in [0, 1] for a memory timestamp.
+ * Returns 1 for "now" and approaches 0 as the memory ages (half at the half-life).
+ * Returns 0 for missing/unparseable timestamps so they receive no recency boost
+ * (relevance-only ranking), never a negative or NaN multiplier.
+ */
+export function recencyDecay(timestampIso: string | undefined, nowMs: number): number {
+  if (!timestampIso) return 0;
+  const t = Date.parse(timestampIso);
+  if (!Number.isFinite(t)) return 0;
+  const ageDays = Math.max(0, (nowMs - t) / MS_PER_DAY);
+  return Math.pow(0.5, ageDays / RECENCY_HALFLIFE_DAYS);
+}
+
+/**
+ * Combine a relevance (RRF) score with a conservative recency booster.
+ * Relevance is primary; recency only nudges similarly-relevant items.
+ */
+export function applyRecencyBoost(rrfScore: number, timestampIso: string | undefined, nowMs: number): number {
+  return rrfScore * (1 + RECENCY_WEIGHT * recencyDecay(timestampIso, nowMs));
 }
 
 /** A single recalled L1 memory with its search score and type. */
@@ -196,17 +240,29 @@ async function performAutoRecallInner(params: {
   //   so it doesn't bust the system prompt cache.
   const stableParts: string[] = [];
   if (personaContent) {
+    // personaContent is ALREADY escaped at write time (persona-generator.ts:203
+    // calls escapeXmlTags before saving persona.md). Do NOT escape again here —
+    // double-escaping would turn a literal "&lt;" into "&amp;lt;".
     stableParts.push(`<user-persona>\n${personaContent}\n</user-persona>`);
   }
   if (sceneNavigation) {
-    stableParts.push(`<scene-navigation>\n${sceneNavigation}\n</scene-navigation>`);
+    // Scene navigation is generated fresh here (generateSceneNavigation) from the
+    // scene index, which is derived from stored — i.e. UNTRUSTED — memory content.
+    // Escape XML-like tags so a scene name containing "</scene-navigation>" or
+    // "<system>" cannot break out of this section and inject instructions.
+    stableParts.push(`<scene-navigation>\n${escapeXmlTags(sceneNavigation)}\n</scene-navigation>`);
   }
 
   // Dynamic part: L1 relevant memories (changes every turn) → prependContext (user prompt)
   let prependContext: string | undefined;
   if (memoryLines.length > 0) {
+    // memoryLines is recalled memory content — UNTRUSTED (a prior session could
+    // have stored a poisoned memory). Escape each line so a memory containing
+    // "</relevant-memories><system>..." cannot close the section early and
+    // inject attacker-controlled instructions into a future session.
+    const safeMemoryLines = memoryLines.map((line) => escapeXmlTags(line));
     prependContext =
-      `<relevant-memories>\n以下是当前对话召回的相关记忆，不代表当前任务进程，仅作为参考：\n\n${memoryLines.join("\n")}\n</relevant-memories>`;
+      `<relevant-memories>\n以下是当前对话召回的相关记忆，不代表当前任务进程，仅作为参考：\n\n${safeMemoryLines.join("\n")}\n</relevant-memories>`;
   }
 
   // Append memory tools usage guide to the stable part so the agent knows
@@ -513,7 +569,7 @@ async function searchHybrid(
   userText: string,
   _pluginDataDir: string,
   maxResults: number,
-  _threshold: number,
+  threshold: number,
   vectorStore: IMemoryStore,
   embeddingService: EmbeddingService,
   logger?: Logger,
@@ -600,49 +656,88 @@ async function searchHybrid(
   // RRF merge: k=60 is a standard constant from the RRF paper
   const RRF_K = 60;
 
-  // Map: record_id → { rrfScore, formatable }
-  const mergedMap = new Map<string, { rrfScore: number; formatable: FormatableMemory }>();
+  // Map: record_id → fused entry. We carry the raw embedding cosine and a
+  // timestamp alongside the RRF score so we can (a) apply the score threshold
+  // (RC3) — the pure RRF rank loses the cosine — and (b) apply a recency boost.
+  interface MergedEntry {
+    rrfScore: number;
+    formatable: FormatableMemory;
+    /** Raw embedding cosine similarity (0–1) if this record came from the vector side, else undefined. */
+    cosine?: number;
+    /** Whether this record appeared in the keyword (FTS exact-term) list. */
+    fromKeyword: boolean;
+    /** Best available memory timestamp (ISO) for recency weighting, if any. */
+    timestamp?: string;
+  }
+  const mergedMap = new Map<string, MergedEntry>();
 
-  // Process keyword results
+  // Process keyword results (FTS exact-term hits — no cosine available)
   for (let rank = 0; rank < keywordResults.length; rank++) {
     const r = keywordResults[rank];
     const id = r.record.id;
     const rrfScore = 1 / (RRF_K + rank + 1);
+    const ts = (r.record.timestamps && r.record.timestamps.length > 0) ? r.record.timestamps[0] : undefined;
     const existing = mergedMap.get(id);
     if (existing) {
       existing.rrfScore += rrfScore;
+      existing.fromKeyword = true;
+      if (!existing.timestamp && ts) existing.timestamp = ts;
     } else {
-      mergedMap.set(id, { rrfScore, formatable: recordToFormatable(r.record) });
+      mergedMap.set(id, { rrfScore, formatable: recordToFormatable(r.record), fromKeyword: true, timestamp: ts });
     }
   }
 
-  // Process embedding results
+  // Process embedding results (carry the raw cosine for thresholding)
   for (let rank = 0; rank < embeddingResults.length; rank++) {
     const r = embeddingResults[rank];
     const id = r.record_id;
     const rrfScore = 1 / (RRF_K + rank + 1);
+    const ts = r.timestamp_str || r.timestamp_start || undefined;
     const existing = mergedMap.get(id);
     if (existing) {
       existing.rrfScore += rrfScore;
+      existing.cosine = Math.max(existing.cosine ?? 0, r.score);
+      if (!existing.timestamp && ts) existing.timestamp = ts;
     } else {
-      mergedMap.set(id, { rrfScore, formatable: vectorResultToFormatable(r) });
+      mergedMap.set(id, { rrfScore, formatable: vectorResultToFormatable(r), cosine: r.score, fromKeyword: false, timestamp: ts });
     }
   }
 
-  // Sort by combined RRF score and take top results
-  const sorted = [...mergedMap.entries()]
-    .sort((a, b) => b[1].rrfScore - a[1].rrfScore)
+  // RC3 threshold gate: drop embedding-only candidates whose raw cosine is below
+  // the threshold (mirrors the single-strategy searchByEmbedding path). Keyword
+  // (FTS) hits are kept regardless — they are exact-term matches with no cosine
+  // to threshold, and dropping them would silently disable keyword recall.
+  const gated = [...mergedMap.entries()].filter(([, e]) => {
+    if (e.fromKeyword) return true;
+    return (e.cosine ?? 0) >= threshold;
+  });
+
+  const droppedByThreshold = mergedMap.size - gated.length;
+  if (droppedByThreshold > 0) {
+    logger?.debug?.(
+      `${TAG} Hybrid threshold gate: dropped ${droppedByThreshold} embedding-only result(s) below cosine ${threshold}`,
+    );
+  }
+
+  // RC3 recency boost: relevance (RRF) is primary; recency only nudges
+  // similarly-relevant items so newer memories sort ahead of equally-relevant
+  // older ones. Sort by the recency-boosted fused score and take top results.
+  const nowMs = Date.now();
+  const sorted = gated
+    .map(([id, e]) => ({ id, e, ranked: applyRecencyBoost(e.rrfScore, e.timestamp, nowMs) }))
+    .sort((a, b) => b.ranked - a.ranked)
     .slice(0, maxResults);
 
   if (sorted.length > 0) {
     logger?.debug?.(
       `${TAG} Hybrid search found ${sorted.length} results ` +
-      `(keyword=${keywordResults.length}, embedding=${embeddingResults.length})`,
+      `(keyword=${keywordResults.length}, embedding=${embeddingResults.length}, ` +
+      `gated=${gated.length}, threshold=${threshold})`,
     );
-    return { lines: sorted.map(([, { formatable }]) => formatMemoryLine(formatable)), timing };
+    return { lines: sorted.map(({ e }) => formatMemoryLine(e.formatable)), timing };
   }
 
-  logger?.debug?.(`${TAG} Hybrid search: no results after merge`);
+  logger?.debug?.(`${TAG} Hybrid search: no results after merge/threshold`);
   return { lines: [], timing };
 }
 

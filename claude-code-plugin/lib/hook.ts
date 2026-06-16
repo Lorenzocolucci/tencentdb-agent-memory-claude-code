@@ -9,7 +9,7 @@
  *   search | status | clear-session
  */
 
-import { GatewayClient } from "./gateway-client.js";
+import { GatewayClient, RECALL_TIMEOUT_MS, CAPTURE_TIMEOUT_MS } from "./gateway-client.js";
 import { getSessionKey } from "./session-key.js";
 import { readAllTurns } from "./transcript.js";
 import { DaemonManager, readDaemonState, clearDaemonState } from "./daemon.js";
@@ -188,13 +188,28 @@ async function handleStop(data: HookStdin, client: GatewayClient): Promise<strin
   ]);
 
   const lastTurn = newTurns[newTurns.length - 1];
-  await client.captureTurn({
+  // Phase 3: NO SILENT FAILURE — captureTurn already retries once (2s gap)
+  // internally. If both attempts fail, warn visibly in the CC UI so the user
+  // knows the session was NOT saved, instead of silently logging to a file.
+  const captureResult = await client.captureTurn({
     user_content: lastTurn.user,
     assistant_content: lastTurn.assistant,
     messages,
     session_key: sessionKey,
     session_id: data.session_id,
   });
+  if (captureResult === null) {
+    // Phase 3: NO SILENT FAILURE — write to stderr so Claude Code surfaces
+    // this in the UI instead of silently writing to a log nobody reads.
+    process.stderr.write(
+      "⚠️ TencentDB: session NOT saved — gateway may be down or the token is stale. " +
+      "Run C:\\Users\\lo\\tdai-gateway\\start-gateway.ps1 to restart it.\n",
+    );
+    // Also log to hook.log so the failure is visible in /memory-status.
+    await safeLog(join(dataDir, "hook.log"), "stop: captureTurn failed after retry — session not saved");
+    // Do NOT advance the cursor: next Stop will retry the unsent turns.
+    return "";
+  }
   await writeCursor(dataDir, cursorId, allTurns.length);
   return "";
 }
@@ -563,12 +578,20 @@ async function main(): Promise<void> {
       return;
     }
 
+    // Phase 3: TOKEN/AUTH — read token fresh from disk (not cached at startup).
+    // GatewayClient will also re-read it on each request via tokenPath.
     const token = await mgr.readToken(state.tokenPath);
     const client = new GatewayClient({
       baseUrl: `http://127.0.0.1:${state.port}`,
       token,
-      timeoutMs: event === "user-prompt-submit" ? 4_000 : 10_000,
+      // Phase 3: HOOK CLIENT TIMEOUT — use named constants, not magic numbers.
+      // recall: short (non-blocking prompt); capture: generous (don't drop saves);
+      // other events: DEFAULT_TIMEOUT_MS (see gateway-client.ts constants).
+      timeoutMs: event === "user-prompt-submit" ? RECALL_TIMEOUT_MS : CAPTURE_TIMEOUT_MS,
       logPath,
+      // Phase 3: TOKEN/AUTH — pass tokenPath so the client always reads the
+      // CURRENT token from file on each request; handles stale-token-after-restart.
+      tokenPath: state.tokenPath,
     });
 
     const out = await handleHook(event, { stdin, client, args });

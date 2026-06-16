@@ -8,7 +8,8 @@
     "migrate-sqlite-to-tcvdb": "./bin/migrate-sqlite-to-tcvdb.mjs",
     "export-tencent-vdb": "./bin/export-tencent-vdb.mjs",
     "read-local-memory": "./bin/read-local-memory.mjs",
-    "tdai-memory-gateway": "./dist/src/gateway/cli.mjs"
+    "tdai-memory-gateway": "./dist/src/gateway/cli.mjs",
+    "tdai-memory-reindex": "./dist/src/cli/reindex-standalone.mjs"
   },
   "exports": {
     ".": {
@@ -27,6 +28,7 @@
     "export-tencent-vdb": "node ./bin/export-tencent-vdb.mjs",
     "build:read-local-memory": "tsc --project scripts/read-local-memory/tsconfig.json",
     "read-local-memory": "node ./bin/read-local-memory.mjs",
+    "reindex": "node ./dist/src/cli/reindex-standalone.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",

@@ -439,6 +439,8 @@ export class TdaiCore {
           apiKey: this.cfg.llm.apiKey,
           model: this.cfg.llm.model,
           maxTokens: this.cfg.llm.maxTokens,
+          // RC5: honor configured temperature (Kimi/Moonshot requires exactly 1).
+          temperature: this.cfg.llm.temperature,
           timeoutMs: this.cfg.llm.timeoutMs,
         },
         logger: this.logger,

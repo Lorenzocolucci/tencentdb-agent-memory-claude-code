@@ -184,7 +184,26 @@ async function runLlmJudgment(
       });
     }
 
-    const decisions = parseBatchResult(result, memories, logger);
+    // Build two lookup maps from the candidate pool so the destructive-merge
+    // guard in parseBatchResult can validate every delete target:
+    //   - candidateTypeById: target id → the EXISTING candidate's type. Lets the
+    //     guard reject an update/merge that would delete a DIFFERENT-type record
+    //     even when merged_type happens to equal the new memory's type.
+    //   - recalledByNewId: new memory record_id → the set of candidate ids that
+    //     were actually recalled FOR THAT memory. Lets the guard reject a
+    //     hallucinated target (an id the LLM invented that was never a candidate).
+    const candidateTypeById = new Map<string, MemoryType>();
+    const recalledByNewId = new Map<string, Set<string>>();
+    for (const match of matches) {
+      const ids = new Set<string>();
+      for (const cand of match.candidates) {
+        candidateTypeById.set(cand.id, cand.type);
+        ids.add(cand.id);
+      }
+      recalledByNewId.set(match.newMemory.record_id, ids);
+    }
+
+    const decisions = parseBatchResult(result, memories, candidateTypeById, recalledByNewId, logger);
     return decisions;
   } catch (err) {
     logger?.warn?.(
@@ -317,6 +336,10 @@ const VALID_TYPES: MemoryType[] = ["persona", "episodic", "instruction"];
 function parseBatchResult(
   raw: string,
   memories: Array<ExtractedMemory & { record_id: string }>,
+  /** target id → existing candidate's type (for cross-type delete rejection). */
+  candidateTypeById: Map<string, MemoryType>,
+  /** new memory record_id → set of candidate ids recalled for it (anti-hallucination). */
+  recalledByNewId: Map<string, Set<string>>,
   logger?: Logger,
 ): DedupDecision[] {
   try {
@@ -342,6 +365,12 @@ function parseBatchResult(
       return fallbackStoreAll(memories);
     }
 
+    // Map record_id → the new memory's OWN type, used by the destructive-merge
+    // guard below to reject cross-type merge/update decisions (RC1 defense-in-depth).
+    const newMemoryTypeById = new Map<string, MemoryType>(
+      memories.map((m) => [m.record_id, m.type]),
+    );
+
     // Build decisions from LLM output
     const decisions: DedupDecision[] = [];
     const validActions = ["store", "update", "merge", "skip"];
@@ -362,12 +391,79 @@ function parseBatchResult(
         logger?.warn?.(`${TAG} Invalid action "${action}" for record ${recordId}, defaulting to store`);
       }
 
+      const normalizedAction: DedupDecision["action"] =
+        validActions.includes(action) ? (action as DedupDecision["action"]) : "store";
+      const targetIds = Array.isArray(d.target_ids) ? d.target_ids.map(String) : [];
+      const mergedType = VALID_TYPES.includes(d.merged_type as MemoryType)
+        ? (d.merged_type as MemoryType)
+        : undefined;
+
+      // === RC1 destructive-merge guard (defense-in-depth) ===
+      // Even if the LLM disobeys the conservative prompt, NEVER allow a merge/
+      // update that would delete a DISTINCT fact via deleteL1Batch. We force
+      // action="store" (clearing target_ids so nothing is deleted) when a
+      // destructive decision hits ANY of these red flags:
+      //   1. manyTargets  — more than one delete target (many-to-many merge).
+      //   2. crossType    — merged_type differs from the new memory's own type.
+      //   3. targetTypeMismatch — a target id resolves to an EXISTING candidate
+      //      whose type differs from the new memory's type. This closes the gap
+      //      where merged_type==new type but the single target is actually a
+      //      different-type record (e.g. an episodic "update" pointed at an
+      //      instruction record).
+      //   4. hallucinatedTarget — a target id that was NEVER in this memory's
+      //      recalled candidate set (the LLM invented it). Deleting an
+      //      unrelated record by a hallucinated id must never happen.
+      const isDestructive = normalizedAction === "merge" || normalizedAction === "update";
+      const newOwnType = newMemoryTypeById.get(recordId);
+      const manyTargets = targetIds.length > 1;
+      const crossType = mergedType !== undefined && newOwnType !== undefined && mergedType !== newOwnType;
+
+      // Per-target validation (only meaningful for destructive actions).
+      const recalledSet = recalledByNewId.get(recordId);
+      let targetTypeMismatch = false;
+      let hallucinatedTarget = false;
+      if (isDestructive) {
+        for (const tid of targetIds) {
+          // Hallucination: the target was never recalled as a candidate for this
+          // new memory. If we have NO recalled set for this record, treat any
+          // target as hallucinated (we cannot vouch for it).
+          if (!recalledSet || !recalledSet.has(tid)) {
+            hallucinatedTarget = true;
+            continue;
+          }
+          // Cross-type delete: the existing candidate's type differs from the
+          // new memory's own type.
+          const candType = candidateTypeById.get(tid);
+          if (candType !== undefined && newOwnType !== undefined && candType !== newOwnType) {
+            targetTypeMismatch = true;
+          }
+        }
+      }
+
+      if (isDestructive && (manyTargets || crossType || targetTypeMismatch || hallucinatedTarget)) {
+        const reasons: string[] = [];
+        if (manyTargets) reasons.push(`target_ids.length=${targetIds.length} (>1)`);
+        if (crossType) reasons.push(`merged_type="${mergedType}" != new type="${newOwnType}"`);
+        if (targetTypeMismatch) reasons.push(`a target's existing type != new type="${newOwnType}"`);
+        if (hallucinatedTarget) reasons.push(`a target id was not in the recalled candidate set (hallucinated)`);
+        logger?.warn?.(
+          `${TAG} Guard: forcing store for record ${recordId} — ` +
+          `${reasons.join("; ")} (rejected destructive ${normalizedAction})`,
+        );
+        decisions.push({
+          record_id: recordId,
+          action: "store",
+          target_ids: [],
+        });
+        continue;
+      }
+
       decisions.push({
         record_id: recordId,
-        action: validActions.includes(action) ? (action as DedupDecision["action"]) : "store",
-        target_ids: Array.isArray(d.target_ids) ? d.target_ids.map(String) : [],
+        action: normalizedAction,
+        target_ids: targetIds,
         merged_content: typeof d.merged_content === "string" ? d.merged_content : undefined,
-        merged_type: VALID_TYPES.includes(d.merged_type as MemoryType) ? (d.merged_type as MemoryType) : undefined,
+        merged_type: mergedType,
         merged_priority: typeof d.merged_priority === "number" ? d.merged_priority : undefined,
         merged_timestamps: Array.isArray(d.merged_timestamps) ? d.merged_timestamps.map(String) : undefined,
       });

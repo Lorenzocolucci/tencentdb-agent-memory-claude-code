@@ -47,6 +47,11 @@ export interface StandaloneLLMConfig {
   model: string;
   /** Default max output tokens. */
   maxTokens?: number;
+  /**
+   * Sampling temperature. Kimi/Moonshot extraction requires EXACTLY 1 for
+   * stable structured output; the runner defaults to 1 when this is omitted.
+   */
+  temperature?: number;
   /** Request timeout in milliseconds (default: 120_000). */
   timeoutMs?: number;
 }
@@ -180,7 +185,12 @@ export class StandaloneLLMRunner implements LLMRunner {
   async run(params: LLMRunParams): Promise<string> {
     const runStartMs = Date.now();
     const timeoutMs = params.timeoutMs ?? this.config.timeoutMs ?? 120_000;
-    const maxTokens = params.maxTokens ?? this.config.maxTokens ?? 4096;
+    // RC5: default max_tokens 16000 (was 4096). 4096 silently truncated long L1
+    // extraction JSON, which then failed to parse and dropped all memories.
+    const maxTokens = params.maxTokens ?? this.config.maxTokens ?? 16000;
+    // RC5: Kimi/Moonshot extraction is only stable at temperature=1. Default to 1
+    // when neither the per-call param nor the config sets it.
+    const temperature = params.temperature ?? this.config.temperature ?? 1;
     const workspaceDir = params.workspaceDir ?? process.cwd();
 
     this.logger?.debug?.(
@@ -228,6 +238,8 @@ export class StandaloneLLMRunner implements LLMRunner {
           ? [stepCountIs(MAX_TOOL_ITERATIONS), hasToolCall("write_to_file")]
           : stepCountIs(this.enableTools ? MAX_TOOL_ITERATIONS : 1),
         maxOutputTokens: maxTokens,
+        // RC5: pin sampling temperature (Kimi/Moonshot requires exactly 1).
+        temperature,
         // Survive transient network blips (e.g. flaky DNS: getaddrinfo ENOTFOUND)
         // with extra retry headroom. The AI SDK retries with exponential backoff;
         // the abortSignal below still caps total wall-clock per run.
