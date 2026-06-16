@@ -193,17 +193,19 @@ async function runLlmJudgment(
     //     were actually recalled FOR THAT memory. Lets the guard reject a
     //     hallucinated target (an id the LLM invented that was never a candidate).
     const candidateTypeById = new Map<string, MemoryType>();
+    const candidateContentById = new Map<string, string>();
     const recalledByNewId = new Map<string, Set<string>>();
     for (const match of matches) {
       const ids = new Set<string>();
       for (const cand of match.candidates) {
         candidateTypeById.set(cand.id, cand.type);
+        candidateContentById.set(cand.id, cand.content);
         ids.add(cand.id);
       }
       recalledByNewId.set(match.newMemory.record_id, ids);
     }
 
-    const decisions = parseBatchResult(result, memories, candidateTypeById, recalledByNewId, logger);
+    const decisions = parseBatchResult(result, memories, candidateTypeById, candidateContentById, recalledByNewId, logger);
     return decisions;
   } catch (err) {
     logger?.warn?.(
@@ -338,6 +340,8 @@ function parseBatchResult(
   memories: Array<ExtractedMemory & { record_id: string }>,
   /** target id → existing candidate's type (for cross-type delete rejection). */
   candidateTypeById: Map<string, MemoryType>,
+  /** target id → existing candidate's content (for same-fact similarity gate). */
+  candidateContentById: Map<string, string>,
   /** new memory record_id → set of candidate ids recalled for it (anti-hallucination). */
   recalledByNewId: Map<string, Set<string>>,
   logger?: Logger,
@@ -369,6 +373,11 @@ function parseBatchResult(
     // guard below to reject cross-type merge/update decisions (RC1 defense-in-depth).
     const newMemoryTypeById = new Map<string, MemoryType>(
       memories.map((m) => [m.record_id, m.type]),
+    );
+    // Map record_id → the new memory's OWN content, used by the same-fact
+    // similarity gate below (refuse merging two facts that merely share tokens).
+    const newContentById = new Map<string, string>(
+      memories.map((m) => [m.record_id, m.content]),
     );
 
     // Build decisions from LLM output
@@ -413,15 +422,29 @@ function parseBatchResult(
       //   4. hallucinatedTarget — a target id that was NEVER in this memory's
       //      recalled candidate set (the LLM invented it). Deleting an
       //      unrelated record by a hallucinated id must never happen.
+      //   5. contentDivergent — a target's existing content is NOT a near-
+      //      duplicate of the new fact. A genuine dedup/refresh replaces a
+      //      near-identical fact; a conflation merges two DISTINCT facts that
+      //      merely share surface tokens (e.g. "il codice segreto è MANGO-
+      //      STELLARE-99" vs "MANGO-STELLARE-99 non è in memoria"). Without this
+      //      gate the LLM silently destroyed the clean fact by merging it into
+      //      an unrelated same-type record.
       const isDestructive = normalizedAction === "merge" || normalizedAction === "update";
       const newOwnType = newMemoryTypeById.get(recordId);
+      const newContent = newContentById.get(recordId) ?? "";
       const manyTargets = targetIds.length > 1;
       const crossType = mergedType !== undefined && newOwnType !== undefined && mergedType !== newOwnType;
+
+      // Minimum token overlap (Jaccard) for two contents to count as "the same
+      // atomic fact" and thus be safe to merge/update. Below this they are
+      // treated as distinct facts and both are kept (force store).
+      const SAME_FACT_MIN_SIMILARITY = 0.6;
 
       // Per-target validation (only meaningful for destructive actions).
       const recalledSet = recalledByNewId.get(recordId);
       let targetTypeMismatch = false;
       let hallucinatedTarget = false;
+      let contentDivergent = false;
       if (isDestructive) {
         for (const tid of targetIds) {
           // Hallucination: the target was never recalled as a candidate for this
@@ -437,15 +460,23 @@ function parseBatchResult(
           if (candType !== undefined && newOwnType !== undefined && candType !== newOwnType) {
             targetTypeMismatch = true;
           }
+          // Same-fact gate: the existing candidate's content must be a near-
+          // duplicate of the new memory; otherwise they are distinct facts and
+          // merging would lose one of them.
+          const candContent = candidateContentById.get(tid);
+          if (candContent !== undefined && tokenSimilarity(newContent, candContent) < SAME_FACT_MIN_SIMILARITY) {
+            contentDivergent = true;
+          }
         }
       }
 
-      if (isDestructive && (manyTargets || crossType || targetTypeMismatch || hallucinatedTarget)) {
+      if (isDestructive && (manyTargets || crossType || targetTypeMismatch || hallucinatedTarget || contentDivergent)) {
         const reasons: string[] = [];
         if (manyTargets) reasons.push(`target_ids.length=${targetIds.length} (>1)`);
         if (crossType) reasons.push(`merged_type="${mergedType}" != new type="${newOwnType}"`);
         if (targetTypeMismatch) reasons.push(`a target's existing type != new type="${newOwnType}"`);
         if (hallucinatedTarget) reasons.push(`a target id was not in the recalled candidate set (hallucinated)`);
+        if (contentDivergent) reasons.push(`a target's content is not a near-duplicate of the new fact (<${SAME_FACT_MIN_SIMILARITY} token overlap)`);
         logger?.warn?.(
           `${TAG} Guard: forcing store for record ${recordId} — ` +
           `${reasons.join("; ")} (rejected destructive ${normalizedAction})`,
@@ -456,6 +487,40 @@ function parseBatchResult(
           target_ids: [],
         });
         continue;
+      }
+
+      // === Skip gate (defense-in-depth) ===
+      // "skip" drops the NEW memory as redundant. That is only safe when an
+      // EXISTING recalled candidate is actually a near-duplicate of it. The LLM
+      // sometimes skips a DISTINCT fact that merely shares surface tokens with a
+      // candidate (e.g. it skipped "Il codice segreto è MANGO-STELLARE-99"
+      // against the unrelated "MANGO-STELLARE-99 non è in memoria" record),
+      // silently losing the fact. If no recalled candidate is a near-duplicate,
+      // force store so the distinct fact is kept.
+      if (normalizedAction === "skip") {
+        const recalledForSkip = recalledByNewId.get(recordId);
+        let hasNearDuplicate = false;
+        if (recalledForSkip) {
+          for (const cid of recalledForSkip) {
+            const cContent = candidateContentById.get(cid);
+            if (cContent !== undefined && tokenSimilarity(newContent, cContent) >= SAME_FACT_MIN_SIMILARITY) {
+              hasNearDuplicate = true;
+              break;
+            }
+          }
+        }
+        if (!hasNearDuplicate) {
+          logger?.warn?.(
+            `${TAG} Guard: forcing store for record ${recordId} — skip rejected: ` +
+            `no recalled candidate is a near-duplicate (<${SAME_FACT_MIN_SIMILARITY} token overlap), the new fact is distinct`,
+          );
+          decisions.push({
+            record_id: recordId,
+            action: "store",
+            target_ids: [],
+          });
+          continue;
+        }
       }
 
       decisions.push({
@@ -487,6 +552,25 @@ function parseBatchResult(
     logger?.warn?.(`${TAG} Failed to parse conflict detection result: ${err instanceof Error ? err.message : String(err)}`);
     return fallbackStoreAll(memories);
   }
+}
+
+/**
+ * Normalized token-overlap (Jaccard) between two memory contents, in [0, 1].
+ *
+ * Used by the destructive-merge guard to refuse merging two facts that merely
+ * share surface terms (low overlap) rather than being the same atomic fact.
+ * Tokens are lowercased, split on non-alphanumeric boundaries, and single-char
+ * tokens dropped (so "MANGO-STELLARE-99" → {mango, stellare, 99}).
+ */
+function tokenSimilarity(a: string, b: string): number {
+  const tokenize = (s: string): Set<string> =>
+    new Set(s.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((t) => t.length > 1));
+  const ta = tokenize(a);
+  const tb = tokenize(b);
+  if (ta.size === 0 || tb.size === 0) return 0;
+  let inter = 0;
+  for (const t of ta) if (tb.has(t)) inter++;
+  return inter / (ta.size + tb.size - inter);
 }
 
 /**
