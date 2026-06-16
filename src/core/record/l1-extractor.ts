@@ -121,7 +121,11 @@ export async function extractL1Memories(params: {
   const maxNewMessages = options.maxMessagesPerExtraction ?? 10;
   const maxBgMessages = options.maxBackgroundMessages ?? 5;
   const enableDedup = options.enableDedup ?? true;
-  const maxMemoriesPerSession = options.maxMemoriesPerSession ?? 10;
+  // Default 30 (was 10): with technical work-facts now first-class episodic
+  // memories, a dense coding session easily produces >10 atomic facts
+  // (decisions + bugs + fixes + config changes). A cap of 10 would silently
+  // truncate them at the slice below. 30 covers realistic dense sessions.
+  const maxMemoriesPerSession = options.maxMemoriesPerSession ?? 30;
 
   if (messages.length === 0) {
     logger?.debug?.(`${TAG} No messages to extract from`);
@@ -186,10 +190,11 @@ export async function extractL1Memories(params: {
         continue;
       }
       // RC4 defense-in-depth: cap per-memory content length and clamp priority.
-      // 600 chars is well above the prompt's ~120-char target so legitimate
-      // episodic narratives survive, while multi-paragraph config/CLAUDE.md dumps
-      // (which the prompt already forbids) are rejected here too.
-      const MAX_MEMORY_CONTENT_CHARS = 600;
+      // 1000 chars leaves headroom for rich technical episodic facts (typically
+      // ~400-600 chars: file:line + function + numbers + error text), while
+      // multi-paragraph config/CLAUDE.md dumps (which the prompt already forbids)
+      // are still rejected here too.
+      const MAX_MEMORY_CONTENT_CHARS = 1000;
       const rawContent = typeof mem.content === "string" ? mem.content.trim() : "";
       if (rawContent.length === 0 || rawContent.length > MAX_MEMORY_CONTENT_CHARS) {
         logger?.warn?.(
