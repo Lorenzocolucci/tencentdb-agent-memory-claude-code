@@ -484,13 +484,20 @@ export async function readConversationMessagesGroupedBySessionId(
   // by recordedAt, but messages within may not be perfectly sorted by timestamp.
   allMessages.sort((a, b) => a.msg.timestamp - b.msg.timestamp);
 
-  // Truncate to newest `limit` messages (keep tail)
+  // Truncate to `limit` messages. When an incremental cursor is active we keep
+  // the OLDEST `limit` (head): a cursor-based reader that kept the newest would
+  // skip the oldest un-extracted messages permanently once the cursor advances
+  // past the returned batch. Without a cursor (cold start) we keep the newest
+  // `limit` (tail) to bound how much history is replayed on first run. This
+  // mirrors the SQLite path's ASC-incremental / DESC-cold split.
   let selected = allMessages;
   if (limit != null && limit > 0 && allMessages.length > limit) {
+    const incremental = Boolean(afterRecordedAtMs && afterRecordedAtMs > 0);
     logger?.debug?.(
-      `${TAG} readConversationMessagesGroupedBySessionId: truncating ${allMessages.length} → ${limit} (newest)`,
+      `${TAG} readConversationMessagesGroupedBySessionId: truncating ${allMessages.length} → ${limit} ` +
+      `(${incremental ? "oldest — incremental cursor" : "newest — cold start"})`,
     );
-    selected = allMessages.slice(-limit);
+    selected = incremental ? allMessages.slice(0, limit) : allMessages.slice(-limit);
   }
 
   // Re-group by sessionId

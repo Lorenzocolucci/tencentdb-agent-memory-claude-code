@@ -386,6 +386,10 @@ export class VectorStore implements IMemoryStore {
   private stmtL0QueryAll!: StatementSync;
   /** L0 query for L1 runner: messages after a timestamp cursor */
   private stmtL0QueryAfter!: StatementSync;
+  /** L0 query for L1 runner: messages after a cursor, OLDEST-first.
+   *  Used for incremental reads so a partial (LIMIT-bounded) read never skips
+   *  the oldest un-extracted messages — the cursor advances over them in order. */
+  private stmtL0QueryAfterAsc!: StatementSync;
   /** L1 cursor-based pagination for migration (by PK) */
   private stmtL1QueryMigrationCursor!: StatementSync;
   /** L0 cursor-based pagination for migration (by PK) */
@@ -774,6 +778,19 @@ export class VectorStore implements IMemoryStore {
       FROM l0_conversations
       WHERE session_key = ? AND recorded_at > ?
       ORDER BY recorded_at DESC
+      LIMIT ?
+    `);
+
+    // Incremental cursor read, OLDEST-first. The DESC variant above keeps the
+    // NEWEST N when a backlog exceeds LIMIT — for a cursor-based reader that
+    // SKIPS the oldest un-extracted messages permanently (the cursor then jumps
+    // past them). ASC returns the oldest un-extracted window first, so paging +
+    // cursor advancement processes the whole backlog across successive triggers.
+    this.stmtL0QueryAfterAsc = this.db.prepare(`
+      SELECT record_id, session_key, session_id, role, message_text, recorded_at, timestamp
+      FROM l0_conversations
+      WHERE session_key = ? AND recorded_at > ?
+      ORDER BY recorded_at ASC
       LIMIT ?
     `);
 
@@ -2032,23 +2049,26 @@ export class VectorStore implements IMemoryStore {
       return [];
     }
     try {
-      // Query newest-first (DESC) with LIMIT, then reverse to chronological order
       let rows: Array<Record<string, unknown>>;
-      if (afterRecordedAtMs && afterRecordedAtMs > 0) {
+      // `incremental` is true for cursor reads: we use the ASC (oldest-first)
+      // statement so a LIMIT-bounded read returns the OLDEST un-extracted window
+      // and never skips messages. The cold-start "all" path keeps DESC (newest-N)
+      // to bound how much un-cursored history is replayed on first run.
+      const incremental = Boolean(afterRecordedAtMs && afterRecordedAtMs > 0);
+      if (incremental) {
         // Convert epoch ms to ISO string for recorded_at comparison
-        const afterRecordedAtIso = new Date(afterRecordedAtMs).toISOString();
-        rows = this.stmtL0QueryAfter.all(sessionKey, afterRecordedAtIso, limit) as Array<Record<string, unknown>>;
+        const afterRecordedAtIso = new Date(afterRecordedAtMs!).toISOString();
+        rows = this.stmtL0QueryAfterAsc.all(sessionKey, afterRecordedAtIso, limit) as Array<Record<string, unknown>>;
       } else {
         rows = this.stmtL0QueryAll.all(sessionKey, limit) as Array<Record<string, unknown>>;
       }
 
       this.logger?.info(
         `${TAG} [L0-query] session=${sessionKey}, afterRecordedAtMs=${afterRecordedAtMs ?? "(all)"}, ` +
-        `limit=${limit}, returned ${rows.length} row(s)`,
+        `limit=${limit}, order=${incremental ? "ASC" : "DESC"}, returned ${rows.length} row(s)`,
       );
 
-      // Reverse: SQL returns newest-first (DESC), callers expect chronological order
-      return rows.map((r) => ({
+      const mapped = rows.map((r) => ({
         record_id: r.record_id as string,
         session_key: r.session_key as string,
         session_id: (r.session_id as string) || "",
@@ -2056,7 +2076,10 @@ export class VectorStore implements IMemoryStore {
         message_text: r.message_text as string,
         recorded_at: (r.recorded_at as string) || "",
         timestamp: (r.timestamp as number) || 0,
-      })).reverse();
+      }));
+      // ASC is already chronological; DESC must be reversed so callers always
+      // receive messages in chronological (oldest-first) order.
+      return incremental ? mapped : mapped.reverse();
     } catch (err) {
       this.logger?.warn(
         `${TAG} [L0-query] FAILED (non-fatal, returning empty): ${err instanceof Error ? err.message : String(err)}`,

@@ -187,6 +187,15 @@ interface SessionTimerState {
   l2Schedule: ManagedTimer;
   /** Whether an L1 task is already queued or running for this session. */
   l1Queued: boolean;
+  /**
+   * Trailing-edge flag: set when a trigger arrives while an L1 task is already
+   * queued/running. The L1 runner reads un-extracted L0 by cursor (not the
+   * in-memory buffer), so a trigger that fires DURING an in-flight L1 run would
+   * otherwise be dropped and its messages never re-read — they sit in L0 newer
+   * than the cursor with nothing scheduled to pick them up. When this flag is
+   * set, runL1 re-enqueues itself once on completion to drain that tail.
+   */
+  l1Rerun: boolean;
   /** Whether an L2 task is already queued or running for this session. */
   l2Queued: boolean;
   /** Consecutive L1 failure count for retry limiting. Reset on success or new conversation. */
@@ -484,13 +493,16 @@ export class MemoryPipelineManager {
       timers.l1Idle.cancel();
     }
 
-    // Step 2: flush pending buffered messages through L1 if any.
-    if (buffer && buffer.length > 0) {
-      this.logger?.debug?.(
-        `${TAG} [${sessionKey}] flushSession: enqueuing L1 for ${buffer.length} buffered message(s)`,
-      );
-      this.enqueueL1(sessionKey, "flush");
-    }
+    // Step 2: enqueue a final L1 flush. We do this UNCONDITIONALLY (not only
+    // when the in-memory buffer is non-empty): the L1 runner reads un-extracted
+    // L0 by cursor, so the session can still have captured-but-unextracted
+    // messages even when the buffer is empty (e.g. triggers coalesced during an
+    // in-flight run). The "flush" reason forces runL1 past its buffer-empty
+    // early-return; if the cursor is already current the runner is a cheap no-op.
+    this.logger?.debug?.(
+      `${TAG} [${sessionKey}] flushSession: enqueuing final L1 (buffered=${buffer?.length ?? 0})`,
+    );
+    this.enqueueL1(sessionKey, "flush");
 
     // Step 3: wait for L1 to drain.  L1 is a single-consumer SerialQueue
     // so this is the cheapest correct signal; it will not starve other
@@ -618,12 +630,16 @@ export class MemoryPipelineManager {
   // Internal: L1 queue
   // ============================
 
-  private enqueueL1(sessionKey: string, triggerReason: "threshold" | "idle_timeout" | "flush" = "threshold"): void {
+  private enqueueL1(sessionKey: string, triggerReason: "threshold" | "idle_timeout" | "flush" | "trailing" = "threshold"): void {
     const timers = this.getOrCreateTimers(sessionKey);
 
-    // Don't double-queue
+    // Don't double-queue — but remember that a trigger fired while L1 was busy
+    // so runL1 re-runs afterwards and drains any L0 messages that arrived during
+    // the in-flight run (otherwise those facts are lost: the runner reads L0 by
+    // cursor, not the in-memory buffer, so a dropped trigger = unread messages).
     if (timers.l1Queued) {
-      this.logger?.debug?.(`${TAG} [${sessionKey}] L1 already queued, skipping`);
+      timers.l1Rerun = true;
+      this.logger?.debug?.(`${TAG} [${sessionKey}] L1 already queued, marking re-run for trailing messages`);
       return;
     }
 
@@ -645,14 +661,27 @@ export class MemoryPipelineManager {
       });
     }
 
+    // "trailing" and "flush" runs must reach the L1 runner even when the
+    // in-memory buffer is empty: the runner reads un-extracted L0 by cursor, so
+    // there may be messages to extract even though the buffer drained. Threshold/
+    // idle runs keep the original early-return (cheap no-op when truly nothing).
+    const forceRun = triggerReason === "trailing" || triggerReason === "flush";
     this.l1Queue.add(async () => {
-      await this.runL1(sessionKey);
+      await this.runL1(sessionKey, forceRun);
     }).catch((err) => {
       this.logger?.error(
         `${TAG} [${sessionKey}] L1 task failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`,
       );
     }).finally(() => {
       timers.l1Queued = false;
+      // Trailing edge: if any trigger fired while this run was in flight, run L1
+      // once more to drain the L0 messages that arrived during the run. Clear the
+      // flag first so the re-run itself can re-arm it without looping forever.
+      if (timers.l1Rerun && !this.destroyed) {
+        timers.l1Rerun = false;
+        this.logger?.debug?.(`${TAG} [${sessionKey}] L1 re-run for trailing messages`);
+        this.enqueueL1(sessionKey, "trailing");
+      }
     });
   }
 
@@ -667,7 +696,7 @@ export class MemoryPipelineManager {
    * If L1 fails, conversation_count and buffer are preserved for retry
    * on next idle timeout or threshold trigger.
    */
-  private async runL1(sessionKey: string): Promise<void> {
+  private async runL1(sessionKey: string, force = false): Promise<void> {
     const state = this.sessionStates.get(sessionKey);
     if (!state) return;
 
@@ -675,7 +704,10 @@ export class MemoryPipelineManager {
     const buffer = this.messageBuffers.get(sessionKey) ?? [];
     this.messageBuffers.set(sessionKey, []);
 
-    if (buffer.length === 0 && state.conversation_count === 0) {
+    // `force` (trailing re-run / session-end flush) bypasses this early-return so
+    // the L0-backed runner gets a chance to extract messages that are newer than
+    // the cursor but never made it into the in-memory buffer.
+    if (!force && buffer.length === 0 && state.conversation_count === 0) {
       this.logger?.debug?.(`${TAG} [${sessionKey}] L1 skipped: no messages and no pending conversations`);
       return;
     }
@@ -735,12 +767,17 @@ export class MemoryPipelineManager {
       return; // don't advance state or trigger L2
     }
 
-    // Success: reset retry count and advance state
+    // Success: reset retry count and advance state.
     const timers = this.getOrCreateTimers(sessionKey);
     timers.l1RetryCount = 0;
-    state.l2_pending_l1_count = state.conversation_count;
-    state.conversation_count = 0;
-    this.advanceWarmupThreshold(state);
+    if (state.conversation_count > 0) {
+      // Only fold pending conversations and advance warm-up when this run was
+      // driven by real conversation activity. A forced no-op run (trailing/flush
+      // with conversation_count===0) must NOT over-advance the warm-up threshold.
+      state.l2_pending_l1_count = state.conversation_count;
+      state.conversation_count = 0;
+      this.advanceWarmupThreshold(state);
+    }
     await this.persistStates();
 
     // Advance the L2 timer (downward-only) to fire after delay, respecting minInterval
@@ -1010,6 +1047,7 @@ export class MemoryPipelineManager {
         l1Idle: new ManagedTimer(`L1-idle:${sessionKey}`, isDestroyed),
         l2Schedule: new ManagedTimer(`L2-schedule:${sessionKey}`, isDestroyed),
         l1Queued: false,
+        l1Rerun: false,
         l2Queued: false,
         l1RetryCount: 0,
       };

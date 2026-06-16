@@ -289,8 +289,13 @@ export function createL1Runner(opts: {
     );
 
     try {
-      let groups: Array<{ sessionId: string; messages: ConversationMessage[] }>;
-      let maxRecordedAtMs = 0;
+      // Each message keeps its recorded_at (write-time epoch ms) ALONGSIDE the
+      // ConversationMessage we feed to extraction. The cursor is advanced using
+      // recorded_at, so we MUST keep it attached to every message we read —
+      // otherwise we cannot compute a cursor that matches exactly the messages
+      // we actually fed to the LLM.
+      type RunnerMsg = { msg: ConversationMessage; recordedAtMs: number };
+      let groups: Array<{ sessionId: string; messages: RunnerMsg[] }>;
 
       if (vectorStore && !vectorStore.isDegraded()) {
         const l1Cursor = runnerState.last_l1_cursor > 0
@@ -300,18 +305,15 @@ export function createL1Runner(opts: {
         groups = dbGroups.map((g) => ({
           sessionId: g.sessionId,
           messages: g.messages.map((m) => ({
-            id: m.id,
-            role: m.role as "user" | "assistant",
-            content: m.content,
-            timestamp: m.timestamp,
+            msg: {
+              id: m.id,
+              role: m.role as "user" | "assistant",
+              content: m.content,
+              timestamp: m.timestamp,
+            },
+            recordedAtMs: m.recordedAtMs,
           })),
         }));
-        // Compute max recordedAtMs across all groups for cursor advancement
-        for (const g of dbGroups) {
-          for (const m of g.messages) {
-            if (m.recordedAtMs > maxRecordedAtMs) maxRecordedAtMs = m.recordedAtMs;
-          }
-        }
         logger.debug?.(`${TAG} [l1] L0 data source: VectorStore DB`);
       } else {
         logger.debug?.(`${TAG} [l1] L0 data source: JSONL files (VectorStore unavailable)`);
@@ -324,14 +326,8 @@ export function createL1Runner(opts: {
         );
         groups = jsonlGroups.map((g) => ({
           sessionId: g.sessionId,
-          messages: g.messages,
+          messages: g.messages.map((m) => ({ msg: m, recordedAtMs: m.recordedAtMs })),
         }));
-        // Compute max recordedAtMs from JSONL groups
-        for (const g of jsonlGroups) {
-          for (const m of g.messages) {
-            if (m.recordedAtMs > maxRecordedAtMs) maxRecordedAtMs = m.recordedAtMs;
-          }
-        }
       }
 
       if (groups.length === 0) {
@@ -344,47 +340,123 @@ export function createL1Runner(opts: {
         `${TAG} [l1] Processing ${totalMessages} L0 messages across ${groups.length} sessionId group(s) for session ${sessionKey}`,
       );
 
+      // ════════════════════════════════════════════════════════════════════
+      //  CURSOR ADVANCEMENT — read this carefully, a fact lost here is a fact
+      //  lost forever.
+      //
+      //  We read up to 50 un-extracted L0 messages per trigger, but the LLM is
+      //  only fed a bounded WINDOW of messages per extraction call. We must
+      //  NEVER advance the cursor past a message we did not actually feed to
+      //  the LLM (that message would be skipped permanently), and we must NEVER
+      //  advance past a message whose extraction FAILED (it would be lost too).
+      //
+      //  So we PAGE through each group in windows of WINDOW_SIZE messages:
+      //    - feed exactly that window to extractL1Memories (pass WINDOW_SIZE as
+      //      maxMessagesPerExtraction so the extractor's internal slice never
+      //      drops the window's head);
+      //    - on SUCCESS (including a legit empty extraction, extracted=0):
+      //      advance the cursor to the max recorded_at of THIS window only;
+      //    - on HARD FAILURE (LLM/parse error → success=false): stop paging and
+      //      do NOT advance past this window, so the next trigger retries it.
+      //
+      //  This closes two historical bugs:
+      //    BUG A — the cursor used to advance to the max recorded_at of ALL
+      //            read messages unconditionally (even when extracted=0 or on
+      //            failure), skipping un-extracted messages forever.
+      //    BUG B — the extractor sliced to the LAST 10 messages, so a batch
+      //            larger than 10 dropped its head while the cursor jumped past
+      //            the whole batch. Paging in windows of WINDOW_SIZE feeds every
+      //            message before its recorded_at can advance the cursor.
+      // ════════════════════════════════════════════════════════════════════
+      const WINDOW_SIZE = 10; // messages fed to the LLM per extraction call
+      const BG_SIZE = 5;      // background-context budget inside the extractor
+
       let totalExtracted = 0;
       let totalStored = 0;
       let lastSceneName: string | undefined;
+      // The cursor we will persist: max recorded_at over every window that
+      // succeeded. Starts undefined (= unchanged) so a failed first window
+      // leaves the cursor exactly where it was.
+      let cursorToPersist: number | undefined;
+      let hardFailure = false;
 
       for (const group of groups) {
         logger.debug?.(
           `${TAG} [l1] Group sessionId=${group.sessionId || "(empty)"}: ${group.messages.length} messages`,
         );
 
-        const l1Result = await extractL1Memories({
-          messages: group.messages,
-          sessionKey,
-          sessionId: group.sessionId,
-          baseDir: pluginDataDir,
-          config,
-          options: {
-            enableDedup: cfg.extraction.enableDedup,
-            maxMemoriesPerSession: cfg.extraction.maxMemoriesPerSession,
-            model: cfg.extraction.model,
-            previousSceneName: lastSceneName ?? (runnerState.last_scene_name || undefined),
-            vectorStore,
-            embeddingService,
-            conflictRecallTopK: cfg.embedding.conflictRecallTopK,
-            embeddingTimeoutMs: cfg.embedding.captureTimeoutMs ?? cfg.embedding.timeoutMs,
-            llmRunner,
-          },
-          logger,
-          instanceId: getInstanceId?.(),
-        });
+        // Page this group in fixed windows. `i` walks the group; each window is
+        // [i, i + WINDOW_SIZE). We feed ONLY the window's own messages to the
+        // extractor (NOT prior messages): mixing background into `messages`
+        // would let the extractor's quality filter + internal slice pull a
+        // background message into the extracted set, re-extracting it and
+        // breaking the no-double-extraction guarantee. Cross-window continuity
+        // is preserved via `previousSceneName` threading below instead.
+        for (let i = 0; i < group.messages.length; i += WINDOW_SIZE) {
+          const windowMsgs = group.messages.slice(i, i + WINDOW_SIZE);
 
-        totalExtracted += l1Result.extractedCount;
-        totalStored += l1Result.storedCount;
-        if (l1Result.lastSceneName) {
-          lastSceneName = l1Result.lastSceneName;
+          const l1Result = await extractL1Memories({
+            messages: windowMsgs.map((m) => m.msg),
+            sessionKey,
+            sessionId: group.sessionId,
+            baseDir: pluginDataDir,
+            config,
+            options: {
+              // Window length as the per-extraction cap: the extractor's
+              // internal slice keeps the ENTIRE window (its head is never
+              // dropped — that was BUG B).
+              maxMessagesPerExtraction: windowMsgs.length,
+              maxBackgroundMessages: BG_SIZE,
+              enableDedup: cfg.extraction.enableDedup,
+              maxMemoriesPerSession: cfg.extraction.maxMemoriesPerSession,
+              model: cfg.extraction.model,
+              previousSceneName: lastSceneName ?? (runnerState.last_scene_name || undefined),
+              vectorStore,
+              embeddingService,
+              conflictRecallTopK: cfg.embedding.conflictRecallTopK,
+              embeddingTimeoutMs: cfg.embedding.captureTimeoutMs ?? cfg.embedding.timeoutMs,
+              llmRunner,
+            },
+            logger,
+            instanceId: getInstanceId?.(),
+          });
+
+          if (!l1Result.success) {
+            // HARD FAILURE: leave the cursor at the last successful window so the
+            // next trigger re-reads (and retries) this window and everything
+            // after it. Stop paging immediately — order matters for retries.
+            logger.warn(
+              `${TAG} [l1] Extraction FAILED for window [${i}, ${i + windowMsgs.length}) ` +
+              `of session ${sessionKey} — cursor held, will retry on next trigger`,
+            );
+            hardFailure = true;
+            break;
+          }
+
+          totalExtracted += l1Result.extractedCount;
+          totalStored += l1Result.storedCount;
+          if (l1Result.lastSceneName) {
+            lastSceneName = l1Result.lastSceneName;
+          }
+
+          // SUCCESS (including extracted=0): the cursor may move to the max
+          // recorded_at of THIS window — every message in it was fed and
+          // considered. Never let it move backwards.
+          for (const m of windowMsgs) {
+            if (m.recordedAtMs > (cursorToPersist ?? 0)) cursorToPersist = m.recordedAtMs;
+          }
         }
+
+        if (hardFailure) break;
       }
 
-      // Use maxRecordedAtMs (write time) as cursor — always positive, TCVDB-safe
-      await checkpoint.markL1ExtractionComplete(sessionKey, totalStored, maxRecordedAtMs || undefined, lastSceneName);
+      // Advance the cursor to the max recorded_at of the SUCCESSFULLY-extracted
+      // windows only. If even the first window failed, cursorToPersist is
+      // undefined and the cursor stays put (full retry next trigger).
+      await checkpoint.markL1ExtractionComplete(sessionKey, totalStored, cursorToPersist, lastSceneName);
       logger.info(
-        `${TAG} [l1] L1 complete: extracted=${totalExtracted}, stored=${totalStored} (${groups.length} group(s))`,
+        `${TAG} [l1] L1 complete: extracted=${totalExtracted}, stored=${totalStored} ` +
+        `(${groups.length} group(s), cursor=${cursorToPersist ?? "(unchanged)"}${hardFailure ? ", PARTIAL — failure held cursor" : ""})`,
       );
 
       return { processedCount: totalMessages };
