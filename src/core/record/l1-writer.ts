@@ -234,27 +234,47 @@ export async function writeMemory(params: {
 
       // Chunk long content into N vectors so the WHOLE record is indexable
       // (no silent truncation of the tail). upsertL1 stores one vector per chunk.
+      //
+      // RC2: every L1 record that is inserted/updated/merged MUST get its
+      // vector(s) written, otherwise it lives in l1_records but is invisible to
+      // vector search. The embedding-failure path used to silently fall back to
+      // a metadata-only write (warn-level), leaving the row vector-less. We now:
+      //   1. retry embedding ONCE (fresh retry budget) before giving up;
+      //   2. on persistent failure, log LOUDLY (error) that the row is
+      //      vector-less / NOT recallable and flagged for reindex — never silent;
+      //   3. if no embeddingService is wired at all, log loudly (misconfig).
+      // The JSONL line is already written above and is the recoverable source of
+      // truth, so a vector-less row can always be rebuilt by the reindex CLI.
       let embedding: Float32Array[] | undefined;
 
       if (embeddingService) {
-        try {
-          embedding = await embeddingService.embedChunks(record.content);
-          logger?.debug?.(
-            `${TAG} [vec-dual-write] Embedding OK: chunks=${embedding.length}` +
-            (embedding[0] ? `, dims=${embedding[0].length}` : ""),
-          );
-        } catch (embedErr) {
-          // Embedding failed — pass undefined to upsert() which writes
-          // metadata + FTS only, skipping the vec0 table.
-          logger?.warn(
-            `${TAG} [vec-dual-write] Embedding FAILED for id=${record.id}, ` +
-            `will write metadata only: ${embedErr instanceof Error ? embedErr.message : String(embedErr)}`,
-          );
-        }
+        embedding = await embedChunksWithRetry(embeddingService, record.content, record.id, logger);
+      } else {
+        logger?.error(
+          `${TAG} [vec-dual-write] NO embedding service for id=${record.id} — ` +
+          `record will be written WITHOUT a vector (NOT recallable by semantic search); ` +
+          `flagged for reindex.`,
+        );
       }
 
       const upsertOk = await vectorStore.upsertL1(record, embedding);
-      logger?.debug?.(`${TAG} [vec-dual-write] upsert result=${upsertOk} id=${record.id}`);
+      const hasEmbedding = !!embedding && embedding.length > 0;
+      if (hasEmbedding && !upsertOk) {
+        // We had vectors but the store write failed → row may be vector-less.
+        logger?.error(
+          `${TAG} [vec-dual-write] upsertL1 returned false for id=${record.id} despite a valid embedding — ` +
+          `vector may be MISSING (NOT recallable); JSONL retained, flagged for reindex.`,
+        );
+      } else if (!hasEmbedding) {
+        // Persistent embedding failure (already logged loudly above) — make the
+        // vector-less outcome unmistakable in the dual-write log too.
+        logger?.error(
+          `${TAG} [vec-dual-write] id=${record.id} written WITHOUT a vector ` +
+          `(embedding unavailable) — NOT recallable by semantic search; flagged for reindex.`,
+        );
+      } else {
+        logger?.debug?.(`${TAG} [vec-dual-write] upsert result=${upsertOk} id=${record.id} (vectorized)`);
+      }
     } catch (err) {
       // Vector write failure should NOT block the main JSONL write
       logger?.warn?.(
@@ -273,6 +293,66 @@ export async function writeMemory(params: {
 // ============================
 // Helpers
 // ============================
+
+/**
+ * Embed a record's content into chunk vectors, with ONE bounded retry.
+ *
+ * RC2: the EmbeddingService already retries internally per HTTP call, but a
+ * fresh `embedChunks` invocation gets a fresh retry budget and covers transient
+ * failures (timeout, flaky DNS) that exhausted the first call. We retry exactly
+ * once to keep the capture path fast, then give up.
+ *
+ * Returns the chunk vectors on success, or `undefined` if both attempts fail
+ * (the caller then writes the record metadata-only and flags it LOUDLY for
+ * reindex — the record is never left silently vector-less).
+ */
+async function embedChunksWithRetry(
+  embeddingService: EmbeddingService,
+  content: string,
+  recordId: string,
+  logger?: Logger,
+): Promise<Float32Array[] | undefined> {
+  const MAX_EMBED_ATTEMPTS = 2; // initial + 1 retry
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= MAX_EMBED_ATTEMPTS; attempt++) {
+    try {
+      const embedding = await embeddingService.embedChunks(content);
+      if (embedding.length === 0) {
+        // No chunks produced (e.g. empty/whitespace content) — treat as a
+        // non-retryable embedding miss rather than looping.
+        logger?.warn(
+          `${TAG} [vec-dual-write] Embedding produced 0 chunks for id=${recordId} (attempt ${attempt}); ` +
+          `record will be metadata-only.`,
+        );
+        return undefined;
+      }
+      if (attempt > 1) {
+        logger?.info(
+          `${TAG} [vec-dual-write] Embedding retry SUCCEEDED for id=${recordId} on attempt ${attempt}.`,
+        );
+      }
+      logger?.debug?.(
+        `${TAG} [vec-dual-write] Embedding OK: chunks=${embedding.length}` +
+        (embedding[0] ? `, dims=${embedding[0].length}` : ""),
+      );
+      return embedding;
+    } catch (embedErr) {
+      lastErr = embedErr;
+      const msg = embedErr instanceof Error ? embedErr.message : String(embedErr);
+      if (attempt < MAX_EMBED_ATTEMPTS) {
+        logger?.warn(
+          `${TAG} [vec-dual-write] Embedding attempt ${attempt}/${MAX_EMBED_ATTEMPTS} FAILED for id=${recordId}, ` +
+          `retrying: ${msg}`,
+        );
+      }
+    }
+  }
+  logger?.error(
+    `${TAG} [vec-dual-write] Embedding FAILED after ${MAX_EMBED_ATTEMPTS} attempts for id=${recordId}: ` +
+    `${lastErr instanceof Error ? lastErr.message : String(lastErr)}`,
+  );
+  return undefined;
+}
 
 function formatLocalDate(d: Date): string {
   const y = d.getFullYear();

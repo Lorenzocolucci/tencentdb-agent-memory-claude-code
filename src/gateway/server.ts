@@ -420,6 +420,8 @@ export class TdaiGateway {
         apiKey: this.config.llm.apiKey,
         model: this.config.llm.model,
         maxTokens: this.config.llm.maxTokens,
+        // RC5: honor configured temperature (Kimi/Moonshot requires exactly 1).
+        temperature: this.config.llm.temperature,
         timeoutMs: this.config.llm.timeoutMs,
       },
     };

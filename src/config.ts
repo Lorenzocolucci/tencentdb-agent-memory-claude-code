@@ -199,8 +199,13 @@ export interface StandaloneLLMOverrideConfig {
   apiKey: string;
   /** Model name (e.g. "gpt-4o", "deepseek-v3", "claude-sonnet-4-6"). */
   model: string;
-  /** Max output tokens (default: 4096). */
+  /** Max output tokens (default: 16000). */
   maxTokens: number;
+  /**
+   * Sampling temperature (optional, default: 1). Kimi/Moonshot extraction
+   * requires exactly 1; the standalone runner enforces 1 when omitted.
+   */
+  temperature?: number;
   /** Request timeout in milliseconds (default: 120000). */
   timeoutMs: number;
 }
@@ -547,7 +552,10 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
         baseUrl: str(llmGroup, "baseUrl") ?? "https://api.openai.com/v1",
         apiKey: str(llmGroup, "apiKey") ?? "",
         model: str(llmGroup, "model") ?? "gpt-4o",
-        maxTokens: num(llmGroup, "maxTokens") ?? 4096,
+        // RC5: default 16000 (was 4096) to stop silent truncation of long L1 JSON.
+        maxTokens: num(llmGroup, "maxTokens") ?? 16000,
+        // RC5: default temperature 1 (Kimi/Moonshot requires exactly 1).
+        temperature: num(llmGroup, "temperature") ?? 1,
         timeoutMs: num(llmGroup, "timeoutMs") ?? 120_000,
       };
     })(),

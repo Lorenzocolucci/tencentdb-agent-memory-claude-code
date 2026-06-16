@@ -86,6 +86,8 @@ async function createSeedPipeline(opts: SeedRuntimeOptions): Promise<{ pipeline:
         apiKey: cfg.llm.apiKey,
         model: cfg.llm.model,
         maxTokens: cfg.llm.maxTokens,
+        // RC5: honor configured temperature (Kimi/Moonshot requires exactly 1).
+        temperature: cfg.llm.temperature,
         timeoutMs: cfg.llm.timeoutMs,
       },
       logger,

@@ -185,10 +185,27 @@ export async function extractL1Memories(params: {
         logger?.warn?.(`${TAG} Skipping memory with invalid type "${mem.type}"`);
         continue;
       }
+      // RC4 defense-in-depth: cap per-memory content length and clamp priority.
+      // 600 chars is well above the prompt's ~120-char target so legitimate
+      // episodic narratives survive, while multi-paragraph config/CLAUDE.md dumps
+      // (which the prompt already forbids) are rejected here too.
+      const MAX_MEMORY_CONTENT_CHARS = 600;
+      const rawContent = typeof mem.content === "string" ? mem.content.trim() : "";
+      if (rawContent.length === 0 || rawContent.length > MAX_MEMORY_CONTENT_CHARS) {
+        logger?.warn?.(
+          `${TAG} Skipping memory: content length ${rawContent.length} out of [1, ${MAX_MEMORY_CONTENT_CHARS}] ` +
+          `(type=${memType}, preview="${rawContent.slice(0, 80)}")`,
+        );
+        continue;
+      }
+      // The -1 (死命令) priority band was removed from the extraction prompt
+      // (Deliverable 2a), so clamp to [0, 100].
+      const rawPriority = typeof mem.priority === "number" ? mem.priority : 50;
+      const clampedPriority = Math.max(0, Math.min(100, Math.round(rawPriority)));
       allExtracted.push({
-        content: mem.content,
+        content: rawContent,
         type: memType,
-        priority: typeof mem.priority === "number" ? mem.priority : 50,
+        priority: clampedPriority,
         source_message_ids: Array.isArray(mem.source_message_ids) ? mem.source_message_ids : [],
         metadata: mem.metadata ?? {},
         scene_name: scene.scene_name,

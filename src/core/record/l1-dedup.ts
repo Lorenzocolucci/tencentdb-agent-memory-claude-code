@@ -342,6 +342,12 @@ function parseBatchResult(
       return fallbackStoreAll(memories);
     }
 
+    // Map record_id → the new memory's OWN type, used by the destructive-merge
+    // guard below to reject cross-type merge/update decisions (RC1 defense-in-depth).
+    const newMemoryTypeById = new Map<string, MemoryType>(
+      memories.map((m) => [m.record_id, m.type]),
+    );
+
     // Build decisions from LLM output
     const decisions: DedupDecision[] = [];
     const validActions = ["store", "update", "merge", "skip"];
@@ -362,12 +368,47 @@ function parseBatchResult(
         logger?.warn?.(`${TAG} Invalid action "${action}" for record ${recordId}, defaulting to store`);
       }
 
+      const normalizedAction: DedupDecision["action"] =
+        validActions.includes(action) ? (action as DedupDecision["action"]) : "store";
+      const targetIds = Array.isArray(d.target_ids) ? d.target_ids.map(String) : [];
+      const mergedType = VALID_TYPES.includes(d.merged_type as MemoryType)
+        ? (d.merged_type as MemoryType)
+        : undefined;
+
+      // === RC1 destructive-merge guard (defense-in-depth) ===
+      // Even if the LLM disobeys the conservative prompt, NEVER allow a
+      // cross-type or many-to-many merge/update — those are the operations that
+      // physically delete distinct facts via deleteL1Batch. Whenever a
+      // merge/update decision has more than one target OR a merged_type that
+      // differs from the new memory's own type, we force action="store" and
+      // clear target_ids so nothing is deleted.
+      const isDestructive = normalizedAction === "merge" || normalizedAction === "update";
+      const newOwnType = newMemoryTypeById.get(recordId);
+      const manyTargets = targetIds.length > 1;
+      const crossType = mergedType !== undefined && newOwnType !== undefined && mergedType !== newOwnType;
+
+      if (isDestructive && (manyTargets || crossType)) {
+        logger?.warn?.(
+          `${TAG} Guard: forcing store for record ${recordId} — ` +
+          `${manyTargets ? `target_ids.length=${targetIds.length} (>1)` : ""}` +
+          `${manyTargets && crossType ? " and " : ""}` +
+          `${crossType ? `merged_type="${mergedType}" != new type="${newOwnType}"` : ""} ` +
+          `(rejected destructive ${normalizedAction})`,
+        );
+        decisions.push({
+          record_id: recordId,
+          action: "store",
+          target_ids: [],
+        });
+        continue;
+      }
+
       decisions.push({
         record_id: recordId,
-        action: validActions.includes(action) ? (action as DedupDecision["action"]) : "store",
-        target_ids: Array.isArray(d.target_ids) ? d.target_ids.map(String) : [],
+        action: normalizedAction,
+        target_ids: targetIds,
         merged_content: typeof d.merged_content === "string" ? d.merged_content : undefined,
-        merged_type: VALID_TYPES.includes(d.merged_type as MemoryType) ? (d.merged_type as MemoryType) : undefined,
+        merged_type: mergedType,
         merged_priority: typeof d.merged_priority === "number" ? d.merged_priority : undefined,
         merged_timestamps: Array.isArray(d.merged_timestamps) ? d.merged_timestamps.map(String) : undefined,
       });
