@@ -19,7 +19,7 @@ import type { MemoryRecord } from "../record/l1-reader.js";
 import type { IMemoryStore, L1SearchResult, L1FtsResult } from "../store/types.js";
 import { buildFtsQuery } from "../store/sqlite.js";
 import type { EmbeddingService, EmbeddingCallOptions } from "../store/embedding.js";
-import { sanitizeText } from "../../utils/sanitize.js";
+import { sanitizeText, escapeXmlTags } from "../../utils/sanitize.js";
 
 const TAG = "[memory-tdai] [recall]";
 
@@ -240,17 +240,29 @@ async function performAutoRecallInner(params: {
   //   so it doesn't bust the system prompt cache.
   const stableParts: string[] = [];
   if (personaContent) {
+    // personaContent is ALREADY escaped at write time (persona-generator.ts:203
+    // calls escapeXmlTags before saving persona.md). Do NOT escape again here —
+    // double-escaping would turn a literal "&lt;" into "&amp;lt;".
     stableParts.push(`<user-persona>\n${personaContent}\n</user-persona>`);
   }
   if (sceneNavigation) {
-    stableParts.push(`<scene-navigation>\n${sceneNavigation}\n</scene-navigation>`);
+    // Scene navigation is generated fresh here (generateSceneNavigation) from the
+    // scene index, which is derived from stored — i.e. UNTRUSTED — memory content.
+    // Escape XML-like tags so a scene name containing "</scene-navigation>" or
+    // "<system>" cannot break out of this section and inject instructions.
+    stableParts.push(`<scene-navigation>\n${escapeXmlTags(sceneNavigation)}\n</scene-navigation>`);
   }
 
   // Dynamic part: L1 relevant memories (changes every turn) → prependContext (user prompt)
   let prependContext: string | undefined;
   if (memoryLines.length > 0) {
+    // memoryLines is recalled memory content — UNTRUSTED (a prior session could
+    // have stored a poisoned memory). Escape each line so a memory containing
+    // "</relevant-memories><system>..." cannot close the section early and
+    // inject attacker-controlled instructions into a future session.
+    const safeMemoryLines = memoryLines.map((line) => escapeXmlTags(line));
     prependContext =
-      `<relevant-memories>\n以下是当前对话召回的相关记忆，不代表当前任务进程，仅作为参考：\n\n${memoryLines.join("\n")}\n</relevant-memories>`;
+      `<relevant-memories>\n以下是当前对话召回的相关记忆，不代表当前任务进程，仅作为参考：\n\n${safeMemoryLines.join("\n")}\n</relevant-memories>`;
   }
 
   // Append memory tools usage guide to the stable part so the agent knows

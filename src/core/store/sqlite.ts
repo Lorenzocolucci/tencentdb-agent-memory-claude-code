@@ -382,8 +382,12 @@ export class VectorStore implements IMemoryStore {
   private stmtL0DeleteMeta!: StatementSync;
   private stmtL0GetMeta!: StatementSync;
   private stmtL0SearchVec?: StatementSync;   // optional — only set when vecTablesReady
-  /** L0 query for L1 runner: all messages for a session key */
+  /** L0 query for L1 runner: all messages for a session key (DESC, newest-first) */
   private stmtL0QueryAll!: StatementSync;
+  /** L0 query for L1 runner: cold-start read, OLDEST-first.
+   *  Used on the first-ever L1 (cursor=0) so a LIMIT-bounded read returns the
+   *  OLDEST un-extracted window and never skips the oldest backlog messages. */
+  private stmtL0QueryAllAsc!: StatementSync;
   /** L0 query for L1 runner: messages after a timestamp cursor */
   private stmtL0QueryAfter!: StatementSync;
   /** L0 query for L1 runner: messages after a cursor, OLDEST-first.
@@ -770,6 +774,20 @@ export class VectorStore implements IMemoryStore {
       FROM l0_conversations
       WHERE session_key = ?
       ORDER BY recorded_at DESC
+      LIMIT ?
+    `);
+
+    // Cold-start read, OLDEST-first. On the FIRST-EVER L1 for a session (cursor
+    // = 0) we must read the OLDEST N messages, not the newest. The newest-N
+    // (DESC) variant above would skip every message older than the newest N
+    // forever, because the cursor then advances to the newest message read.
+    // ASC returns the oldest un-extracted window first, so paging + per-window
+    // cursor advancement walks the whole backlog across triggers without loss.
+    this.stmtL0QueryAllAsc = this.db.prepare(`
+      SELECT record_id, session_key, session_id, role, message_text, recorded_at, timestamp
+      FROM l0_conversations
+      WHERE session_key = ?
+      ORDER BY recorded_at ASC
       LIMIT ?
     `);
 
@@ -2050,22 +2068,26 @@ export class VectorStore implements IMemoryStore {
     }
     try {
       let rows: Array<Record<string, unknown>>;
-      // `incremental` is true for cursor reads: we use the ASC (oldest-first)
-      // statement so a LIMIT-bounded read returns the OLDEST un-extracted window
-      // and never skips messages. The cold-start "all" path keeps DESC (newest-N)
-      // to bound how much un-cursored history is replayed on first run.
+      // BOTH paths now read OLDEST-first (ASC) so a LIMIT-bounded read always
+      // returns the OLDEST un-extracted window and never skips messages:
+      //  - incremental (cursor>0): rows AFTER the cursor, oldest-first;
+      //  - cold-start (cursor=0/falsy): the OLDEST N for the session.
+      // Why cold-start must be ASC too: the runner advances the cursor to the
+      // newest message it read. A DESC (newest-N) cold-start read would skip
+      // every message older than the newest N forever. ASC lets paging +
+      // per-window cursor advancement walk the whole backlog across triggers.
       const incremental = Boolean(afterRecordedAtMs && afterRecordedAtMs > 0);
       if (incremental) {
         // Convert epoch ms to ISO string for recorded_at comparison
         const afterRecordedAtIso = new Date(afterRecordedAtMs!).toISOString();
         rows = this.stmtL0QueryAfterAsc.all(sessionKey, afterRecordedAtIso, limit) as Array<Record<string, unknown>>;
       } else {
-        rows = this.stmtL0QueryAll.all(sessionKey, limit) as Array<Record<string, unknown>>;
+        rows = this.stmtL0QueryAllAsc.all(sessionKey, limit) as Array<Record<string, unknown>>;
       }
 
       this.logger?.info(
         `${TAG} [L0-query] session=${sessionKey}, afterRecordedAtMs=${afterRecordedAtMs ?? "(all)"}, ` +
-        `limit=${limit}, order=${incremental ? "ASC" : "DESC"}, returned ${rows.length} row(s)`,
+        `limit=${limit}, order=ASC, returned ${rows.length} row(s)`,
       );
 
       const mapped = rows.map((r) => ({
@@ -2077,9 +2099,8 @@ export class VectorStore implements IMemoryStore {
         recorded_at: (r.recorded_at as string) || "",
         timestamp: (r.timestamp as number) || 0,
       }));
-      // ASC is already chronological; DESC must be reversed so callers always
-      // receive messages in chronological (oldest-first) order.
-      return incremental ? mapped : mapped.reverse();
+      // Both paths are already chronological (ASC) — return as-is.
+      return mapped;
     } catch (err) {
       this.logger?.warn(
         `${TAG} [L0-query] FAILED (non-fatal, returning empty): ${err instanceof Error ? err.message : String(err)}`,

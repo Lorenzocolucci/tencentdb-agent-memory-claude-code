@@ -184,7 +184,26 @@ async function runLlmJudgment(
       });
     }
 
-    const decisions = parseBatchResult(result, memories, logger);
+    // Build two lookup maps from the candidate pool so the destructive-merge
+    // guard in parseBatchResult can validate every delete target:
+    //   - candidateTypeById: target id → the EXISTING candidate's type. Lets the
+    //     guard reject an update/merge that would delete a DIFFERENT-type record
+    //     even when merged_type happens to equal the new memory's type.
+    //   - recalledByNewId: new memory record_id → the set of candidate ids that
+    //     were actually recalled FOR THAT memory. Lets the guard reject a
+    //     hallucinated target (an id the LLM invented that was never a candidate).
+    const candidateTypeById = new Map<string, MemoryType>();
+    const recalledByNewId = new Map<string, Set<string>>();
+    for (const match of matches) {
+      const ids = new Set<string>();
+      for (const cand of match.candidates) {
+        candidateTypeById.set(cand.id, cand.type);
+        ids.add(cand.id);
+      }
+      recalledByNewId.set(match.newMemory.record_id, ids);
+    }
+
+    const decisions = parseBatchResult(result, memories, candidateTypeById, recalledByNewId, logger);
     return decisions;
   } catch (err) {
     logger?.warn?.(
@@ -317,6 +336,10 @@ const VALID_TYPES: MemoryType[] = ["persona", "episodic", "instruction"];
 function parseBatchResult(
   raw: string,
   memories: Array<ExtractedMemory & { record_id: string }>,
+  /** target id → existing candidate's type (for cross-type delete rejection). */
+  candidateTypeById: Map<string, MemoryType>,
+  /** new memory record_id → set of candidate ids recalled for it (anti-hallucination). */
+  recalledByNewId: Map<string, Set<string>>,
   logger?: Logger,
 ): DedupDecision[] {
   try {
@@ -376,24 +399,56 @@ function parseBatchResult(
         : undefined;
 
       // === RC1 destructive-merge guard (defense-in-depth) ===
-      // Even if the LLM disobeys the conservative prompt, NEVER allow a
-      // cross-type or many-to-many merge/update — those are the operations that
-      // physically delete distinct facts via deleteL1Batch. Whenever a
-      // merge/update decision has more than one target OR a merged_type that
-      // differs from the new memory's own type, we force action="store" and
-      // clear target_ids so nothing is deleted.
+      // Even if the LLM disobeys the conservative prompt, NEVER allow a merge/
+      // update that would delete a DISTINCT fact via deleteL1Batch. We force
+      // action="store" (clearing target_ids so nothing is deleted) when a
+      // destructive decision hits ANY of these red flags:
+      //   1. manyTargets  — more than one delete target (many-to-many merge).
+      //   2. crossType    — merged_type differs from the new memory's own type.
+      //   3. targetTypeMismatch — a target id resolves to an EXISTING candidate
+      //      whose type differs from the new memory's type. This closes the gap
+      //      where merged_type==new type but the single target is actually a
+      //      different-type record (e.g. an episodic "update" pointed at an
+      //      instruction record).
+      //   4. hallucinatedTarget — a target id that was NEVER in this memory's
+      //      recalled candidate set (the LLM invented it). Deleting an
+      //      unrelated record by a hallucinated id must never happen.
       const isDestructive = normalizedAction === "merge" || normalizedAction === "update";
       const newOwnType = newMemoryTypeById.get(recordId);
       const manyTargets = targetIds.length > 1;
       const crossType = mergedType !== undefined && newOwnType !== undefined && mergedType !== newOwnType;
 
-      if (isDestructive && (manyTargets || crossType)) {
+      // Per-target validation (only meaningful for destructive actions).
+      const recalledSet = recalledByNewId.get(recordId);
+      let targetTypeMismatch = false;
+      let hallucinatedTarget = false;
+      if (isDestructive) {
+        for (const tid of targetIds) {
+          // Hallucination: the target was never recalled as a candidate for this
+          // new memory. If we have NO recalled set for this record, treat any
+          // target as hallucinated (we cannot vouch for it).
+          if (!recalledSet || !recalledSet.has(tid)) {
+            hallucinatedTarget = true;
+            continue;
+          }
+          // Cross-type delete: the existing candidate's type differs from the
+          // new memory's own type.
+          const candType = candidateTypeById.get(tid);
+          if (candType !== undefined && newOwnType !== undefined && candType !== newOwnType) {
+            targetTypeMismatch = true;
+          }
+        }
+      }
+
+      if (isDestructive && (manyTargets || crossType || targetTypeMismatch || hallucinatedTarget)) {
+        const reasons: string[] = [];
+        if (manyTargets) reasons.push(`target_ids.length=${targetIds.length} (>1)`);
+        if (crossType) reasons.push(`merged_type="${mergedType}" != new type="${newOwnType}"`);
+        if (targetTypeMismatch) reasons.push(`a target's existing type != new type="${newOwnType}"`);
+        if (hallucinatedTarget) reasons.push(`a target id was not in the recalled candidate set (hallucinated)`);
         logger?.warn?.(
           `${TAG} Guard: forcing store for record ${recordId} — ` +
-          `${manyTargets ? `target_ids.length=${targetIds.length} (>1)` : ""}` +
-          `${manyTargets && crossType ? " and " : ""}` +
-          `${crossType ? `merged_type="${mergedType}" != new type="${newOwnType}"` : ""} ` +
-          `(rejected destructive ${normalizedAction})`,
+          `${reasons.join("; ")} (rejected destructive ${normalizedAction})`,
         );
         decisions.push({
           record_id: recordId,

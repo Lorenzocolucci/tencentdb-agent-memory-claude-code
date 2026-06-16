@@ -94,6 +94,58 @@ function sendError(res: http.ServerResponse, status: number, message: string): v
 }
 
 // ============================
+// Config-override sanitization (security)
+// ============================
+
+/** Credential / endpoint keys that an external caller must NEVER be able to set
+ *  via /seed's `config_override`. Allowing `baseUrl` would let an authenticated
+ *  caller redirect our LLM/embedding traffic (and the bundled API key) to an
+ *  attacker-controlled server (key exfiltration / SSRF); allowing `apiKey`
+ *  would let them swap in their own key or read ours back indirectly. */
+const FORBIDDEN_OVERRIDE_KEYS = ["apiKey", "baseUrl", "proxyUrl"] as const;
+/** Sub-objects of the plugin config that carry credentials/endpoints. */
+const CREDENTIAL_SECTIONS = ["llm", "embedding"] as const;
+
+/**
+ * Return a NEW, sanitized copy of a `config_override` object with credential and
+ * endpoint keys (apiKey / baseUrl / proxyUrl) stripped from its `llm` and
+ * `embedding` sub-objects. The original is never mutated. Everything else
+ * (tuning knobs like model, maxTokens, temperature, timeoutMs, dimensions, …)
+ * is preserved so legitimate overrides keep working.
+ *
+ * `stripped` lists the dotted paths that were removed, so the caller can log a
+ * security-relevant event when an override tries to set forbidden keys.
+ */
+export function sanitizeConfigOverride(
+  override: Record<string, unknown> | undefined | null,
+): { sanitized: Record<string, unknown>; stripped: string[] } {
+  const stripped: string[] = [];
+  if (!override || typeof override !== "object") {
+    return { sanitized: {}, stripped };
+  }
+
+  // Shallow copy of the top level (immutability — never touch the input).
+  const sanitized: Record<string, unknown> = { ...override };
+
+  for (const section of CREDENTIAL_SECTIONS) {
+    const sub = sanitized[section];
+    if (sub && typeof sub === "object" && !Array.isArray(sub)) {
+      // Copy the sub-object and delete forbidden keys from the COPY only.
+      const subCopy: Record<string, unknown> = { ...(sub as Record<string, unknown>) };
+      for (const key of FORBIDDEN_OVERRIDE_KEYS) {
+        if (key in subCopy) {
+          delete subCopy[key];
+          stripped.push(`${section}.${key}`);
+        }
+      }
+      sanitized[section] = subCopy;
+    }
+  }
+
+  return { sanitized, stripped };
+}
+
+// ============================
 // Gateway Server
 // ============================
 
@@ -426,9 +478,20 @@ export class TdaiGateway {
       },
     };
     if (body.config_override) {
-      for (const key of Object.keys(body.config_override)) {
+      // SECURITY: strip credential/endpoint keys (apiKey / baseUrl / proxyUrl)
+      // from the llm + embedding sections BEFORE merging. Without this, an
+      // authenticated caller could redirect baseUrl to an attacker-controlled
+      // server and exfiltrate the bundled API key (key exfil / SSRF).
+      const { sanitized: safeOverride, stripped } = sanitizeConfigOverride(body.config_override);
+      if (stripped.length > 0) {
+        this.logger.warn(
+          `Seed config_override attempted to set forbidden credential/endpoint key(s): ` +
+          `${stripped.join(", ")} — ignored`,
+        );
+      }
+      for (const key of Object.keys(safeOverride)) {
         const baseVal = pluginConfig[key];
-        const overVal = body.config_override[key];
+        const overVal = safeOverride[key];
         if (baseVal && typeof baseVal === "object" && !Array.isArray(baseVal) &&
             overVal && typeof overVal === "object" && !Array.isArray(overVal)) {
           pluginConfig[key] = { ...(baseVal as Record<string, unknown>), ...(overVal as Record<string, unknown>) };
