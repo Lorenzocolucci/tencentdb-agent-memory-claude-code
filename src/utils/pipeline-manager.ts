@@ -630,7 +630,7 @@ export class MemoryPipelineManager {
   // Internal: L1 queue
   // ============================
 
-  private enqueueL1(sessionKey: string, triggerReason: "threshold" | "idle_timeout" | "flush" | "trailing" = "threshold"): void {
+  private enqueueL1(sessionKey: string, triggerReason: "threshold" | "idle_timeout" | "flush" | "trailing" | "recovery" = "threshold"): void {
     const timers = this.getOrCreateTimers(sessionKey);
 
     // Don't double-queue — but remember that a trigger fired while L1 was busy
@@ -661,11 +661,11 @@ export class MemoryPipelineManager {
       });
     }
 
-    // "trailing" and "flush" runs must reach the L1 runner even when the
-    // in-memory buffer is empty: the runner reads un-extracted L0 by cursor, so
+    // "trailing", "flush" and "recovery" runs must reach the L1 runner even when
+    // the in-memory buffer is empty: the runner reads un-extracted L0 by cursor, so
     // there may be messages to extract even though the buffer drained. Threshold/
     // idle runs keep the original early-return (cheap no-op when truly nothing).
-    const forceRun = triggerReason === "trailing" || triggerReason === "flush";
+    const forceRun = triggerReason === "trailing" || triggerReason === "flush" || triggerReason === "recovery";
     this.l1Queue.add(async () => {
       await this.runL1(sessionKey, forceRun);
     }).catch((err) => {
@@ -1135,19 +1135,27 @@ export class MemoryPipelineManager {
    */
   private recoverPendingSessions(): void {
     for (const [sessionKey, state] of this.sessionStates) {
-      if (state.conversation_count === 0 && state.l2_pending_l1_count === 0) continue;
+      // L2 recovery: a session that already produced L1 records before the restart
+      // (l2_pending_l1_count > 0) still owes an L2 scene pass — arm its L2 timer.
+      if (state.l2_pending_l1_count > 0) {
+        this.logger?.debug?.(
+          `${TAG} [${sessionKey}] Recovery: l2_pending_l1_count=${state.l2_pending_l1_count}, arming L2 timer`,
+        );
+        this.advanceL2Timer(sessionKey);
+      }
 
-      this.logger?.debug?.(
-        `${TAG} [${sessionKey}] Recovery: conversation_count=${state.conversation_count}, ` +
-        `l2_pending_l1_count=${state.l2_pending_l1_count}, arming L2 timer`,
-      );
-
-      // Reset conversation_count since we can't recover the messages
-      state.l2_pending_l1_count = Math.max(state.l2_pending_l1_count, state.conversation_count);
-      state.conversation_count = 0;
-
-      // Arm L2 timer with delay (gives the system time to fully start)
-      this.advanceL2Timer(sessionKey);
+      // L1 recovery (FIX): re-extract any L0 that was captured but never reached L1
+      // before the restart. After the cursor-based L1 refactor these messages are
+      // NOT lost — they persist in L0 and the runner re-reads them by L0 cursor.
+      // The old code gave up here (reset conversation_count, armed only L2), so an
+      // ended/idle session's backlog never re-triggered: no new turns arrive => no
+      // threshold/idle trigger fires. This was the symptom after a gateway restart
+      // (e.g. L1 failed at the previous shutdown with the cursor held). We force an
+      // L1 "recovery" pass for every known session: the runner extracts any L0
+      // newer than the L1 cursor and cheaply no-ops sessions that are already fully
+      // extracted (the cursor guards against re-extraction). conversation_count is
+      // left untouched — the runner consumes/resets it on a successful extraction.
+      this.enqueueL1(sessionKey, "recovery");
     }
   }
 
