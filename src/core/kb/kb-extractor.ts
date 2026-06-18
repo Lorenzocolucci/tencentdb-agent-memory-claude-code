@@ -107,11 +107,15 @@ export async function extractKbDelta(params: {
 
   let raw: string;
   try {
+    // Per-call timeout is configurable via TDAI_KB_EXTRACT_TIMEOUT_MS (default
+    // 180s). Lets a bulk backfill fail-fast on oversized windows instead of
+    // blocking 180s each; production leaves it unset → 180s.
+    const extractTimeoutMs = Number(process.env.TDAI_KB_EXTRACT_TIMEOUT_MS) || 180_000;
     raw = await llmRunner.run({
       prompt: userPrompt,
       systemPrompt: KB_EXTRACTION_SYSTEM_PROMPT,
       taskId: "kb-extraction",
-      timeoutMs: 180_000,
+      timeoutMs: extractTimeoutMs,
     });
   } catch (err) {
     // Hard failure — hold the cursor (fail-closed, like l1-extractor.ts:175-178).
