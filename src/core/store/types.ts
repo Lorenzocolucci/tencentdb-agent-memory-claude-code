@@ -163,6 +163,161 @@ export interface L0SessionGroup {
 }
 
 // ============================
+// KB Types (Entity-Centric Core — Phase 1)
+// ============================
+//
+// These are the new entity-centric tables introduced by the redesign
+// (see docs/ENTITY_CORE_BLUEPRINT.md). They are ADDITIVE: they live in the
+// SAME SQLite DB alongside the existing l0_*/l1_* tables and do NOT change
+// any capture/recall behavior in Phase 1.
+
+/** Allowed entity types (open-ended, but these are the canonical ones). */
+export type KbEntityType =
+  | "person"
+  | "project"
+  | "library"
+  | "file"
+  | "decision"
+  | "bug"
+  | "preference"
+  | "concept"
+  | string;
+
+/** A row in the `entities` table (1 row per distinct real-world thing). */
+export interface KbEntity {
+  /** "ent_"+sha1(namespace|type|canonical_key)[:16] — deterministic. */
+  id: string;
+  type: string;
+  /** Display name, in the source language. */
+  name: string;
+  /** Normalized dedup key (NFKC, lowercased, type-normalized). */
+  canonical_key: string;
+  namespace: string;
+  /** Tag (cross-project recall by default). */
+  project: string;
+  language: string;
+  /** Parsed alias list (stored as JSON in aliases_json). */
+  aliases: string[];
+  importance: number;
+  created_time: string;
+  updated_time: string;
+}
+
+/** A row in the `facts` table (bi-temporal attribute/value about an entity). */
+export interface KbFact {
+  /** "fact_"+ulid (time-sortable). */
+  id: string;
+  entity_id: string;
+  /** snake_case, language-neutral key. */
+  attribute: string;
+  /** Source-language value. */
+  value: string;
+  language: string;
+  /** World-time the fact became true. */
+  valid_from: string;
+  /** World-time the fact stopped being true; NULL = still current. */
+  valid_to: string | null;
+  /** Learn-time the fact was recorded. */
+  learned_at: string;
+  /** Newer fact id that replaced this one; NULL = HEAD. */
+  superseded_by: string | null;
+  superseded_at: string | null;
+  source_event_id: string | null;
+  confidence: number;
+  /** How many times this exact value was observed (corroboration count). */
+  support: number;
+  namespace: string;
+  created_time: string;
+}
+
+/** A row in the `events` table (append-only episodic record). */
+export interface KbEvent {
+  /** "evt_"+ulid (time-sortable). */
+  id: string;
+  /** World-time of the event. */
+  ts: string;
+  recorded_at: string;
+  session_key: string;
+  session_id: string;
+  namespace: string;
+  project: string;
+  type: string;
+  text: string;
+  language: string;
+  /** Entity ids referenced by this event (stored as JSON). */
+  entities: string[];
+  /** Provenance: raw message ids this event was derived from (stored as JSON). */
+  source_message_ids: string[];
+}
+
+/** A row in the `relations` table (typed edge between two entities). */
+export interface KbRelation {
+  /** "rel_"+sha1(namespace|src|type|dst)[:16] — deterministic. */
+  id: string;
+  src_entity_id: string;
+  type: string;
+  dst_entity_id: string;
+  namespace: string;
+  valid_from: string;
+  valid_to: string | null;
+  support: number;
+  source_event_id: string | null;
+  created_time: string;
+}
+
+/** Owner kind for a kb_vec / kb_fts row (what the embedded text describes). */
+export type KbOwnerKind = "entity" | "fact" | "event" | string;
+
+/** Result from a kb_vec vector similarity search. */
+export interface KbVectorSearchResult {
+  owner_id: string;
+  owner_kind: string;
+  /** Similarity score (0–1, higher is better). */
+  score: number;
+}
+
+/** Result from a kb_fts keyword search. */
+export interface KbFtsSearchResult {
+  owner_id: string;
+  owner_kind: string;
+  /** Display text (the original, un-segmented content). */
+  content: string;
+  entity_type: string;
+  namespace: string;
+  attribute: string;
+  /** BM25-derived score (0–1, higher is better). */
+  score: number;
+}
+
+/** Input payload for inserting an event (append-only). */
+export interface KbEventInput {
+  /** Optional caller-supplied id; when absent a ULID-like id is generated. */
+  id?: string;
+  ts: string;
+  recordedAt?: string;
+  sessionKey: string;
+  sessionId?: string;
+  namespace?: string;
+  project?: string;
+  type: string;
+  text: string;
+  language?: string;
+  entities?: string[];
+  sourceMessageIds?: string[];
+}
+
+/** Input payload for upserting a relation (idempotent by unique edge). */
+export interface KbRelationInput {
+  srcEntityId: string;
+  type: string;
+  dstEntityId: string;
+  namespace?: string;
+  validFrom?: string;
+  sourceEventId?: string | null;
+  now: string;
+}
+
+// ============================
 // Store Init Result
 // ============================
 
@@ -321,6 +476,75 @@ export interface IMemoryStore {
   // ── FTS (always sync — cached flag) ──────────────────────
 
   isFtsAvailable(): boolean;
+
+  // ── KB: Entity-Centric Core (Phase 1 — additive, not yet wired) ──
+  //
+  // These methods operate on the new entities/facts/events/relations tables
+  // and the kb_vec/kb_fts recall surfaces. They are OPTIONAL on the interface
+  // so non-sqlite backends (TCVDB) can adopt them incrementally.
+
+  /**
+   * Resolve an entity by deterministic canonical key, or create it.
+   * Resolution order: exact (ns,type,canonical_key) → alias match (merge name
+   * into aliases) → create with id `ent_`+sha1(ns|type|key)[:16].
+   */
+  resolveOrCreateEntity?(params: {
+    namespace?: string;
+    type: string;
+    name: string;
+    aliases?: string[];
+    language?: string;
+    project?: string;
+    now: string;
+  }): KbEntity;
+
+  /** Append-only event insert. Never updates or deletes existing events. */
+  insertEvent?(event: KbEventInput): KbEvent;
+
+  /**
+   * Bi-temporal supersession upsert of a single (entity, attribute) fact.
+   * NEVER hard-deletes. See kb-queries.ts for the full algorithm.
+   */
+  upsertFact?(params: {
+    entityId: string;
+    attribute: string;
+    value: string;
+    validFrom?: string;
+    confidence?: number;
+    sourceEventId?: string | null;
+    language?: string;
+    namespace?: string;
+    now: string;
+  }): KbFact;
+
+  /** Idempotent relation upsert (support++ on conflict by unique edge). */
+  upsertRelation?(rel: KbRelationInput): KbRelation;
+
+  /** Current (HEAD) facts for an entity: superseded_by IS NULL AND valid_to IS NULL. */
+  queryHeadFacts?(entityId: string): KbFact[];
+  queryEntityById?(id: string): KbEntity | null;
+  queryEntityByKey?(namespace: string, type: string, canonicalKey: string): KbEntity | null;
+
+  /** kb_vec / kb_fts recall primitives (mirror searchL1Vector / searchL1Fts). */
+  searchKbVector?(queryEmbedding: Float32Array, topK?: number, ownerKindFilter?: string): KbVectorSearchResult[];
+  searchKbFts?(ftsQuery: string, limit?: number): KbFtsSearchResult[];
+
+  /** kb_vec / kb_fts chunked write (mirror the l1 chunked write). */
+  upsertKbVector?(
+    ownerId: string,
+    ownerKind: string,
+    chunks: Float32Array | Float32Array[],
+    updatedTime?: string,
+  ): boolean;
+  upsertKbFts?(params: {
+    ownerId: string;
+    ownerKind: string;
+    content: string;
+    entityType?: string;
+    namespace?: string;
+    attribute?: string;
+    updatedTime?: string;
+  }): boolean;
 }
 
 // ============================

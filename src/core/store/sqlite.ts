@@ -32,7 +32,25 @@ import type {
   L1FtsResult,
   L0SearchResult,
   L0FtsResult,
+  KbEntity,
+  KbEvent,
+  KbEventInput,
+  KbFact,
+  KbRelation,
+  KbRelationInput,
+  KbVectorSearchResult,
+  KbFtsSearchResult,
 } from "./types.js";
+import {
+  resolveOrCreateEntity as kbResolveOrCreateEntity,
+  insertEvent as kbInsertEvent,
+  upsertFact as kbUpsertFact,
+  upsertRelation as kbUpsertRelation,
+  queryHeadFacts as kbQueryHeadFacts,
+  queryEntityById as kbQueryEntityById,
+  queryEntityByKey as kbQueryEntityByKey,
+  kbChunkId,
+} from "../kb/kb-queries.js";
 
 // ============================
 // Types
@@ -411,6 +429,21 @@ export class VectorStore implements IMemoryStore {
   private stmtL0FtsInsert!: StatementSync;
   private stmtL0FtsDelete!: StatementSync;
   private stmtL0FtsSearch!: StatementSync;
+
+  // ── KB (Entity-Centric Core) — Phase 1 ──
+  /** `true` once entities/facts/events/relations tables exist. */
+  private kbReady = false;
+  /** `true` once the kb_vec vec0 table exists (requires dimensions > 0). */
+  private kbVecReady = false;
+  /** `true` once the kb_fts FTS5 table exists. */
+  private kbFtsAvailable = false;
+  private stmtKbVecDelete?: StatementSync;
+  private stmtKbVecInsert?: StatementSync;
+  private stmtKbVecSearch?: StatementSync;
+  private stmtKbVecSearchKind?: StatementSync;
+  private stmtKbFtsDelete?: StatementSync;
+  private stmtKbFtsInsert?: StatementSync;
+  private stmtKbFtsSearch?: StatementSync;
 
   /**
    * Create a VectorStore instance.
@@ -916,6 +949,12 @@ export class VectorStore implements IMemoryStore {
         `FTS-based keyword search will be unavailable; recall will use in-memory scoring if needed.`,
       );
     }
+
+    // ── KB (Entity-Centric Core) schema — Phase 1, ADDITIVE ──
+    // Creates entities/facts/events/relations + the kb_vec/kb_fts recall
+    // surfaces. Best-effort: a failure here must NOT break L0/L1 (those are the
+    // live path). On any error we leave the KB tables unavailable and continue.
+    this.initKbSchema();
 
     // Save current embedding meta (write after schema is ready)
     if (providerInfo) {
@@ -2466,6 +2505,396 @@ export class VectorStore implements IMemoryStore {
       this.logger?.warn(
         `${TAG} FTS5 rebuild failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
       );
+    }
+  }
+
+  // ============================
+  // KB (Entity-Centric Core) — Phase 1
+  // ============================
+
+  /**
+   * Create the new entity-centric tables + recall surfaces.
+   *
+   * ADDITIVE & BEST-EFFORT:
+   *   - All statements use `IF NOT EXISTS`, so a legacy DB (only the old l0_
+   *     and l1_ tables) opens fine and simply GAINS these tables.
+   *   - It does NOT alter or drop any existing l0_ or l1_ table.
+   *   - The kb_vec virtual table is only created when dimensions > 0 (mirrors
+   *     the l1_vec / l0_vec deferral when provider="none").
+   *   - Any failure leaves the KB tables unavailable but never propagates — the
+   *     live L0/L1 path must keep working.
+   */
+  private initKbSchema(): void {
+    try {
+      // ── entities ──
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS entities (
+          id TEXT PRIMARY KEY,
+          type TEXT NOT NULL,
+          name TEXT NOT NULL,
+          canonical_key TEXT NOT NULL,
+          namespace TEXT NOT NULL DEFAULT 'default',
+          project TEXT NOT NULL DEFAULT '',
+          language TEXT NOT NULL DEFAULT 'und',
+          aliases_json TEXT NOT NULL DEFAULT '[]',
+          importance INTEGER NOT NULL DEFAULT 50,
+          created_time TEXT NOT NULL,
+          updated_time TEXT NOT NULL,
+          UNIQUE(namespace, type, canonical_key)
+        )
+      `);
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_ent_ns_type ON entities(namespace, type)");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_ent_canonical ON entities(namespace, canonical_key)");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_ent_updated ON entities(updated_time)");
+
+      // ── facts ──
+      // HEAD fact = (entity_id, attribute) WHERE superseded_by IS NULL AND valid_to IS NULL.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS facts (
+          id TEXT PRIMARY KEY,
+          entity_id TEXT NOT NULL,
+          attribute TEXT NOT NULL,
+          value TEXT NOT NULL,
+          language TEXT NOT NULL DEFAULT 'und',
+          valid_from TEXT NOT NULL,
+          valid_to TEXT,
+          learned_at TEXT NOT NULL,
+          superseded_by TEXT,
+          superseded_at TEXT,
+          source_event_id TEXT,
+          confidence REAL NOT NULL DEFAULT 0.7,
+          support INTEGER NOT NULL DEFAULT 1,
+          namespace TEXT NOT NULL DEFAULT 'default',
+          created_time TEXT NOT NULL
+        )
+      `);
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_facts_head ON facts(entity_id, attribute, superseded_by)");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_facts_entity ON facts(entity_id)");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_facts_ns_attr ON facts(namespace, attribute)");
+
+      // ── events (append-only) ──
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS events (
+          id TEXT PRIMARY KEY,
+          ts TEXT NOT NULL,
+          recorded_at TEXT NOT NULL,
+          session_key TEXT NOT NULL,
+          session_id TEXT NOT NULL DEFAULT '',
+          namespace TEXT NOT NULL DEFAULT 'default',
+          project TEXT NOT NULL DEFAULT '',
+          type TEXT NOT NULL,
+          text TEXT NOT NULL,
+          language TEXT NOT NULL DEFAULT 'und',
+          entities_json TEXT NOT NULL DEFAULT '[]',
+          source_message_ids_json TEXT NOT NULL DEFAULT '[]'
+        )
+      `);
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_evt_session ON events(session_key, ts)");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_evt_ns_ts ON events(namespace, ts)");
+
+      // ── relations (idempotent edges) ──
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS relations (
+          id TEXT PRIMARY KEY,
+          src_entity_id TEXT NOT NULL,
+          type TEXT NOT NULL,
+          dst_entity_id TEXT NOT NULL,
+          namespace TEXT NOT NULL DEFAULT 'default',
+          valid_from TEXT NOT NULL,
+          valid_to TEXT,
+          support INTEGER NOT NULL DEFAULT 1,
+          source_event_id TEXT,
+          created_time TEXT NOT NULL,
+          UNIQUE(namespace, src_entity_id, type, dst_entity_id)
+        )
+      `);
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_rel_src ON relations(src_entity_id, type)");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_rel_dst ON relations(dst_entity_id, type)");
+
+      this.kbReady = true;
+    } catch (err) {
+      this.kbReady = false;
+      this.logger?.warn(
+        `${TAG} KB schema NOT available (entities/facts/events/relations): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return; // No point creating recall surfaces if the base tables failed.
+    }
+
+    // ── kb_vec (vec0 recall surface) — mirrors l1_vec chunked pattern ──
+    // Only when dimensions > 0 (deferred under provider="none", like l1_vec).
+    if (this.dimensions > 0) {
+      try {
+        this.db.exec(`
+          CREATE VIRTUAL TABLE IF NOT EXISTS kb_vec USING vec0(
+            chunk_id TEXT PRIMARY KEY,
+            owner_id TEXT partition key,
+            owner_kind TEXT,
+            embedding float[${this.dimensions}] distance_metric=cosine,
+            updated_time TEXT DEFAULT ''
+          )
+        `);
+        // DELETE by partition key removes ALL chunk rows for an owner.
+        this.stmtKbVecDelete = this.db.prepare("DELETE FROM kb_vec WHERE owner_id = ?");
+        this.stmtKbVecInsert = this.db.prepare(
+          "INSERT INTO kb_vec (chunk_id, owner_id, owner_kind, embedding, updated_time) VALUES (?, ?, ?, ?, ?)",
+        );
+        this.stmtKbVecSearch = this.db.prepare(`
+          SELECT chunk_id, owner_id, owner_kind, distance
+          FROM kb_vec
+          WHERE embedding MATCH ? AND k = ?
+          ORDER BY distance
+        `);
+        // vec0 KNN cannot reliably filter by a metadata column inside the MATCH
+        // query, so owner_kind filtering is applied in JS (see searchKbVector).
+        this.kbVecReady = true;
+      } catch (err) {
+        this.kbVecReady = false;
+        this.logger?.warn(
+          `${TAG} kb_vec NOT available: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    // ── kb_fts (FTS5 recall surface) — mirrors l1_fts pattern ──
+    try {
+      this.db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS kb_fts USING fts5(
+          content,
+          content_original UNINDEXED,
+          owner_id UNINDEXED,
+          owner_kind UNINDEXED,
+          entity_type UNINDEXED,
+          namespace UNINDEXED,
+          attribute UNINDEXED,
+          updated_time UNINDEXED
+        )
+      `);
+      // Upsert-by-owner = delete-then-insert (FTS5 has no ON CONFLICT).
+      this.stmtKbFtsDelete = this.db.prepare("DELETE FROM kb_fts WHERE owner_id = ?");
+      this.stmtKbFtsInsert = this.db.prepare(`
+        INSERT INTO kb_fts (content, content_original, owner_id, owner_kind, entity_type, namespace, attribute, updated_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      this.stmtKbFtsSearch = this.db.prepare(`
+        SELECT owner_id, owner_kind, content_original AS content, entity_type, namespace, attribute,
+               bm25(kb_fts) AS rank
+        FROM kb_fts
+        WHERE kb_fts MATCH ?
+        ORDER BY rank ASC
+        LIMIT ?
+      `);
+      this.kbFtsAvailable = true;
+    } catch (err) {
+      this.kbFtsAvailable = false;
+      this.logger?.warn(
+        `${TAG} kb_fts NOT available: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    this.logger?.debug?.(
+      `${TAG} KB schema initialized (kbReady=${this.kbReady}, kbVec=${this.kbVecReady}, kbFts=${this.kbFtsAvailable})`,
+    );
+  }
+
+  /** Whether the entity-centric (KB) base tables are available. */
+  isKbReady(): boolean {
+    return this.kbReady;
+  }
+
+  /** @see IMemoryStore.resolveOrCreateEntity */
+  resolveOrCreateEntity(params: {
+    namespace?: string;
+    type: string;
+    name: string;
+    aliases?: string[];
+    language?: string;
+    project?: string;
+    now: string;
+  }): KbEntity {
+    if (!this.kbReady) throw new Error(`${TAG} KB not ready — resolveOrCreateEntity unavailable`);
+    return kbResolveOrCreateEntity(this.db, params);
+  }
+
+  /** @see IMemoryStore.insertEvent */
+  insertEvent(event: KbEventInput): KbEvent {
+    if (!this.kbReady) throw new Error(`${TAG} KB not ready — insertEvent unavailable`);
+    return kbInsertEvent(this.db, event);
+  }
+
+  /** @see IMemoryStore.upsertFact */
+  upsertFact(params: {
+    entityId: string;
+    attribute: string;
+    value: string;
+    validFrom?: string;
+    confidence?: number;
+    sourceEventId?: string | null;
+    language?: string;
+    namespace?: string;
+    now: string;
+  }): KbFact {
+    if (!this.kbReady) throw new Error(`${TAG} KB not ready — upsertFact unavailable`);
+    return kbUpsertFact(this.db, params);
+  }
+
+  /** @see IMemoryStore.upsertRelation */
+  upsertRelation(rel: KbRelationInput): KbRelation {
+    if (!this.kbReady) throw new Error(`${TAG} KB not ready — upsertRelation unavailable`);
+    return kbUpsertRelation(this.db, rel);
+  }
+
+  /** @see IMemoryStore.queryHeadFacts */
+  queryHeadFacts(entityId: string): KbFact[] {
+    if (!this.kbReady) return [];
+    return kbQueryHeadFacts(this.db, entityId);
+  }
+
+  /** @see IMemoryStore.queryEntityById */
+  queryEntityById(id: string): KbEntity | null {
+    if (!this.kbReady) return null;
+    return kbQueryEntityById(this.db, id);
+  }
+
+  /** @see IMemoryStore.queryEntityByKey */
+  queryEntityByKey(namespace: string, type: string, canonicalKeyValue: string): KbEntity | null {
+    if (!this.kbReady) return null;
+    return kbQueryEntityByKey(this.db, namespace, type, canonicalKeyValue);
+  }
+
+  /**
+   * Write the kb_vec chunk vectors for an owner (entity/fact/event).
+   * Delete-all-then-insert-N (idempotent), mirroring the l1_vec write.
+   * Zero / empty vectors are filtered out (placeholders must never pollute KNN).
+   */
+  upsertKbVector(
+    ownerId: string,
+    ownerKind: string,
+    chunks: Float32Array | Float32Array[],
+    updatedTime = "",
+  ): boolean {
+    if (this.degraded || !this.kbVecReady) return false;
+    const chunkVectors = VectorStore.toChunkVectors(chunks);
+    if (chunkVectors.length === 0) return false;
+    try {
+      this.db.exec("BEGIN");
+      try {
+        this.stmtKbVecDelete!.run(ownerId);
+        for (let i = 0; i < chunkVectors.length; i++) {
+          this.stmtKbVecInsert!.run(
+            kbChunkId(ownerKind, ownerId, i),
+            ownerId,
+            ownerKind,
+            Buffer.from(chunkVectors[i].buffer),
+            updatedTime,
+          );
+        }
+        this.db.exec("COMMIT");
+      } catch (err) {
+        try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
+        throw err;
+      }
+      return true;
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} [kb-vec-upsert] FAILED (non-fatal) owner=${ownerId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
+  /** Write the kb_fts row for an owner (delete-then-insert; jieba-segmented content). */
+  upsertKbFts(params: {
+    ownerId: string;
+    ownerKind: string;
+    content: string;
+    entityType?: string;
+    namespace?: string;
+    attribute?: string;
+    updatedTime?: string;
+  }): boolean {
+    if (this.degraded || !this.kbFtsAvailable) return false;
+    try {
+      this.stmtKbFtsDelete!.run(params.ownerId);
+      this.stmtKbFtsInsert!.run(
+        tokenizeForFts(params.content), // content — segmented for indexing
+        params.content,                 // content_original — raw for display
+        params.ownerId,
+        params.ownerKind,
+        params.entityType ?? "",
+        params.namespace ?? "default",
+        params.attribute ?? "",
+        params.updatedTime ?? "",
+      );
+      return true;
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} [kb-fts-upsert] FAILED (non-fatal) owner=${params.ownerId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * kb_vec cosine similarity search. Mirrors searchL1Vector: over-fetch, skip
+   * null/NaN distances (zero-vector placeholders), de-dup to the best chunk per
+   * owner, trim to topK. Optional `ownerKindFilter` keeps only that kind.
+   */
+  searchKbVector(queryEmbedding: Float32Array, topK = 5, ownerKindFilter?: string): KbVectorSearchResult[] {
+    if (this.degraded || !this.kbVecReady) return [];
+    try {
+      const retrieveCount = topK * VectorStore.CHUNK_RECALL_FANOUT + VectorStore.ZERO_VEC_BUFFER;
+      const rows = this.stmtKbVecSearch!.all(
+        Buffer.from(queryEmbedding.buffer),
+        retrieveCount,
+      ) as Array<{ chunk_id: string; owner_id: string; owner_kind: string; distance: number }>;
+
+      if (rows.length === 0) return [];
+
+      const results: KbVectorSearchResult[] = [];
+      const seenOwners = new Set<string>();
+      for (const { owner_id, owner_kind, distance } of rows) {
+        if (distance == null || Number.isNaN(distance)) continue; // zero-vector placeholder
+        if (ownerKindFilter && owner_kind !== ownerKindFilter) continue;
+        if (seenOwners.has(owner_id)) continue; // best chunk per owner (rows are distance-sorted)
+        seenOwners.add(owner_id);
+        results.push({ owner_id, owner_kind, score: 1.0 - distance });
+      }
+      return results.slice(0, topK);
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} [kb-vec-search] FAILED (non-fatal, returning empty): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return [];
+    }
+  }
+
+  /** kb_fts keyword search. Mirrors searchL1Fts (BM25 → 0–1 score). */
+  searchKbFts(ftsQuery: string, limit = 20): KbFtsSearchResult[] {
+    if (this.degraded || !this.kbFtsAvailable) return [];
+    try {
+      const rows = this.stmtKbFtsSearch!.all(ftsQuery, limit) as Array<{
+        owner_id: string;
+        owner_kind: string;
+        content: string;
+        entity_type: string;
+        namespace: string;
+        attribute: string;
+        rank: number;
+      }>;
+      return rows.map((r) => ({
+        owner_id: r.owner_id,
+        owner_kind: r.owner_kind,
+        content: r.content,
+        entity_type: r.entity_type,
+        namespace: r.namespace,
+        attribute: r.attribute,
+        score: bm25RankToScore(r.rank),
+      }));
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} [kb-fts-search] FAILED (non-fatal, returning empty): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return [];
     }
   }
 
