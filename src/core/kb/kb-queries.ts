@@ -260,6 +260,23 @@ function rowToFact(row: Record<string, unknown>): KbFact {
   };
 }
 
+function rowToEvent(row: Record<string, unknown>): KbEvent {
+  return {
+    id: row.id as string,
+    ts: row.ts as string,
+    recorded_at: row.recorded_at as string,
+    session_key: row.session_key as string,
+    session_id: (row.session_id as string) ?? "",
+    namespace: row.namespace as string,
+    project: (row.project as string) ?? "",
+    type: row.type as string,
+    text: row.text as string,
+    language: (row.language as string) ?? "und",
+    entities: parseJsonArray(row.entities_json),
+    source_message_ids: parseJsonArray(row.source_message_ids_json),
+  };
+}
+
 // ============================================================================
 // Input validation helpers
 // ============================================================================
@@ -765,6 +782,83 @@ export function queryHeadFacts(db: DatabaseSync, entityIdValue: string): KbFact[
     )
     .all(entityIdValue) as Array<Record<string, unknown>>;
   return rows.map(rowToFact);
+}
+
+// ============================================================================
+// Read primitives for retrieval (Phase 4 — fetch a single row by id)
+// ============================================================================
+//
+// Retrieval gets back only an owner_id from the kb_vec/kb_fts recall surfaces.
+// To render a compact result line (and to drop superseded facts) it must fetch
+// the underlying row. These are tiny, read-only, parameterized lookups.
+
+/**
+ * Fetch a single fact by id (any version, HEAD or historical). Retrieval uses
+ * this to (a) verify a vector/FTS fact hit is still the HEAD before showing it
+ * and (b) render "{entity} — {attribute}: {value}".
+ */
+export function queryFactById(db: DatabaseSync, id: string): KbFact | null {
+  const row = db.prepare("SELECT * FROM facts WHERE id = ?").get(id) as
+    | Record<string, unknown>
+    | undefined;
+  return row ? rowToFact(row) : null;
+}
+
+/** Fetch a single event by id (events are append-only / immutable). */
+export function queryEventById(db: DatabaseSync, id: string): KbEvent | null {
+  const row = db.prepare("SELECT * FROM events WHERE id = ?").get(id) as
+    | Record<string, unknown>
+    | undefined;
+  return row ? rowToEvent(row) : null;
+}
+
+/**
+ * Entity-name match (Phase 4 retrieval, candidate source C).
+ *
+ * Tokenize the query upstream, pass the NORMALIZED tokens in here, and this
+ * returns entities whose display name, any alias, or canonical_key contains a
+ * token. This is a deterministic lexical recall path (NO LLM, NO embedding) so
+ * "Sofia" finds the Sofia project even when the vector side is weak.
+ *
+ * Matching is done in JS against the lightweight entity set (entities are the
+ * smallest KB table — one row per real-world thing), which keeps the SQL a
+ * single bounded scan and the match logic readable + alias-aware. The query is
+ * scoped by namespace; an empty token list returns nothing.
+ */
+export function queryEntitiesByTokens(
+  db: DatabaseSync,
+  tokens: string[],
+  namespace: string = "default",
+  limit: number = 20,
+): KbEntity[] {
+  const normTokens = [...new Set(tokens.map((t) => normalizeBase(t)).filter((t) => t.length > 0))];
+  if (normTokens.length === 0) return [];
+
+  const rows = db
+    .prepare("SELECT * FROM entities WHERE namespace = ?")
+    .all(namespace) as Array<Record<string, unknown>>;
+
+  // Score each entity by how many distinct query tokens it matches (name /
+  // alias / canonical_key, all normalized). Higher token coverage ranks first.
+  const scored: Array<{ entity: KbEntity; matches: number }> = [];
+  for (const row of rows) {
+    const entity = rowToEntity(row);
+    const haystacks = [
+      normalizeBase(entity.name),
+      normalizeBase(entity.canonical_key),
+      ...entity.aliases.map((a) => normalizeBase(a)),
+    ];
+    let matches = 0;
+    for (const token of normTokens) {
+      if (haystacks.some((h) => h.includes(token))) matches += 1;
+    }
+    if (matches > 0) scored.push({ entity, matches });
+  }
+
+  return scored
+    .sort((a, b) => b.matches - a.matches)
+    .slice(0, limit)
+    .map((s) => s.entity);
 }
 
 // ============================================================================

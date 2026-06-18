@@ -34,6 +34,13 @@ export interface CaptureConfig {
 export interface ExtractionConfig {
   /** Enable background extraction (default: true) */
   enabled: boolean;
+  /**
+   * Extraction engine (default: "l1").
+   * - "l1": legacy 5-stage funnel (extract → dedup → scene → persona). UNCHANGED.
+   * - "kb": Phase-2 single-stage entity-centric extraction (KbDelta → applyKbDelta).
+   * Default "l1" so live capture is NOT changed; "kb" is opt-in for migration/eval.
+   */
+  engine: "l1" | "kb";
   /** Enable L1 smart dedup (default: true) */
   enableDedup: boolean;
   /** Max memories per session (default: 20) */
@@ -86,6 +93,21 @@ export interface RecallConfig {
   strategy: "embedding" | "keyword" | "hybrid";
   /** Overall recall timeout in milliseconds (default: 5000). When exceeded, recall is skipped with a warning. */
   timeoutMs: number;
+  /**
+   * Recall source (Phase 4, default: "l1").
+   * - "l1": legacy l1_vec/l1_fts hybrid recall. UNCHANGED behavior.
+   * - "kb": entity-centric KB retrieval (kbRecall over kb_vec/kb_fts + entity
+   *   name match → RRF → recency/importance reweight → calibrated 0-1 score).
+   * Default "l1" until the eval gate passes (blueprint §Owner decisions #2).
+   */
+  source: "l1" | "kb";
+  /**
+   * Rerank toggle for the KB retrieval path (Phase 4, default: false / OFF).
+   * When false the rerank() stage is a no-op passthrough. Kimi list-rerank is a
+   * later phase; the interface is fail-open by design (rerank failure → the
+   * un-reranked fused order is kept).
+   */
+  rerank: boolean;
 }
 
 /** Embedding service configuration for vector search. */
@@ -479,6 +501,9 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
     },
     extraction: {
       enabled: bool(extractionGroup, "enabled") ?? true,
+      // Default "l1" (legacy funnel) so live capture is NOT changed. Any value
+      // other than the literal "kb" falls back to "l1" (fail-safe).
+      engine: str(extractionGroup, "engine") === "kb" ? "kb" : "l1",
       enableDedup: bool(extractionGroup, "enableDedup") ?? true,
       maxMemoriesPerSession: num(extractionGroup, "maxMemoriesPerSession") ?? 20,
       model: optStr(extractionGroup, "model"),
@@ -505,6 +530,11 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       scoreThreshold: num(recallGroup, "scoreThreshold") ?? 0.3,
       strategy: validateStrategy(str(recallGroup, "strategy")) ?? "hybrid",
       timeoutMs: num(recallGroup, "timeoutMs") ?? 5000,
+      // Default "l1" (legacy recall) so live recall is NOT changed. Any value
+      // other than the literal "kb" falls back to "l1" (fail-safe).
+      source: str(recallGroup, "source") === "kb" ? "kb" : "l1",
+      // Rerank OFF by default in Phase 4 (no-op passthrough until eval enables it).
+      rerank: bool(recallGroup, "rerank") ?? false,
     },
     embedding: {
       enabled: embeddingEnabled,

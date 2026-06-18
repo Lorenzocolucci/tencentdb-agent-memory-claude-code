@@ -296,6 +296,10 @@ export class TdaiCore {
       vectorStore: this.vectorStore,
       embeddingService: this.embeddingService,
       logger: this.logger,
+      // Phase-4: route the tool through KB retrieval when recall.source = "kb"
+      // (default "l1" → existing behavior unchanged).
+      recallSource: this.cfg.recall.source,
+      rerank: this.cfg.recall.rerank,
     });
 
     return {

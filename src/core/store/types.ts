@@ -525,6 +525,21 @@ export interface IMemoryStore {
   queryEntityById?(id: string): KbEntity | null;
   queryEntityByKey?(namespace: string, type: string, canonicalKey: string): KbEntity | null;
 
+  /**
+   * Fetch a single fact by id (any version — HEAD or historical). Phase-4
+   * retrieval uses this to verify a fact hit is still the HEAD before showing
+   * it and to render its display text. Returns null when not found / KB off.
+   */
+  queryFactById?(id: string): KbFact | null;
+  /** Fetch a single (immutable) event by id. Returns null when not found / KB off. */
+  queryEventById?(id: string): KbEvent | null;
+  /**
+   * Entity-name match for retrieval (candidate source C): normalized query
+   * tokens → entities whose name / alias / canonical_key contains a token,
+   * ranked by token coverage. Deterministic, NO LLM. Empty/none → [].
+   */
+  queryEntitiesByTokens?(tokens: string[], namespace?: string, limit?: number): KbEntity[];
+
   /** kb_vec / kb_fts recall primitives (mirror searchL1Vector / searchL1Fts). */
   searchKbVector?(queryEmbedding: Float32Array, topK?: number, ownerKindFilter?: string): KbVectorSearchResult[];
   searchKbFts?(ftsQuery: string, limit?: number): KbFtsSearchResult[];

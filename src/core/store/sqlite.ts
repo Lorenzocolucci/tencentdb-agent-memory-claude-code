@@ -49,6 +49,9 @@ import {
   queryHeadFacts as kbQueryHeadFacts,
   queryEntityById as kbQueryEntityById,
   queryEntityByKey as kbQueryEntityByKey,
+  queryFactById as kbQueryFactById,
+  queryEventById as kbQueryEventById,
+  queryEntitiesByTokens as kbQueryEntitiesByTokens,
   kbChunkId,
 } from "../kb/kb-queries.js";
 
@@ -2759,6 +2762,24 @@ export class VectorStore implements IMemoryStore {
   queryEntityByKey(namespace: string, type: string, canonicalKeyValue: string): KbEntity | null {
     if (!this.kbReady) return null;
     return kbQueryEntityByKey(this.db, namespace, type, canonicalKeyValue);
+  }
+
+  /** @see IMemoryStore.queryFactById */
+  queryFactById(id: string): KbFact | null {
+    if (!this.kbReady) return null;
+    return kbQueryFactById(this.db, id);
+  }
+
+  /** @see IMemoryStore.queryEventById */
+  queryEventById(id: string): KbEvent | null {
+    if (!this.kbReady) return null;
+    return kbQueryEventById(this.db, id);
+  }
+
+  /** @see IMemoryStore.queryEntitiesByTokens */
+  queryEntitiesByTokens(tokens: string[], namespace = "default", limit = 20): KbEntity[] {
+    if (!this.kbReady) return [];
+    return kbQueryEntitiesByTokens(this.db, tokens, namespace, limit);
   }
 
   /**

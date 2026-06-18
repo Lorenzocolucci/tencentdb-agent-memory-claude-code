@@ -20,6 +20,7 @@ import type { IMemoryStore, L1SearchResult, L1FtsResult } from "../store/types.j
 import { buildFtsQuery } from "../store/sqlite.js";
 import type { EmbeddingService, EmbeddingCallOptions } from "../store/embedding.js";
 import { sanitizeText, escapeXmlTags } from "../../utils/sanitize.js";
+import { kbRecall, type KbRecallResult } from "../kb/retrieval.js";
 
 const TAG = "[memory-tdai] [recall]";
 
@@ -70,6 +71,25 @@ export const RECENCY_WEIGHT = 0.15;
 export const RECENCY_HALFLIFE_DAYS = 30;
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * Standard RRF (Reciprocal Rank Fusion) constant from the original RRF paper.
+ * Shared so every recall path (L1 hybrid here, the memory_search tool, and the
+ * Phase-4 KB retrieval) fuses rank lists with the SAME formula instead of
+ * forking divergent copies.
+ */
+export const RRF_K = 60;
+
+/**
+ * RRF contribution of a single rank position (0-based) in one ranked list:
+ *   1 / (RRF_K + rank + 1)
+ * When an item appears in multiple lists, callers SUM these contributions.
+ * This is the exact formula previously inlined in searchHybrid (~:678/694) and
+ * in tools/memory-search.ts; extracting it keeps all fusers in lock-step.
+ */
+export function rrfScoreForRank(rank: number): number {
+  return 1 / (RRF_K + rank + 1);
+}
 
 /**
  * Exponential time-decay factor in [0, 1] for a memory timestamp.
@@ -166,6 +186,21 @@ async function performAutoRecallInner(params: {
   let searchTiming: SearchTiming = { ftsMs: 0, embeddingMs: 0, ftsHits: 0, embeddingHits: 0 };
   if (!userText || userText.length === 0) {
     logger?.debug?.(`${TAG} User text empty/undefined, skipping memory search (persona/scene still injected)`);
+  } else if (cfg.recall.source === "kb") {
+    // ── Phase-4 entity-centric KB recall path (recall.source = "kb") ──
+    // Maps KbRecallResult → the same memoryLines / RecalledMemory shape the L1
+    // path produces, so downstream injection is unchanged. The score injected
+    // here is the CALIBRATED 0-1 relevance from kbRecall (never raw RRF).
+    effectiveStrategy = "kb";
+    const tKb = performance.now();
+    const kbResults = await runKbRecall(userText, cfg, logger, vectorStore, embeddingService);
+    memoryLines = kbResults.map((r) => formatKbRecallLine(r));
+    recalledL1Memories = kbResults.map((r) => ({
+      content: r.text,
+      score: r.score,
+      type: r.owner_kind,
+    }));
+    searchTiming = { ftsMs: 0, embeddingMs: performance.now() - tKb, ftsHits: 0, embeddingHits: kbResults.length };
   } else {
     effectiveStrategy = cfg.recall.strategy ?? "hybrid";
     const searchResult = await searchMemories(userText, pluginDataDir, cfg, logger, effectiveStrategy as "keyword" | "embedding" | "hybrid", vectorStore, embeddingService);
@@ -295,6 +330,55 @@ async function performAutoRecallInner(params: {
     recalledL3Persona: personaContent ?? null,
     recallStrategy: effectiveStrategy,
   };
+}
+
+// ============================
+// KB recall path (recall.source = "kb")
+// ============================
+
+/**
+ * Run the Phase-4 entity-centric KB recall and return its results. Fault
+ * tolerant: any failure degrades to [] so the recall path never blocks the turn
+ * (mirrors searchMemories' try/catch contract).
+ */
+async function runKbRecall(
+  userText: string,
+  cfg: MemoryTdaiConfig,
+  logger: Logger | undefined,
+  vectorStore?: IMemoryStore,
+  embeddingService?: EmbeddingService,
+): Promise<KbRecallResult[]> {
+  if (!vectorStore) {
+    logger?.debug?.(`${TAG} [kb] vectorStore unavailable — KB recall skipped`);
+    return [];
+  }
+  const recallEmbeddingTimeoutMs = cfg.embedding?.recallTimeoutMs ?? cfg.embedding?.timeoutMs;
+  try {
+    return await kbRecall(userText, {
+      store: vectorStore,
+      embeddingService,
+      maxResults: cfg.recall.maxResults ?? 5,
+      rerank: cfg.recall.rerank ?? false,
+      embeddingTimeoutMs: recallEmbeddingTimeoutMs,
+      logger,
+    });
+  } catch (err) {
+    logger?.warn?.(`${TAG} [kb] KB recall failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+}
+
+/**
+ * Format a single KbRecallResult into a memory line matching the L1 line shape
+ * (`- [type] content (活动时间: ...)`) so the existing injection + parsing logic
+ * is unchanged. The calibrated 0-1 score is appended so the user-facing score is
+ * the calibrated relevance, never raw RRF.
+ */
+function formatKbRecallLine(r: KbRecallResult): string {
+  let line = `- [${r.owner_kind}] ${r.text} (relevance: ${r.score.toFixed(2)})`;
+  const point = formatTimestamp(r.ts);
+  if (point) line += ` (活动时间: ${point})`;
+  return line;
 }
 
 // ============================
@@ -653,8 +737,8 @@ async function searchHybrid(
     return { lines: [], timing };
   }
 
-  // RRF merge: k=60 is a standard constant from the RRF paper
-  const RRF_K = 60;
+  // RRF merge: k=60 is a standard constant from the RRF paper (shared helper
+  // rrfScoreForRank — same formula used by the KB retrieval + memory_search).
 
   // Map: record_id → fused entry. We carry the raw embedding cosine and a
   // timestamp alongside the RRF score so we can (a) apply the score threshold
@@ -675,7 +759,7 @@ async function searchHybrid(
   for (let rank = 0; rank < keywordResults.length; rank++) {
     const r = keywordResults[rank];
     const id = r.record.id;
-    const rrfScore = 1 / (RRF_K + rank + 1);
+    const rrfScore = rrfScoreForRank(rank);
     const ts = (r.record.timestamps && r.record.timestamps.length > 0) ? r.record.timestamps[0] : undefined;
     const existing = mergedMap.get(id);
     if (existing) {
@@ -691,7 +775,7 @@ async function searchHybrid(
   for (let rank = 0; rank < embeddingResults.length; rank++) {
     const r = embeddingResults[rank];
     const id = r.record_id;
-    const rrfScore = 1 / (RRF_K + rank + 1);
+    const rrfScore = rrfScoreForRank(rank);
     const ts = r.timestamp_str || r.timestamp_start || undefined;
     const existing = mergedMap.get(id);
     if (existing) {

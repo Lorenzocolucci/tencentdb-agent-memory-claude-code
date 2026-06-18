@@ -18,6 +18,8 @@ import { MemoryPipelineManager } from "./pipeline-manager.js";
 import type { L2Runner, L3Runner } from "./pipeline-manager.js";
 import { SessionFilter } from "./session-filter.js";
 import { extractL1Memories } from "../core/record/l1-extractor.js";
+import { extractKbDelta } from "../core/kb/kb-extractor.js";
+import type { KbWriterStore } from "../core/kb/kb-writer.js";
 import { readConversationMessagesGroupedBySessionId } from "../core/conversation/l0-recorder.js";
 import type { ConversationMessage } from "../core/conversation/l0-recorder.js";
 import { CheckpointManager } from "./checkpoint.js";
@@ -41,6 +43,29 @@ const TAG = "[memory-tdai] [pipeline-factory]";
 
 function supportsProfileSyncWrite(store?: IMemoryStore): boolean {
   return !!(store?.syncProfiles || store?.deleteProfiles);
+}
+
+/**
+ * Whether a store implements the KB write/embed primitives required by the
+ * Phase-2 "kb" extraction engine. Used to decide if the kb-extractor can run;
+ * if any primitive is missing (e.g. a non-sqlite backend, or KB not ready) the
+ * runner safely falls back to the legacy "l1" path.
+ */
+function supportsKbWrite(store?: IMemoryStore): store is IMemoryStore & KbWriterStore {
+  if (!store) return false;
+  // `isKbReady` exists on the concrete VectorStore (not on IMemoryStore); when
+  // present and false, KB tables aren't ready → fall back.
+  const ready = (store as unknown as { isKbReady?: () => boolean }).isKbReady;
+  if (typeof ready === "function" && !ready.call(store)) return false;
+  return (
+    typeof store.resolveOrCreateEntity === "function" &&
+    typeof store.insertEvent === "function" &&
+    typeof store.upsertFact === "function" &&
+    typeof store.upsertRelation === "function" &&
+    typeof store.queryEntityById === "function" &&
+    typeof store.upsertKbVector === "function" &&
+    typeof store.upsertKbFts === "function"
+  );
 }
 
 // ============================
@@ -371,6 +396,31 @@ export function createL1Runner(opts: {
       const WINDOW_SIZE = 10; // messages fed to the LLM per extraction call
       const BG_SIZE = 5;      // background-context budget inside the extractor
 
+      // ── Extraction engine selection (Phase 2, gated by config) ──
+      // "kb" requires BOTH a host-neutral LLM runner AND a KB-capable store.
+      // When engine="kb" but a prerequisite is missing we fall back to "l1"
+      // (loud warn) so capture never silently stalls. Default engine is "l1",
+      // so the live OpenClaw capture path is unaffected.
+      let useKbEngine = false;
+      if (cfg.extraction.engine === "kb") {
+        if (!llmRunner) {
+          logger.warn(
+            `${TAG} [l1] extraction.engine="kb" but no host-neutral LLM runner is wired ` +
+            `(KB extractor cannot use CleanContextRunner) — falling back to "l1" engine`,
+          );
+        } else if (!supportsKbWrite(vectorStore)) {
+          logger.warn(
+            `${TAG} [l1] extraction.engine="kb" but the store does not support KB writes ` +
+            `(KB not ready / non-sqlite backend) — falling back to "l1" engine`,
+          );
+        } else {
+          useKbEngine = true;
+          logger.info(`${TAG} [l1] Using Phase-2 "kb" extraction engine for session ${sessionKey}`);
+        }
+      }
+      const kbStore =
+        useKbEngine && supportsKbWrite(vectorStore) ? (vectorStore as IMemoryStore & KbWriterStore) : undefined;
+
       let totalExtracted = 0;
       let totalStored = 0;
       let lastSceneName: string | undefined;
@@ -395,31 +445,60 @@ export function createL1Runner(opts: {
         for (let i = 0; i < group.messages.length; i += WINDOW_SIZE) {
           const windowMsgs = group.messages.slice(i, i + WINDOW_SIZE);
 
-          const l1Result = await extractL1Memories({
-            messages: windowMsgs.map((m) => m.msg),
-            sessionKey,
-            sessionId: group.sessionId,
-            baseDir: pluginDataDir,
-            config,
-            options: {
-              // Window length as the per-extraction cap: the extractor's
-              // internal slice keeps the ENTIRE window (its head is never
-              // dropped — that was BUG B).
-              maxMessagesPerExtraction: windowMsgs.length,
-              maxBackgroundMessages: BG_SIZE,
-              enableDedup: cfg.extraction.enableDedup,
-              maxMemoriesPerSession: cfg.extraction.maxMemoriesPerSession,
-              model: cfg.extraction.model,
-              previousSceneName: lastSceneName ?? (runnerState.last_scene_name || undefined),
-              vectorStore,
+          // Normalized window result consumed by the cursor logic below. The
+          // "l1" engine fills extractedCount/storedCount/lastSceneName; the
+          // "kb" engine maps facts+events→extracted and leaves scene undefined.
+          let l1Result: {
+            success: boolean;
+            extractedCount: number;
+            storedCount: number;
+            lastSceneName?: string;
+          };
+
+          if (useKbEngine && kbStore) {
+            // ── Phase-2 "kb" engine: single-stage KbDelta → applyKbDelta ──
+            const kbResult = await extractKbDelta({
+              messages: windowMsgs.map((m) => m.msg),
+              sessionKey,
+              sessionId: group.sessionId,
+              store: kbStore,
               embeddingService,
-              conflictRecallTopK: cfg.embedding.conflictRecallTopK,
-              embeddingTimeoutMs: cfg.embedding.captureTimeoutMs ?? cfg.embedding.timeoutMs,
-              llmRunner,
-            },
-            logger,
-            instanceId: getInstanceId?.(),
-          });
+              llmRunner: llmRunner!,
+              logger,
+            });
+            l1Result = {
+              success: kbResult.success,
+              extractedCount: kbResult.factsCount + kbResult.eventsCount,
+              storedCount: kbResult.factsCount + kbResult.eventsCount,
+            };
+          } else {
+            // ── Legacy "l1" engine (UNCHANGED) ──
+            l1Result = await extractL1Memories({
+              messages: windowMsgs.map((m) => m.msg),
+              sessionKey,
+              sessionId: group.sessionId,
+              baseDir: pluginDataDir,
+              config,
+              options: {
+                // Window length as the per-extraction cap: the extractor's
+                // internal slice keeps the ENTIRE window (its head is never
+                // dropped — that was BUG B).
+                maxMessagesPerExtraction: windowMsgs.length,
+                maxBackgroundMessages: BG_SIZE,
+                enableDedup: cfg.extraction.enableDedup,
+                maxMemoriesPerSession: cfg.extraction.maxMemoriesPerSession,
+                model: cfg.extraction.model,
+                previousSceneName: lastSceneName ?? (runnerState.last_scene_name || undefined),
+                vectorStore,
+                embeddingService,
+                conflictRecallTopK: cfg.embedding.conflictRecallTopK,
+                embeddingTimeoutMs: cfg.embedding.captureTimeoutMs ?? cfg.embedding.timeoutMs,
+                llmRunner,
+              },
+              logger,
+              instanceId: getInstanceId?.(),
+            });
+          }
 
           if (!l1Result.success) {
             // HARD FAILURE: leave the cursor at the last successful window so the

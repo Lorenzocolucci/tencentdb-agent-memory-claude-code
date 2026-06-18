@@ -13,6 +13,7 @@
 import type { IMemoryStore, L1SearchResult } from "../store/types.js";
 import { buildFtsQuery } from "../store/sqlite.js";
 import type { EmbeddingService } from "../store/embedding.js";
+import { kbRecall } from "../kb/retrieval.js";
 
 // ============================
 // Types
@@ -93,6 +94,12 @@ export async function executeMemorySearch(params: {
   vectorStore?: IMemoryStore;
   embeddingService?: EmbeddingService;
   logger?: Logger;
+  /** Recall source (default "l1"). When "kb", uses the Phase-4 KB retrieval. */
+  recallSource?: "l1" | "kb";
+  /** Enable the KB rerank stage (default false / no-op). Only used when recallSource = "kb". */
+  rerank?: boolean;
+  /** Namespace scope for KB recall (default "default"). */
+  namespace?: string;
 }): Promise<MemorySearchResult> {
   const {
     query,
@@ -102,6 +109,9 @@ export async function executeMemorySearch(params: {
     vectorStore,
     embeddingService,
     logger,
+    recallSource = "l1",
+    rerank = false,
+    namespace = "default",
   } = params;
 
   logger?.debug?.(
@@ -119,6 +129,23 @@ export async function executeMemorySearch(params: {
   if (!vectorStore) {
     logger?.warn?.(`${TAG} VectorStore not available`);
     return { results: [], total: 0, strategy: "none" };
+  }
+
+  // ── Phase-4 KB recall path (recall.source = "kb") ──
+  // Maps KbRecallResult → MemorySearchResultItem. The `score` is the calibrated
+  // 0-1 relevance from kbRecall (NOT raw RRF). type/scene filters do not apply to
+  // KB owners (facts/events) and are ignored here.
+  if (recallSource === "kb") {
+    const kbResults = await executeKbMemorySearch({
+      query,
+      limit,
+      vectorStore,
+      embeddingService,
+      rerank,
+      namespace,
+      logger,
+    });
+    return kbResults;
   }
 
   // ── Determine available capabilities ──
@@ -258,6 +285,55 @@ export async function executeMemorySearch(params: {
     total: trimmed.length,
     strategy,
   };
+}
+
+// ============================
+// KB recall path (recall.source = "kb")
+// ============================
+
+/**
+ * Run the Phase-4 KB retrieval and map its calibrated results into the
+ * MemorySearchResult envelope so the tool response shape is unchanged. The
+ * `score` shown is the calibrated 0-1 relevance from kbRecall, never raw RRF.
+ */
+async function executeKbMemorySearch(params: {
+  query: string;
+  limit: number;
+  vectorStore: IMemoryStore;
+  embeddingService?: EmbeddingService;
+  rerank: boolean;
+  namespace: string;
+  logger?: Logger;
+}): Promise<MemorySearchResult> {
+  const { query, limit, vectorStore, embeddingService, rerank, namespace, logger } = params;
+  try {
+    const kbResults = await kbRecall(query, {
+      store: vectorStore,
+      embeddingService,
+      namespace,
+      maxResults: limit,
+      rerank,
+      logger,
+    });
+    const results: MemorySearchResultItem[] = kbResults.map((r) => ({
+      id: r.owner_id,
+      content: r.text,
+      type: r.owner_kind,
+      priority: -1,
+      scene_name: "",
+      score: r.score, // calibrated 0-1 relevance (NOT raw RRF)
+      created_at: r.ts ?? "",
+      updated_at: r.ts ?? "",
+    }));
+    logger?.debug?.(
+      `${TAG} [kb] RESULT: returning ${results.length} memories ` +
+      `(scores: [${results.map((r) => r.score.toFixed(3)).join(", ")}])`,
+    );
+    return { results, total: results.length, strategy: "kb" };
+  } catch (err) {
+    logger?.warn?.(`${TAG} [kb] KB recall failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    return { results: [], total: 0, strategy: "kb" };
+  }
 }
 
 // ============================
