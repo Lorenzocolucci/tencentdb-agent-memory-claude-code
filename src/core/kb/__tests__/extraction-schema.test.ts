@@ -98,32 +98,50 @@ describe("parseKbDelta — empty delta", () => {
   });
 });
 
-describe("parseKbDelta — invalid enum", () => {
-  it("rejects an unknown entity type", () => {
+// RESILIENCE CONTRACT (changed in the extraction-quality fix): an out-of-
+// vocabulary enum must NEVER nuke the whole window (that reject-behavior WAS
+// the recurring MANGO total-loss bug — Kimi emits type:"secret_code", the old
+// schema rejected the entire delta, the cursor held, nothing was ever stored).
+// normalizeRawKbDelta now COERCES the high-churn vocab fields before strict
+// structural validation. Structural errors (dangling/duplicate refs) still reject.
+describe("parseKbDelta — vocabulary coercion (never total-loss)", () => {
+  it("coerces an unknown entity type to 'concept' (the secret_code bug)", () => {
+    const d = validDelta() as Record<string, unknown>;
+    (d.entities as Array<Record<string, unknown>>)[0].type = "secret_code";
+    const res = parseKbDelta(d);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.delta.entities[0].type).toBe("concept");
+  });
+
+  it("coerces another unknown entity type ('alien') to 'concept'", () => {
     const d = validDelta() as Record<string, unknown>;
     (d.entities as Array<Record<string, unknown>>)[0].type = "alien";
     const res = parseKbDelta(d);
-    expect(res.ok).toBe(false);
-    if (res.ok) return;
-    expect(res.error).toMatch(/entities\.0\.type/);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.delta.entities[0].type).toBe("concept");
   });
 
-  it("rejects an unknown event type", () => {
+  it("coerces an unknown event type to 'observation'", () => {
     const d = validDelta() as Record<string, unknown>;
     (d.events as Array<Record<string, unknown>>)[0].type = "meltdown";
     const res = parseKbDelta(d);
-    expect(res.ok).toBe(false);
-    if (res.ok) return;
-    expect(res.error).toMatch(/events\.0\.type/);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.delta.events[0].type).toBe("observation");
   });
 
-  it("rejects an unknown relation type", () => {
+  it("drops a relation with an unknown type (no safe generic fallback), keeps the rest", () => {
     const d = validDelta() as Record<string, unknown>;
     (d.relations as Array<Record<string, unknown>>)[0].type = "loves";
     const res = parseKbDelta(d);
-    expect(res.ok).toBe(false);
-    if (res.ok) return;
-    expect(res.error).toMatch(/relations\.0\.type/);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.delta.relations).toHaveLength(0); // the single bad relation was dropped
+    // entities/facts/events survive — the window is NOT lost
+    expect(res.delta.entities).toHaveLength(2);
+    expect(res.delta.facts).toHaveLength(1);
   });
 });
 
@@ -194,32 +212,44 @@ describe("parseKbDelta — duplicate ref", () => {
   });
 });
 
-describe("parseKbDelta — non-snake_case attribute", () => {
-  it("rejects an attribute with uppercase / camelCase", () => {
+// Attribute keys are language-neutral English snake_case. Rather than reject a
+// fact (data loss) when the model emits camelCase / spaces / punctuation,
+// normalizeRawKbDelta coerces the key to valid snake_case.
+describe("parseKbDelta — attribute coercion to snake_case", () => {
+  it("coerces camelCase → snake_case (ibanDelivery → iban_delivery)", () => {
     const d = validDelta() as Record<string, unknown>;
     (d.facts as Array<Record<string, unknown>>)[0].attribute = "ibanDelivery";
     const res = parseKbDelta(d);
-    expect(res.ok).toBe(false);
-    if (res.ok) return;
-    expect(res.error).toMatch(/snake_case/);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.delta.facts[0].attribute).toBe("iban_delivery");
   });
 
-  it("rejects an attribute that starts with a digit", () => {
+  it("prefixes an attribute that starts with a digit (1st_status → v_1st_status)", () => {
     const d = validDelta() as Record<string, unknown>;
     (d.facts as Array<Record<string, unknown>>)[0].attribute = "1st_status";
     const res = parseKbDelta(d);
-    expect(res.ok).toBe(false);
-    if (res.ok) return;
-    expect(res.error).toMatch(/snake_case/);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.delta.facts[0].attribute).toBe("v_1st_status");
   });
 
-  it("rejects an attribute with a hyphen or space", () => {
+  it("coerces hyphen/space → underscore (default-branch → default_branch)", () => {
     const d = validDelta() as Record<string, unknown>;
     (d.facts as Array<Record<string, unknown>>)[0].attribute = "default-branch";
     const res = parseKbDelta(d);
-    expect(res.ok).toBe(false);
-    if (res.ok) return;
-    expect(res.error).toMatch(/snake_case/);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.delta.facts[0].attribute).toBe("default_branch");
+  });
+
+  it("coerces a mixed-script attribute by stripping non-latin ('verifica موفق' → 'verifica')", () => {
+    const d = validDelta() as Record<string, unknown>;
+    (d.facts as Array<Record<string, unknown>>)[0].attribute = "verifica موفق";
+    const res = parseKbDelta(d);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.delta.facts[0].attribute).toBe("verifica");
   });
 });
 

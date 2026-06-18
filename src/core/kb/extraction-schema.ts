@@ -219,6 +219,100 @@ export type KbDeltaEvent = z.infer<typeof EventSchema>;
 export type KbDeltaRelation = z.infer<typeof RelationSchema>;
 
 // ============================
+// Vocabulary coercion (resilience — never lose a window to vocab drift)
+// ============================
+
+const ENTITY_TYPE_SET: ReadonlySet<string> = new Set(KB_ENTITY_TYPES);
+const EVENT_TYPE_SET: ReadonlySet<string> = new Set(KB_EVENT_TYPES);
+const RELATION_TYPE_SET: ReadonlySet<string> = new Set(KB_RELATION_TYPES);
+
+/** Fallback entity type for out-of-vocabulary values (codes, secrets, ids, …). */
+const ENTITY_TYPE_FALLBACK = "concept";
+/** Fallback event type for out-of-vocabulary values. */
+const EVENT_TYPE_FALLBACK = "observation";
+
+/**
+ * Coerce a free-form attribute key to language-neutral English snake_case so a
+ * model that emits camelCase / spaces / punctuation ("preferredLanguage",
+ * "IBAN delivery") does not fail the whole window. Mirrors SNAKE_CASE_ATTRIBUTE.
+ */
+function coerceAttribute(raw: unknown): string {
+  if (typeof raw !== "string") return "value";
+  let s = raw
+    .normalize("NFKC")
+    // camelCase / PascalCase → snake (insert _ at lower→Upper boundaries)
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    // any run of non [a-z0-9] → single _
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if (s.length === 0) return "value";
+  // must start with a letter (regex anchor [a-z]); prefix otherwise.
+  if (!/^[a-z]/.test(s)) s = `v_${s}`;
+  return s.slice(0, ATTRIBUTE_MAX);
+}
+
+/**
+ * Normalize a raw (JSON-parsed) KbDelta-shaped object BEFORE strict validation.
+ *
+ * RESILIENCE PRINCIPLE: a single out-of-vocabulary enum (the model loves
+ * `type:"secret_code"`) must NEVER nuke an entire window's memory (the recurring
+ * total-loss bug). Here we coerce the high-churn, low-risk vocabulary fields:
+ *   - entity.type  ∉ enum → "concept"
+ *   - event.type   ∉ enum → "observation"
+ *   - fact.attribute       → snake_case
+ *   - relation.type ∉ enum → DROP that relation (no safe generic fallback)
+ * Structural integrity (refs, required fields, caps) is still enforced strictly
+ * by KbDeltaSchema afterwards. Pure/immutable — returns a new object.
+ */
+export function normalizeRawKbDelta(raw: unknown): unknown {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const obj = raw as Record<string, unknown>;
+
+  const mapArray = <T>(v: unknown, fn: (item: Record<string, unknown>) => T): unknown =>
+    Array.isArray(v)
+      ? v.map((item) =>
+          item !== null && typeof item === "object" && !Array.isArray(item)
+            ? fn(item as Record<string, unknown>)
+            : item,
+        )
+      : v;
+
+  const entities = mapArray(obj.entities, (e) => {
+    const t = e.type;
+    return typeof t === "string" && ENTITY_TYPE_SET.has(t)
+      ? e
+      : { ...e, type: ENTITY_TYPE_FALLBACK };
+  });
+
+  const events = mapArray(obj.events, (ev) => {
+    const t = ev.type;
+    return typeof t === "string" && EVENT_TYPE_SET.has(t)
+      ? ev
+      : { ...ev, type: EVENT_TYPE_FALLBACK };
+  });
+
+  const facts = mapArray(obj.facts, (f) =>
+    "attribute" in f ? { ...f, attribute: coerceAttribute(f.attribute) } : f,
+  );
+
+  // Relations have no safe generic fallback — drop ones with an unknown type
+  // rather than inventing a wrong edge or failing the whole delta.
+  const relations = Array.isArray(obj.relations)
+    ? obj.relations.filter(
+        (r) =>
+          r !== null &&
+          typeof r === "object" &&
+          !Array.isArray(r) &&
+          RELATION_TYPE_SET.has((r as Record<string, unknown>).type as string),
+      )
+    : obj.relations;
+
+  return { ...obj, entities, events, facts, relations };
+}
+
+// ============================
 // Parse result (never throws)
 // ============================
 
@@ -233,9 +327,12 @@ export type ParseKbDeltaResult =
  * single-line summary of the FIRST few Zod issues (path + message), suitable
  * for a fail-closed log line. The runner treats `ok:false` as a hard failure
  * and HOLDS the cursor; an empty-but-valid delta is `ok:true`.
+ *
+ * Raw input is first passed through `normalizeRawKbDelta` so out-of-vocabulary
+ * enums are coerced (never a total-loss window) before strict structural checks.
  */
 export function parseKbDelta(raw: unknown): ParseKbDeltaResult {
-  const result = KbDeltaSchema.safeParse(raw);
+  const result = KbDeltaSchema.safeParse(normalizeRawKbDelta(raw));
   if (result.success) {
     return { ok: true, delta: result.data };
   }
