@@ -13,6 +13,8 @@
  * - Throws on failure; callers decide fallback strategy.
  */
 
+import { request as undiciRequest, Agent as UndiciAgent } from "undici";
+import type { Dispatcher } from "undici";
 import {
   resolveChunkOptions,
   splitIntoChunks,
@@ -80,6 +82,21 @@ export interface EmbeddingCallOptions {
   timeoutMs?: number;
 }
 
+/**
+ * Liveness/health signal for an embedding service.
+ *
+ * `healthy` flips to false once a provider has seen K consecutive transient
+ * failures (circuit breaker open) and flips back to true on the next success.
+ * It lets /health report an honest "embedding: failing" instead of a blind
+ * "ok" while every query embedding is silently aborting on a dead socket.
+ */
+export interface EmbeddingHealth {
+  /** True while the embedding path is believed to be working. */
+  healthy: boolean;
+  /** Number of consecutive transient failures since the last success. */
+  consecutiveFailures: number;
+}
+
 export interface EmbeddingService {
   /**
    * Get embedding for a single text.
@@ -118,6 +135,15 @@ export interface EmbeddingService {
    * Safe to call multiple times (idempotent).
    */
   startWarmup(): void;
+  /**
+   * Optional circuit-breaker health signal.
+   *
+   * Remote providers (OpenAI) implement this to surface a "degraded" state
+   * after K consecutive transient HTTP failures, so /health can report the
+   * embedding path honestly. Providers that can't fail this way (local model,
+   * noop) may omit it; callers must treat a missing implementation as healthy.
+   */
+  getHealth?(): EmbeddingHealth;
   /** Optional: release resources (model memory, GPU, etc.) on shutdown */
   close?(): void | Promise<void>;
 }
@@ -433,10 +459,74 @@ export class LocalEmbeddingService implements EmbeddingService {
 /** Max texts per batch (OpenAI limit is 2048, we use a safe value) */
 const MAX_BATCH_SIZE = 256;
 
-/** Max retries for API calls */
-const MAX_RETRIES = 0;
+/**
+ * Max RETRIES (additional attempts) per API call.
+ *
+ * Was 0 — a single failed request was a hard failure. Over a multi-hour
+ * process the pooled keep-alive TLS socket to the embedding host goes stale
+ * (idle reaping by a load balancer / NAT), so the FIRST attempt reuses a dead
+ * socket and throws "fetch failed" / UND_ERR_SOCKET. With 0 retries recall
+ * collapsed. We now retry on a FRESH dispatcher (see _callApi) so attempt 2
+ * cannot inherit the zombie socket.
+ */
+const MAX_RETRIES = 2;
 /** Default timeout per API call in milliseconds */
 const DEFAULT_API_TIMEOUT_MS = 10_000;
+
+/**
+ * Bounded socket lifetime for the dedicated undici Agent.
+ *
+ * The whole bug class is "a pooled socket outlives the remote's idle timeout".
+ * We keep keep-alive ON for throughput but retire idle sockets quickly (10s)
+ * so a socket can't sit idle long enough for an upstream LB/NAT to silently
+ * kill it. connect/headers/body timeouts bound how long any single phase can
+ * hang. These are deliberately conservative for a query-latency-sensitive path.
+ */
+const AGENT_KEEP_ALIVE_TIMEOUT_MS = 10_000; // retire idle sockets after 10s
+const AGENT_KEEP_ALIVE_MAX_TIMEOUT_MS = 30_000; // absolute cap on keep-alive
+const AGENT_CONNECT_TIMEOUT_MS = 10_000; // TCP+TLS connect budget
+const AGENT_HEADERS_TIMEOUT_MS = 15_000; // time to first response byte
+const AGENT_BODY_TIMEOUT_MS = 15_000; // time to read the response body
+
+/**
+ * Circuit-breaker threshold: after this many CONSECUTIVE transient failures the
+ * embedding service reports itself unhealthy (getHealth().healthy === false).
+ * A single success resets the counter and closes the breaker.
+ */
+const CIRCUIT_OPEN_THRESHOLD = 3;
+
+/** Substrings/names that identify a TRANSIENT network failure worth retrying. */
+const TRANSIENT_ERROR_MARKERS = [
+  "UND_ERR_SOCKET",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "ECONNREFUSED",
+  "EPIPE",
+  "EAI_AGAIN",
+  "ENOTFOUND",
+  "fetch failed",
+  "socket hang up",
+  "other side closed",
+  "terminated",
+] as const;
+
+/**
+ * Decide whether an error is a transient network failure (stale socket, reset,
+ * timeout, abort) that is worth retrying on a fresh connection. Client errors
+ * (4xx) are NOT transient and bubble up immediately via EmbeddingApiError.
+ */
+function isTransientNetworkError(err: unknown): boolean {
+  if (err instanceof EmbeddingApiError) {
+    // Only 429 / 5xx are worth retrying; 4xx client errors are permanent.
+    return !err.isClientError();
+  }
+  if (!(err instanceof Error)) return false;
+  // AbortError = our per-call timeout fired → the request hung, retry it.
+  if (err.name === "AbortError" || err.name === "TimeoutError") return true;
+  const code = (err as NodeJS.ErrnoException).code ?? "";
+  const haystack = `${err.name} ${err.message} ${code}`;
+  return TRANSIENT_ERROR_MARKERS.some((m) => haystack.includes(m));
+}
 
 /**
  * Custom error class for embedding API errors that carries HTTP status code.
@@ -467,6 +557,9 @@ interface OpenAIEmbeddingResponse {
   };
 }
 
+/** Factory for the embedding HTTP dispatcher — overridable in tests. */
+export type EmbeddingDispatcherFactory = () => Dispatcher;
+
 export class OpenAIEmbeddingService implements EmbeddingService {
   private readonly baseUrl: string;
   private readonly apiKey: string;
@@ -479,7 +572,28 @@ export class OpenAIEmbeddingService implements EmbeddingService {
   private readonly timeoutMs: number;
   private readonly logger?: Logger;
 
-  constructor(config: OpenAIEmbeddingConfig, logger?: Logger) {
+  /**
+   * Dedicated undici dispatcher with bounded socket lifetime. We use our OWN
+   * Agent (not Node's process-global fetch dispatcher) so we fully control
+   * keep-alive/socket-age and can RECYCLE it on a transient failure — that is
+   * what guarantees a retry opens a brand-new connection instead of reusing the
+   * zombie socket that caused the failure.
+   */
+  private dispatcher: Dispatcher;
+  /** Factory used to (re)create the dispatcher; kept so retries can recycle it. */
+  private readonly makeDispatcher: EmbeddingDispatcherFactory;
+
+  // ── Circuit-breaker state ────────────────────────────────
+  /** Consecutive transient failures since the last success. */
+  private consecutiveFailures = 0;
+  /** True once the breaker has opened (>= CIRCUIT_OPEN_THRESHOLD failures). */
+  private circuitOpen = false;
+
+  constructor(
+    config: OpenAIEmbeddingConfig,
+    logger?: Logger,
+    dispatcherFactory?: EmbeddingDispatcherFactory,
+  ) {
     if (!config.apiKey) {
       throw new Error("EmbeddingService: apiKey is required for remote provider");
     }
@@ -513,6 +627,84 @@ export class OpenAIEmbeddingService implements EmbeddingService {
     });
     this.timeoutMs = config.timeoutMs && config.timeoutMs > 0 ? config.timeoutMs : DEFAULT_API_TIMEOUT_MS;
     this.logger = logger;
+
+    // Build a dedicated undici Agent with bounded socket lifetime. Tests can
+    // inject their own factory (e.g. pointing at an unreachable host) to drive
+    // the retry / circuit-breaker paths deterministically.
+    this.makeDispatcher = dispatcherFactory ?? OpenAIEmbeddingService.defaultDispatcherFactory;
+    this.dispatcher = this.makeDispatcher();
+  }
+
+  /**
+   * Default dispatcher: an undici Agent that keeps connections alive for
+   * throughput but retires idle sockets aggressively so none survives long
+   * enough for an upstream load balancer / NAT to silently kill it.
+   */
+  private static defaultDispatcherFactory(): Dispatcher {
+    return new UndiciAgent({
+      keepAliveTimeout: AGENT_KEEP_ALIVE_TIMEOUT_MS,
+      keepAliveMaxTimeout: AGENT_KEEP_ALIVE_MAX_TIMEOUT_MS,
+      connect: { timeout: AGENT_CONNECT_TIMEOUT_MS },
+      headersTimeout: AGENT_HEADERS_TIMEOUT_MS,
+      bodyTimeout: AGENT_BODY_TIMEOUT_MS,
+    });
+  }
+
+  /**
+   * Throw away the current dispatcher (and every socket it pools) and build a
+   * fresh one. Called between retry attempts so attempt N+1 CANNOT inherit the
+   * dead keep-alive socket that made attempt N fail. destroy() is best-effort
+   * and fire-and-forget — we never block the retry on socket teardown.
+   */
+  private recycleDispatcher(): void {
+    const old = this.dispatcher;
+    this.dispatcher = this.makeDispatcher();
+    void Promise.resolve()
+      .then(() => (old as unknown as { destroy?: () => Promise<void> }).destroy?.())
+      .catch(() => {
+        /* best-effort: a failed teardown must not break the retry */
+      });
+  }
+
+  /**
+   * Circuit-breaker health signal. Healthy until CIRCUIT_OPEN_THRESHOLD
+   * consecutive transient failures; one success closes the breaker again.
+   */
+  getHealth(): EmbeddingHealth {
+    return {
+      healthy: !this.circuitOpen,
+      consecutiveFailures: this.consecutiveFailures,
+    };
+  }
+
+  /** Record a successful API call: reset failure count, close the breaker. */
+  private onApiSuccess(): void {
+    if (this.circuitOpen) {
+      this.logger?.info(`${TAG} Embedding service recovered — circuit closed`);
+    }
+    this.consecutiveFailures = 0;
+    this.circuitOpen = false;
+  }
+
+  /** Record a transient failure: bump the counter, open the breaker at K. */
+  private onApiFailure(): void {
+    this.consecutiveFailures += 1;
+    if (!this.circuitOpen && this.consecutiveFailures >= CIRCUIT_OPEN_THRESHOLD) {
+      this.circuitOpen = true;
+      this.logger?.error(
+        `${TAG} Embedding service degraded — ${this.consecutiveFailures} consecutive ` +
+        `failures; circuit OPEN (recall will degrade until a call succeeds).`,
+      );
+    }
+  }
+
+  /** Release the dedicated dispatcher (and its sockets) on shutdown. */
+  async close(): Promise<void> {
+    try {
+      await (this.dispatcher as unknown as { close?: () => Promise<void> }).close?.();
+    } catch {
+      /* best-effort */
+    }
   }
 
   getDimensions(): number {
@@ -622,63 +814,91 @@ export class OpenAIEmbeddingService implements EmbeddingService {
       );
     }
 
-    // Retry loop with timeout
+    // Retry loop. We use undici.request() with our OWN bounded-lifetime Agent
+    // (mirrors tcvdb-client.ts) instead of global fetch, so we can recycle the
+    // dispatcher between attempts and never reuse a dead pooled socket.
     let lastError: Error | undefined;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      // CRITICAL: before any RETRY (attempt > 0), throw away the dispatcher so
+      // this attempt opens a brand-new connection. Otherwise a stale keep-alive
+      // socket would be reused and the retry would fail identically.
+      if (attempt > 0) {
+        this.recycleDispatcher();
+      }
       try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), timeoutOverride ?? this.timeoutMs);
+        const { statusCode, body: respBody } = await undiciRequest(fetchUrl, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+          // Per-call deadline (unchanged contract): caps total time for this
+          // attempt. AbortSignal.timeout fires a TimeoutError, treated as
+          // transient and retried on a fresh socket.
+          signal: AbortSignal.timeout(timeoutOverride ?? this.timeoutMs),
+          dispatcher: this.dispatcher,
+        });
 
-        try {
-          const resp = await fetch(fetchUrl, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(body),
-            signal: controller.signal,
-          });
+        const respText = await respBody.text();
 
-          if (!resp.ok) {
-            const errBody = await resp.text().catch(() => "(unable to read body)");
-            const err = new EmbeddingApiError(
-              `Embedding API error: HTTP ${resp.status} ${resp.statusText} — ${errBody.slice(0, 500)}`,
-              resp.status,
-            );
-            // Don't retry on 4xx client errors (except 429 rate limit)
-            if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
-              throw err;
-            }
-            lastError = err;
-            continue;
+        if (statusCode < 200 || statusCode >= 300) {
+          const err = new EmbeddingApiError(
+            `Embedding API error: HTTP ${statusCode} — ${respText.slice(0, 500)}`,
+            statusCode,
+          );
+          // Don't retry on 4xx client errors (except 429 rate limit).
+          if (err.isClientError()) {
+            this.onApiSuccess(); // a 4xx means the SOCKET is fine — keep breaker closed
+            throw err;
           }
-
-          const json = (await resp.json()) as OpenAIEmbeddingResponse;
-
-          if (!json.data || !Array.isArray(json.data)) {
-            throw new Error("Embedding API returned unexpected format: missing 'data' array");
+          lastError = err;
+          this.onApiFailure();
+          if (attempt < MAX_RETRIES) {
+            await this.backoff(attempt);
           }
-
-          // Sort by index to ensure correct order, then sanitize+normalize for consistency with local provider
-          const sorted = [...json.data].sort((a, b) => a.index - b.index);
-          return sorted.map((d) => sanitizeAndNormalize(d.embedding));
-        } finally {
-          clearTimeout(timeoutId);
+          continue;
         }
+
+        const json = JSON.parse(respText) as OpenAIEmbeddingResponse;
+
+        if (!json.data || !Array.isArray(json.data)) {
+          throw new Error("Embedding API returned unexpected format: missing 'data' array");
+        }
+
+        // Sort by index to ensure correct order, then sanitize+normalize for consistency with local provider
+        const sorted = [...json.data].sort((a, b) => a.index - b.index);
+        const result = sorted.map((d) => sanitizeAndNormalize(d.embedding));
+        this.onApiSuccess();
+        return result;
       } catch (err) {
-        // Non-retryable errors (4xx client errors) — rethrow immediately
+        // Non-retryable errors (4xx client errors) — rethrow immediately.
         if (err instanceof EmbeddingApiError && err.isClientError()) {
           throw err;
         }
         lastError = err instanceof Error ? err : new Error(String(err));
-        // AbortError = timeout, retry
-        if (attempt < MAX_RETRIES) {
-          // Exponential backoff: 500ms, 1000ms
-          const delay = 500 * (attempt + 1);
-          await new Promise((r) => setTimeout(r, delay));
+        // Only network-transient errors should retry + count toward the breaker.
+        // A malformed-response Error (e.g. bad JSON) is a hard failure: still
+        // count it (the call did fail) but it won't usually be marked transient.
+        if (isTransientNetworkError(err)) {
+          this.onApiFailure();
+          if (attempt < MAX_RETRIES) {
+            await this.backoff(attempt);
+            continue;
+          }
+        } else {
+          // Non-transient, non-client error (e.g. unexpected response shape):
+          // count it once and stop retrying.
+          this.onApiFailure();
+          break;
         }
       }
     }
 
     throw lastError ?? new Error("Embedding API call failed after retries");
+  }
+
+  /** Exponential backoff between retry attempts: 500ms, 1000ms, … */
+  private async backoff(attempt: number): Promise<void> {
+    const delay = 500 * (attempt + 1);
+    await new Promise((r) => setTimeout(r, delay));
   }
 }
 

@@ -1,55 +1,69 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { MockAgent } from "undici";
 import { OpenAIEmbeddingService } from "../embedding.js";
 
 const DIMS = 4;
 
 /**
- * Stub the global fetch with an OpenAI-compatible embeddings response that
- * returns ONE vector per input text (the real API contract).  This lets us
- * assert the chunk cardinality embedChunks() produces.
+ * Capture of one POST /embeddings call body, so tests can assert what inputs
+ * were actually sent (mirrors the old fetchMock.mock.calls inspection).
  */
-function stubFetch(): ReturnType<typeof vi.fn> {
-  const fn = vi.fn(async (_url: string, init?: { body?: string }) => {
-    const body = JSON.parse(String(init?.body ?? "{}")) as { input: string[] };
-    const data = body.input.map((_text, index) => ({
-      index,
-      embedding: Array.from({ length: DIMS }, (_v, i) => (i + 1) / 10 + index * 0.01),
-    }));
-    return {
-      ok: true,
-      status: 200,
-      statusText: "OK",
-      json: async () => ({ data }),
-      text: async () => "",
-    } as unknown as Response;
-  });
-  vi.stubGlobal("fetch", fn);
-  return fn;
+const sentInputs: string[][] = [];
+
+/**
+ * Build an undici MockAgent that answers POST /v1/embeddings with an
+ * OpenAI-compatible response returning ONE vector per input text (the real API
+ * contract). The service no longer uses global fetch — it uses undici.request
+ * with an injected dispatcher — so we mock at the dispatcher layer instead.
+ */
+function makeMockAgent(): MockAgent {
+  const agent = new MockAgent();
+  agent.disableNetConnect();
+  const pool = agent.get("https://api.test");
+  pool
+    .intercept({ path: "/v1/embeddings", method: "POST" })
+    .reply(200, (opts) => {
+      const body = JSON.parse(String(opts.body ?? "{}")) as { input: string[] };
+      sentInputs.push(body.input);
+      return {
+        data: body.input.map((_text, index) => ({
+          index,
+          embedding: Array.from({ length: DIMS }, (_v, i) => (i + 1) / 10 + index * 0.01),
+        })),
+      };
+    })
+    .persist();
+  return agent;
 }
 
+let mockAgent: MockAgent;
+
 function makeService(overrides: Record<string, unknown> = {}): OpenAIEmbeddingService {
-  return new OpenAIEmbeddingService({
-    provider: "openai",
-    baseUrl: "https://api.test/v1",
-    apiKey: "test-key",
-    model: "text-embedding-3-small",
-    dimensions: DIMS,
-    chunkSize: 2000,
-    chunkOverlap: 200,
-    maxChunksPerText: 50,
-    ...overrides,
-  });
+  return new OpenAIEmbeddingService(
+    {
+      provider: "openai",
+      baseUrl: "https://api.test/v1",
+      apiKey: "test-key",
+      model: "text-embedding-3-small",
+      dimensions: DIMS,
+      chunkSize: 2000,
+      chunkOverlap: 200,
+      maxChunksPerText: 50,
+      ...overrides,
+    },
+    undefined,
+    () => mockAgent,
+  );
 }
 
 describe("OpenAIEmbeddingService.embedChunks", () => {
-  let fetchMock: ReturnType<typeof vi.fn>;
-
   beforeEach(() => {
-    fetchMock = stubFetch();
+    sentInputs.length = 0;
+    mockAgent = makeMockAgent();
   });
 
-  afterEach(() => {
-    vi.unstubAllGlobals();
+  afterEach(async () => {
+    await mockAgent.close();
   });
 
   it("a >5000-char text produces MULTIPLE chunk vectors", async () => {
@@ -88,6 +102,7 @@ describe("OpenAIEmbeddingService.embedChunks", () => {
         maxChunksPerText: 3,
       },
       { info: () => {}, warn: (m) => warnings.push(m), error: () => {}, debug: () => {} },
+      () => mockAgent,
     );
     const vectors = await svc.embedChunks("q".repeat(1000)); // needs 10 chunks, capped at 3
     expect(vectors).toHaveLength(3);
@@ -103,10 +118,8 @@ describe("OpenAIEmbeddingService.embedChunks", () => {
   it("does not silently truncate: long text covered by chunks reflects in fetch input", async () => {
     const svc = makeService();
     await svc.embedChunks("x".repeat(5001));
-    // The last fetch call's inputs together must cover beyond the old 5000 cap.
-    const allInputs = fetchMock.mock.calls.flatMap(
-      (c) => (JSON.parse(String((c[1] as { body: string }).body)).input as string[]),
-    );
+    // The request inputs together must cover beyond the old 5000 cap.
+    const allInputs = sentInputs.flat();
     const totalChars = allInputs.reduce((s, t) => s + t.length, 0);
     // With overlap the summed chunk length exceeds the original (proves full coverage + overlap).
     expect(totalChars).toBeGreaterThan(5001);

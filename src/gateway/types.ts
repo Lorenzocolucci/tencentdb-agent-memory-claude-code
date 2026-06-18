@@ -23,6 +23,12 @@ export interface HealthResponse {
     vectorStore: boolean;
     embeddingService: boolean;
   };
+  /**
+   * Real embedding liveness: "ok" when a tiny embed("ping") (or the circuit
+   * breaker) reports the embedding path works, "failing" when it does not.
+   * The result is cached (see HEALTH_EMBEDDING_TTL_MS) so /health stays cheap.
+   */
+  embedding: "ok" | "failing";
 }
 
 // ============================

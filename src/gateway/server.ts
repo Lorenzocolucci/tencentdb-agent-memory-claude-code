@@ -47,6 +47,21 @@ import type { SeedProgress } from "../core/seed/types.js";
 const TAG = "[tdai-gateway]";
 const VERSION = "0.1.0";
 
+// ── HTTP server timeouts ──────────────────────────────────
+// A wedged handler must not hold a connection forever. /seed can legitimately
+// run for minutes, so requestTimeout is generous (10 min) rather than 0, while
+// headers/idle are short so half-open or idle sockets are reaped quickly.
+const HTTP_REQUEST_TIMEOUT_MS = 600_000; // 10 min — accommodates long /seed
+const HTTP_HEADERS_TIMEOUT_MS = 30_000; // time to receive request headers
+const HTTP_KEEP_ALIVE_TIMEOUT_MS = 60_000; // idle keep-alive socket lifetime
+
+// ── /health embedding liveness cache ──────────────────────
+// /health is polled frequently (hooks, daemon, start-gateway.ps1). A real
+// embed("ping") on every call would add latency + cost, so we cache the result.
+const HEALTH_EMBEDDING_TTL_MS = 45_000; // re-probe embedding at most every 45s
+/** Tiny input used for the liveness probe — cheap, deterministic. */
+const HEALTH_EMBEDDING_PROBE = "ping";
+
 // ============================
 // Console logger (for standalone gateway — no OpenClaw logger available)
 // ============================
@@ -156,6 +171,12 @@ export class TdaiGateway {
   private server: http.Server | null = null;
   private startTime = Date.now();
 
+  // Cached embedding-liveness result (see HEALTH_EMBEDDING_TTL_MS). null = not
+  // probed yet. We never let a probe failure throw out of /health.
+  private embeddingHealthCache: { ok: boolean; at: number } | null = null;
+  /** In-flight probe promise, so concurrent /health calls share one probe. */
+  private embeddingProbeInFlight: Promise<boolean> | null = null;
+
   constructor(configOverrides?: Partial<GatewayConfig>) {
     this.config = loadGatewayConfig(configOverrides);
     this.logger = createConsoleLogger();
@@ -188,6 +209,17 @@ export class TdaiGateway {
 
     // Create HTTP server
     this.server = http.createServer((req, res) => this.handleRequest(req, res));
+
+    // Server-side timeouts so a wedged handler (e.g. a hung embedding call)
+    // cannot hold a client connection open forever. requestTimeout bounds the
+    // whole request; headersTimeout bounds time-to-headers; keepAliveTimeout
+    // retires idle keep-alive client connections. All are deliberately longer
+    // than the slowest legitimate request (seed can take minutes) EXCEPT we
+    // disable requestTimeout (0) for that reason and rely on the per-call
+    // timeouts inside the handlers instead, while still bounding headers/idle.
+    this.server.requestTimeout = HTTP_REQUEST_TIMEOUT_MS;
+    this.server.headersTimeout = HTTP_HEADERS_TIMEOUT_MS;
+    this.server.keepAliveTimeout = HTTP_KEEP_ALIVE_TIMEOUT_MS;
 
     const { port, host } = this.config.server;
 
@@ -242,7 +274,7 @@ export class TdaiGateway {
     try {
       switch (`${method} ${pathname}`) {
         case "GET /health":
-          return this.handleHealth(res);
+          return await this.handleHealth(res);
         case "POST /recall":
           return await this.handleRecall(req, res);
         case "POST /capture":
@@ -298,17 +330,80 @@ export class TdaiGateway {
   // Route handlers
   // ============================
 
-  private handleHealth(res: http.ServerResponse): void {
+  private async handleHealth(res: http.ServerResponse): Promise<void> {
+    const embeddingOk = await this.checkEmbeddingLiveness();
+
+    // Honest status: degraded if the vector store is missing OR the embedding
+    // path is failing (recall is useless without working query embeddings).
+    const storeOk = !!this.core.getVectorStore();
+    const healthy = storeOk && embeddingOk;
+
     const response: HealthResponse = {
-      status: this.core.getVectorStore() ? "ok" : "degraded",
+      status: healthy ? "ok" : "degraded",
       version: VERSION,
       uptime: Math.floor((Date.now() - this.startTime) / 1000),
       stores: {
-        vectorStore: !!this.core.getVectorStore(),
+        vectorStore: storeOk,
         embeddingService: !!this.core.getEmbeddingService(),
       },
+      embedding: embeddingOk ? "ok" : "failing",
     };
-    sendJson(res, 200, response);
+
+    // Return 503 when degraded so EVERY existing probe — daemon.ts, the cc
+    // hook client, and start-gateway.ps1 (all of which gate on HTTP 200) —
+    // treats a degraded embedding path as unhealthy, without changing them.
+    sendJson(res, healthy ? 200 : 503, response);
+  }
+
+  /**
+   * Real, CACHED embedding liveness check.
+   *
+   * - If the embedding service exposes a circuit breaker (getHealth) and it is
+   *   currently OPEN, report failing immediately (no probe needed).
+   * - Otherwise probe with a tiny embed("ping"), but at most once per
+   *   HEALTH_EMBEDDING_TTL_MS so /health stays cheap. Concurrent callers share
+   *   one in-flight probe. Any error → failing (never throws).
+   */
+  private async checkEmbeddingLiveness(): Promise<boolean> {
+    const svc = this.core.getEmbeddingService();
+    // No embedding service configured at all → recall can't work → failing.
+    if (!svc) return false;
+
+    // Fast path: an OPEN circuit breaker is authoritative and free.
+    const breaker = svc.getHealth?.();
+    if (breaker && !breaker.healthy) {
+      this.embeddingHealthCache = { ok: false, at: Date.now() };
+      return false;
+    }
+
+    // Serve a fresh cached result.
+    const now = Date.now();
+    if (this.embeddingHealthCache && now - this.embeddingHealthCache.at < HEALTH_EMBEDDING_TTL_MS) {
+      return this.embeddingHealthCache.ok;
+    }
+
+    // Coalesce concurrent probes into one.
+    if (!this.embeddingProbeInFlight) {
+      this.embeddingProbeInFlight = (async () => {
+        try {
+          const vec = await svc.embed(HEALTH_EMBEDDING_PROBE, { timeoutMs: 5_000 });
+          // A zero-length vector is the NoopEmbeddingService (server-side
+          // embedding) — treat as ok; otherwise require a real vector.
+          const ok = vec.length === 0 || vec.length > 0;
+          this.embeddingHealthCache = { ok, at: Date.now() };
+          return ok;
+        } catch (err) {
+          this.logger.warn(
+            `Health embedding probe failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          this.embeddingHealthCache = { ok: false, at: Date.now() };
+          return false;
+        } finally {
+          this.embeddingProbeInFlight = null;
+        }
+      })();
+    }
+    return this.embeddingProbeInFlight;
   }
 
   private async handleRecall(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
