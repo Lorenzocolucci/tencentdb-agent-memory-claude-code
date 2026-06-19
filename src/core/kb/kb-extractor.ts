@@ -14,7 +14,7 @@
 
 import type { ConversationMessage } from "../conversation/l0-recorder.js";
 import { KB_EXTRACTION_SYSTEM_PROMPT, formatKbExtractionPrompt } from "../prompts/kb-extraction.js";
-import { parseKbDelta } from "./extraction-schema.js";
+import { parseKbDelta, type KbDelta } from "./extraction-schema.js";
 import { applyKbDelta } from "./kb-writer.js";
 import type { KbWriterStore } from "./kb-writer.js";
 import { sanitizeJsonForParse } from "../../utils/sanitize.js";
@@ -98,52 +98,64 @@ export async function extractKbDelta(params: {
     return empty;
   }
 
-  // ── Step 1: LLM call ──
+  // ── Steps 1-3 with ONE retry: LLM → parse → validate. Kimi at temperature=1
+  //    occasionally emits malformed JSON (e.g. a doubled quote `""key"`) or a
+  //    dangling ref; a single fresh retry almost always yields a clean delta —
+  //    cheap robustness vs. losing the whole window (the recurring "3 windows
+  //    failed in the backfill" cause). Each attempt is independent; only after
+  //    both fail do we fail-closed (cursor holds, retried on the next trigger). ──
   const userPrompt = formatKbExtractionPrompt({
     newMessages: messages,
     backgroundMessages: params.backgroundMessages,
     knownEntities: params.knownEntities,
   });
+  // Per-call timeout is configurable via TDAI_KB_EXTRACT_TIMEOUT_MS (default
+  // 180s). Lets a bulk backfill fail-fast on oversized windows; prod → 180s.
+  const extractTimeoutMs = Number(process.env.TDAI_KB_EXTRACT_TIMEOUT_MS) || 180_000;
+  const MAX_ATTEMPTS = 2;
 
-  let raw: string;
-  try {
-    // Per-call timeout is configurable via TDAI_KB_EXTRACT_TIMEOUT_MS (default
-    // 180s). Lets a bulk backfill fail-fast on oversized windows instead of
-    // blocking 180s each; production leaves it unset → 180s.
-    const extractTimeoutMs = Number(process.env.TDAI_KB_EXTRACT_TIMEOUT_MS) || 180_000;
-    raw = await llmRunner.run({
-      prompt: userPrompt,
-      systemPrompt: KB_EXTRACTION_SYSTEM_PROMPT,
-      taskId: "kb-extraction",
-      timeoutMs: extractTimeoutMs,
-    });
-  } catch (err) {
-    // Hard failure — hold the cursor (fail-closed, like l1-extractor.ts:175-178).
-    logger?.error(
-      `${TAG} LLM extraction failed: ${err instanceof Error ? err.message : String(err)} — cursor will hold`,
-    );
-    return { ...empty, success: false };
+  let delta: KbDelta | undefined;
+  let lastError = "unknown";
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    let raw: string;
+    try {
+      raw = await llmRunner.run({
+        prompt: userPrompt,
+        systemPrompt: KB_EXTRACTION_SYSTEM_PROMPT,
+        taskId: "kb-extraction",
+        timeoutMs: extractTimeoutMs,
+      });
+    } catch (err) {
+      lastError = `LLM call failed: ${err instanceof Error ? err.message : String(err)}`;
+      logger?.warn?.(`${TAG} attempt ${attempt}/${MAX_ATTEMPTS}: ${lastError}`);
+      continue; // fresh retry of the LLM call
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = parseRawKbDeltaJson(raw);
+    } catch (err) {
+      lastError = `JSON parse failed (rawLen=${raw.length}): ${err instanceof Error ? err.message : String(err)}`;
+      logger?.warn?.(`${TAG} attempt ${attempt}/${MAX_ATTEMPTS}: ${lastError}`);
+      continue;
+    }
+
+    const validation = parseKbDelta(parsed);
+    if (!validation.ok) {
+      lastError = validation.error;
+      logger?.warn?.(`${TAG} attempt ${attempt}/${MAX_ATTEMPTS}: ${lastError}`);
+      continue;
+    }
+
+    delta = validation.delta;
+    break;
   }
 
-  // ── Step 2: strip fences + sanitize + JSON.parse ──
-  let parsed: unknown;
-  try {
-    parsed = parseRawKbDeltaJson(raw);
-  } catch (err) {
-    logger?.error(
-      `${TAG} Failed to JSON-parse KbDelta: ${err instanceof Error ? err.message : String(err)} ` +
-      `(rawLen=${raw.length}) — cursor will hold`,
-    );
+  if (!delta) {
+    // Both attempts failed — hold the cursor (fail-closed, like l1-extractor.ts:175-178).
+    logger?.error(`${TAG} extraction failed after ${MAX_ATTEMPTS} attempts: ${lastError} — cursor will hold`);
     return { ...empty, success: false };
   }
-
-  // ── Step 3: Zod validation (referential integrity, enums, snake_case) ──
-  const validation = parseKbDelta(parsed);
-  if (!validation.ok) {
-    logger?.error(`${TAG} ${validation.error} — cursor will hold`);
-    return { ...empty, success: false };
-  }
-  const delta = validation.delta;
 
   // Empty delta is a VALID success → no-op apply, cursor advances.
   if (
@@ -215,5 +227,25 @@ function parseRawKbDeltaJson(raw: string): unknown {
   }
 
   const sanitized = sanitizeJsonForParse(objMatch[0]);
-  return JSON.parse(sanitized);
+  try {
+    return JSON.parse(sanitized);
+  } catch {
+    // Salvage pass for the common Kimi glitches (only runs AFTER a real parse
+    // failure, so it can never corrupt already-valid JSON). Throws if still bad.
+    return JSON.parse(repairCommonJsonGlitches(sanitized));
+  }
+}
+
+/**
+ * Repair the malformed-JSON patterns Kimi produces at temperature=1, observed in
+ * the live backfill:
+ *   - a doubled quote before a key:  `],""language"`  →  `],"language"`
+ *   - a trailing comma before `}`/`]`
+ * Conservative on purpose — only invoked as a last-ditch salvage before
+ * fail-closed; if it does not yield valid JSON the window still fails safely.
+ */
+function repairCommonJsonGlitches(s: string): string {
+  return s
+    .replace(/([,{[]\s*)""(\s*[A-Za-z_])/g, '$1"$2') // ,""key → ,"key
+    .replace(/,(\s*[}\]])/g, "$1"); // trailing comma
 }

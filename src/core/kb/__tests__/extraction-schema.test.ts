@@ -132,14 +132,14 @@ describe("parseKbDelta — vocabulary coercion (never total-loss)", () => {
     expect(res.delta.events[0].type).toBe("observation");
   });
 
-  it("drops a relation with an unknown type (no safe generic fallback), keeps the rest", () => {
+  it("coerces a relation with an unknown type to 'related-to' (never drop a link)", () => {
     const d = validDelta() as Record<string, unknown>;
     (d.relations as Array<Record<string, unknown>>)[0].type = "loves";
     const res = parseKbDelta(d);
     expect(res.ok).toBe(true);
     if (!res.ok) return;
-    expect(res.delta.relations).toHaveLength(0); // the single bad relation was dropped
-    // entities/facts/events survive — the window is NOT lost
+    expect(res.delta.relations).toHaveLength(1); // kept, not dropped
+    expect(res.delta.relations[0].type).toBe("related-to");
     expect(res.delta.entities).toHaveLength(2);
     expect(res.delta.facts).toHaveLength(1);
   });
@@ -164,13 +164,20 @@ describe("parseKbDelta — dangling entity_ref", () => {
     expect(res.error).toMatch(/unknown entity ref "e_ghost"/);
   });
 
-  it("rejects a relation src_ref/dst_ref that is not a defined entity", () => {
+  it("DROPS a relation whose src_ref/dst_ref is not a defined entity (window survives, not a total reject)", () => {
+    // Resilience: Kimi sometimes targets an event ref / undefined ref in a
+    // relation. That dangling edge is dropped so the window keeps its
+    // entities/facts/events — relations are auxiliary; a fact/event dangling ref
+    // still rejects (those are load-bearing).
     const d = validDelta() as Record<string, unknown>;
     (d.relations as Array<Record<string, unknown>>)[0].dst_ref = "e_missing";
     const res = parseKbDelta(d);
-    expect(res.ok).toBe(false);
-    if (res.ok) return;
-    expect(res.error).toMatch(/unknown entity ref "e_missing"/);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.delta.relations).toHaveLength(0); // the single dangling edge was dropped
+    expect(res.delta.entities).toHaveLength(2);
+    expect(res.delta.facts).toHaveLength(1);
+    expect(res.delta.events).toHaveLength(1);
   });
 });
 

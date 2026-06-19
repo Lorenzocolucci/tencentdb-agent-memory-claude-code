@@ -58,7 +58,11 @@ export const KB_RELATION_TYPES = [
   "supersedes",
   "recurs-in",
   "decided-in",
+  "related-to", // generic catch-all so an out-of-vocab edge is COERCED, never dropped
 ] as const;
+
+/** Fallback relation type for out-of-vocabulary values (coerce, never drop). */
+const RELATION_TYPE_FALLBACK = "related-to";
 
 // ============================
 // Field-level limits (mirror the kb-queries DB constraints + the spec caps)
@@ -297,16 +301,39 @@ export function normalizeRawKbDelta(raw: unknown): unknown {
     "attribute" in f ? { ...f, attribute: coerceAttribute(f.attribute) } : f,
   );
 
-  // Relations have no safe generic fallback — drop ones with an unknown type
-  // rather than inventing a wrong edge or failing the whole delta.
+  // Relations need two passes:
+  //  (1) COERCE an out-of-vocabulary edge type → generic "related-to" (keep the
+  //      link, never drop it for an unknown type).
+  //  (2) Relations may ONLY connect ENTITY refs. Kimi sometimes targets an EVENT
+  //      ref (ev1) or a ref it never defined — that fails referential integrity
+  //      and would REJECT the whole window. DROP such dangling edges here so the
+  //      window survives with its entities/facts/events intact.
+  const entityRefs = new Set<string>();
+  if (Array.isArray(entities)) {
+    for (const e of entities) {
+      const ref = e !== null && typeof e === "object" ? (e as Record<string, unknown>).ref : undefined;
+      if (typeof ref === "string") entityRefs.add(ref);
+    }
+  }
   const relations = Array.isArray(obj.relations)
-    ? obj.relations.filter(
-        (r) =>
-          r !== null &&
-          typeof r === "object" &&
-          !Array.isArray(r) &&
-          RELATION_TYPE_SET.has((r as Record<string, unknown>).type as string),
-      )
+    ? obj.relations
+        .map((r) =>
+          r !== null && typeof r === "object" && !Array.isArray(r)
+            ? RELATION_TYPE_SET.has((r as Record<string, unknown>).type as string)
+              ? r
+              : { ...(r as Record<string, unknown>), type: RELATION_TYPE_FALLBACK }
+            : r,
+        )
+        .filter((r) => {
+          if (r === null || typeof r !== "object" || Array.isArray(r)) return false;
+          const rr = r as Record<string, unknown>;
+          return (
+            typeof rr.src_ref === "string" &&
+            typeof rr.dst_ref === "string" &&
+            entityRefs.has(rr.src_ref) &&
+            entityRefs.has(rr.dst_ref)
+          );
+        })
     : obj.relations;
 
   return { ...obj, entities, events, facts, relations };
