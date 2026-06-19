@@ -38,6 +38,8 @@ import { SceneExtractor } from "../core/scene/scene-extractor.js";
 import { PersonaTrigger } from "../core/persona/persona-trigger.js";
 import { PersonaGenerator } from "../core/persona/persona-generator.js";
 import { pullProfilesToLocal, syncLocalProfilesToStore } from "../core/profile/profile-sync.js";
+import { projectAll } from "../core/kb/projections-writer.js";
+import type { ProjectionStore } from "../core/kb/projections.js";
 
 const TAG = "[memory-tdai] [pipeline-factory]";
 
@@ -66,6 +68,73 @@ function supportsKbWrite(store?: IMemoryStore): store is IMemoryStore & KbWriter
     typeof store.upsertKbVector === "function" &&
     typeof store.upsertKbFts === "function"
   );
+}
+
+/**
+ * Whether a store implements the Phase-5 projection READ primitives required to
+ * deterministically regenerate persona.md + scene_blocks from the KB. Used to
+ * decide if `refreshKbProjections` can run; if any primitive is missing the
+ * refresh is skipped (the old LLM L2/L3 runners remain the source until P6).
+ */
+function supportsKbProjections(store?: IMemoryStore): store is IMemoryStore & ProjectionStore {
+  if (!store) return false;
+  return (
+    typeof store.listEntities === "function" &&
+    typeof store.listRecentEvents === "function" &&
+    typeof store.queryHeadFacts === "function" &&
+    typeof store.queryAllFacts === "function" &&
+    typeof store.queryEntityById === "function" &&
+    typeof store.queryRelationsForEntity === "function" &&
+    typeof store.queryEventsForEntity === "function"
+  );
+}
+
+/**
+ * Phase-5 deterministic refresh of the session-start memory (persona.md +
+ * scene_blocks/* + scene_index.json) FROM the entity-centric KB. NO LLM.
+ *
+ * This is the "kb" engine's replacement for the old SceneExtractor (L2) +
+ * PersonaGenerator (L3) LLM runners: instead of two separate LLM agents, the KB
+ * already holds the canonical state, so we just re-render it into the exact files
+ * the <user-persona> / <scene-navigation> injection reads.
+ *
+ * Never throws out of the runner: a projection failure is logged and swallowed
+ * (the KB write already succeeded; a stale persona is recoverable on the next
+ * refresh). Returns true when the projection ran.
+ */
+export async function refreshKbProjections(opts: {
+  store: IMemoryStore | undefined;
+  pluginDataDir: string;
+  namespace?: string;
+  locale?: string;
+  logger: PipelineLogger;
+}): Promise<boolean> {
+  const { store, pluginDataDir, namespace, locale, logger } = opts;
+  if (!supportsKbProjections(store)) {
+    logger.debug?.(
+      `${TAG} [kb-projections] store does not support projection reads — skipping deterministic refresh`,
+    );
+    return false;
+  }
+  try {
+    const result = await projectAll(store, {
+      dataDir: pluginDataDir,
+      namespace: namespace ?? "default",
+      locale: locale ?? "en",
+      logger,
+    });
+    logger.info(
+      `${TAG} [kb-projections] refreshed persona.md + ${result.scenesWritten} scene block(s) ` +
+        `(removed ${result.scenesRemoved} stale)`,
+    );
+    return true;
+  } catch (err) {
+    logger.warn(
+      `${TAG} [kb-projections] deterministic refresh FAILED (non-fatal, KB write already persisted): ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
 }
 
 // ============================
@@ -429,6 +498,9 @@ export function createL1Runner(opts: {
       // leaves the cursor exactly where it was.
       let cursorToPersist: number | undefined;
       let hardFailure = false;
+      // Phase-5: did at least one "kb" window write successfully? Drives the
+      // deterministic projection refresh after the loop (see call site below).
+      let kbWriteSucceeded = false;
 
       for (const group of groups) {
         logger.debug?.(
@@ -471,6 +543,11 @@ export function createL1Runner(opts: {
               extractedCount: kbResult.factsCount + kbResult.eventsCount,
               storedCount: kbResult.factsCount + kbResult.eventsCount,
             };
+            // Track a successful KB window so the deterministic projection
+            // refresh (below) only runs when the KB actually changed.
+            if (kbResult.success && (kbResult.factsCount > 0 || kbResult.eventsCount > 0)) {
+              kbWriteSucceeded = true;
+            }
           } else {
             // ── Legacy "l1" engine (UNCHANGED) ──
             l1Result = await extractL1Memories({
@@ -537,6 +614,28 @@ export function createL1Runner(opts: {
         `${TAG} [l1] L1 complete: extracted=${totalExtracted}, stored=${totalStored} ` +
         `(${groups.length} group(s), cursor=${cursorToPersist ?? "(unchanged)"}${hardFailure ? ", PARTIAL — failure held cursor" : ""})`,
       );
+
+      // ══════════════════════════════════════════════════════════════════════
+      //  PHASE-5 DETERMINISTIC PROJECTION REFRESH (kb engine only)
+      //
+      //  When the "kb" engine wrote something, regenerate persona.md +
+      //  scene_blocks/* deterministically FROM the KB — replacing the old
+      //  SceneExtractor (L2) + PersonaGenerator (L3) LLM runners on the kb path.
+      //  This does NOT double-write persona.md: the kb path writes it HERE; the
+      //  old L2/L3 runners only run on the engine="l1" path (untouched).
+      //
+      //  GATED behind cfg.extraction.kbProjections (default FALSE) so enabling it
+      //  is an explicit maintenance-window decision. Until enabled, the kb engine
+      //  behaves exactly as before. The engine="l1" path NEVER reaches this block.
+      //  refreshKbProjections never throws (KB write already persisted).
+      // ══════════════════════════════════════════════════════════════════════
+      if (useKbEngine && kbWriteSucceeded && cfg.extraction.kbProjections) {
+        await refreshKbProjections({
+          store: vectorStore,
+          pluginDataDir,
+          logger,
+        });
+      }
 
       return { processedCount: totalMessages };
     } catch (err) {

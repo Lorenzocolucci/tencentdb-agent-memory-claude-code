@@ -784,6 +784,23 @@ export function queryHeadFacts(db: DatabaseSync, entityIdValue: string): KbFact[
   return rows.map(rowToFact);
 }
 
+/**
+ * ALL facts for an entity (HEAD + superseded/historical), ordered by attribute
+ * then world-time (valid_from ascending). Used by the entity-page projection to
+ * render the "Current facts" section (HEAD rows) AND the "History" section
+ * (superseded rows). Pure read; never mutates.
+ */
+export function queryAllFacts(db: DatabaseSync, entityIdValue: string): KbFact[] {
+  const rows = db
+    .prepare(
+      `SELECT * FROM facts
+       WHERE entity_id = ?
+       ORDER BY attribute ASC, valid_from ASC`,
+    )
+    .all(entityIdValue) as Array<Record<string, unknown>>;
+  return rows.map(rowToFact);
+}
+
 // ============================================================================
 // Read primitives for retrieval (Phase 4 — fetch a single row by id)
 // ============================================================================
@@ -889,6 +906,10 @@ export function upsertRelation(db: DatabaseSync, rel: KbRelationInput): KbRelati
   ).run(id, srcEntityId, type, dstEntityId, namespace, validFrom, sourceEventId, now);
 
   const row = db.prepare("SELECT * FROM relations WHERE id = ?").get(id) as Record<string, unknown>;
+  return rowToRelation(row);
+}
+
+function rowToRelation(row: Record<string, unknown>): KbRelation {
   return {
     id: row.id as string,
     src_entity_id: row.src_entity_id as string,
@@ -901,6 +922,139 @@ export function upsertRelation(db: DatabaseSync, rel: KbRelationInput): KbRelati
     source_event_id: (row.source_event_id as string | null) ?? null,
     created_time: row.created_time as string,
   };
+}
+
+/**
+ * All relation edges TOUCHING an entity (as src OR dst), within its namespace.
+ * Used by the entity-page projection to render the "Related [[entity]]" links.
+ * Ordered deterministically (type, then the OTHER endpoint id) so the rendered
+ * page is stable across runs. Pure read; never mutates.
+ */
+export function queryRelationsForEntity(
+  db: DatabaseSync,
+  entityIdValue: string,
+): KbRelation[] {
+  const id = requireNonEmpty(entityIdValue, "entityId");
+  const rows = db
+    .prepare(
+      `SELECT * FROM relations
+       WHERE src_entity_id = ? OR dst_entity_id = ?
+       ORDER BY type ASC, src_entity_id ASC, dst_entity_id ASC`,
+    )
+    .all(id, id) as Array<Record<string, unknown>>;
+  return rows.map(rowToRelation);
+}
+
+// ============================================================================
+// Projection read primitives (Phase 5 — deterministic persona/scene/page render)
+// ============================================================================
+//
+// These power the deterministic projections (src/core/kb/projections.ts). They
+// are pure, parameterized, read-only scans over the smallest KB tables, scoped
+// by namespace and bounded by `limit`. NO LLM, NO mutation.
+
+/**
+ * List entities in a namespace, optionally filtered to a set of `types`.
+ *
+ * Ordered by importance DESC then updated_time DESC so the persona projection
+ * sees the most salient person/preference entities first. `limit` bounds the
+ * scan (default 500 — entities are the smallest table, one row per real thing).
+ */
+export function listEntities(
+  db: DatabaseSync,
+  namespace: string = "default",
+  opts: { types?: string[]; limit?: number } = {},
+): KbEntity[] {
+  const ns = namespace?.trim() || "default";
+  const limit = clampLimit(opts.limit, 500);
+  const types = (opts.types ?? [])
+    .map((t) => normalizeBase(t))
+    .filter((t) => t.length > 0);
+
+  let sql =
+    "SELECT * FROM entities WHERE namespace = ?";
+  const args: unknown[] = [ns];
+  if (types.length > 0) {
+    sql += ` AND type IN (${types.map(() => "?").join(", ")})`;
+    args.push(...types);
+  }
+  sql += " ORDER BY importance DESC, updated_time DESC LIMIT ?";
+  args.push(limit);
+
+  const rows = db.prepare(sql).all(...(args as never[])) as Array<Record<string, unknown>>;
+  return rows.map(rowToEntity);
+}
+
+/**
+ * List recent events in a namespace (newest world-time first), optionally only
+ * those with `ts` strictly after `sinceTs` (ISO string compare — the schema
+ * stores ISO timestamps). `limit` bounds the result (default 200). Used by the
+ * scene projection to group recent episodic events into scene blocks.
+ */
+export function listRecentEvents(
+  db: DatabaseSync,
+  namespace: string = "default",
+  opts: { sinceTs?: string; limit?: number } = {},
+): KbEvent[] {
+  const ns = namespace?.trim() || "default";
+  const limit = clampLimit(opts.limit, 200);
+  const sinceTs = opts.sinceTs?.trim();
+
+  let sql = "SELECT * FROM events WHERE namespace = ?";
+  const args: unknown[] = [ns];
+  if (sinceTs) {
+    sql += " AND ts > ?";
+    args.push(sinceTs);
+  }
+  sql += " ORDER BY ts DESC, id DESC LIMIT ?";
+  args.push(limit);
+
+  const rows = db.prepare(sql).all(...(args as never[])) as Array<Record<string, unknown>>;
+  return rows.map(rowToEvent);
+}
+
+/**
+ * Events referencing a given entity (its `entities_json` contains the id),
+ * within the namespace, newest world-time first. Used by the entity-page
+ * projection to render the per-entity "Timeline". Matching is done in JS on the
+ * parsed entities array (the id list is short) after a bounded namespace scan.
+ */
+export function queryEventsForEntity(
+  db: DatabaseSync,
+  entityIdValue: string,
+  namespace: string = "default",
+  limit: number = 50,
+): KbEvent[] {
+  const id = requireNonEmpty(entityIdValue, "entityId");
+  const ns = namespace?.trim() || "default";
+  const cap = clampLimit(limit, 50);
+
+  // LIKE pre-filter on the JSON column narrows the scan to rows that mention the
+  // id at all; the authoritative check is the parsed-array membership below
+  // (avoids false positives from a substring match across ids).
+  const rows = db
+    .prepare(
+      `SELECT * FROM events
+       WHERE namespace = ? AND entities_json LIKE ?
+       ORDER BY ts DESC, id DESC`,
+    )
+    .all(ns, `%${id}%`) as Array<Record<string, unknown>>;
+
+  const out: KbEvent[] = [];
+  for (const row of rows) {
+    const event = rowToEvent(row);
+    if (event.entities.includes(id)) {
+      out.push(event);
+      if (out.length >= cap) break;
+    }
+  }
+  return out;
+}
+
+/** Clamp a caller-supplied limit into [1, hardMax] with a sane default. */
+function clampLimit(limit: number | undefined, fallback: number): number {
+  if (typeof limit !== "number" || !Number.isFinite(limit) || limit <= 0) return fallback;
+  return Math.min(Math.floor(limit), 5000);
 }
 
 /** Stable, unique chunk id for a kb_vec owner + chunk index. */

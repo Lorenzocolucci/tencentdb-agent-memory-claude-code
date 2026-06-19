@@ -43,6 +43,14 @@ export interface ExtractionConfig {
   engine: "l1" | "kb";
   /** Enable L1 smart dedup (default: true) */
   enableDedup: boolean;
+  /**
+   * Phase-5: when engine="kb", after a successful KB write, deterministically
+   * regenerate persona.md + scene_blocks/* FROM the KB (NO LLM) instead of the
+   * old SceneExtractor/PersonaGenerator runners. Default FALSE so the kb engine's
+   * write behavior is unchanged until this is explicitly enabled in a maintenance
+   * window. Has NO effect when engine="l1".
+   */
+  kbProjections: boolean;
   /** Max memories per session (default: 20) */
   maxMemoriesPerSession: number;
   /** LLM model for extraction, format: "provider/model" (falls back to OpenClaw default model when omitted) */
@@ -505,6 +513,8 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       // other than the literal "kb" falls back to "l1" (fail-safe).
       engine: str(extractionGroup, "engine") === "kb" ? "kb" : "l1",
       enableDedup: bool(extractionGroup, "enableDedup") ?? true,
+      // Phase-5 deterministic projections from the KB. Default FALSE (opt-in).
+      kbProjections: bool(extractionGroup, "kbProjections") ?? false,
       maxMemoriesPerSession: num(extractionGroup, "maxMemoriesPerSession") ?? 20,
       model: optStr(extractionGroup, "model"),
     },

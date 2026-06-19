@@ -522,6 +522,12 @@ export interface IMemoryStore {
 
   /** Current (HEAD) facts for an entity: superseded_by IS NULL AND valid_to IS NULL. */
   queryHeadFacts?(entityId: string): KbFact[];
+  /**
+   * ALL facts for an entity (HEAD + superseded/historical), ordered by attribute
+   * then valid_from. Phase-5 entity-page projection uses this for the
+   * Current-facts + History sections. Returns [] when KB off.
+   */
+  queryAllFacts?(entityId: string): KbFact[];
   queryEntityById?(id: string): KbEntity | null;
   queryEntityByKey?(namespace: string, type: string, canonicalKey: string): KbEntity | null;
 
@@ -539,6 +545,33 @@ export interface IMemoryStore {
    * ranked by token coverage. Deterministic, NO LLM. Empty/none → [].
    */
   queryEntitiesByTokens?(tokens: string[], namespace?: string, limit?: number): KbEntity[];
+
+  // ── Phase-5 projection read primitives (deterministic persona/scene/page) ──
+  //
+  // These feed the deterministic projections (projections.ts). All are pure,
+  // namespace-scoped, bounded reads; NO LLM, NO mutation. Optional so non-sqlite
+  // backends can adopt them incrementally. Return [] when KB off.
+
+  /**
+   * List entities in a namespace, optionally filtered to `types`, ordered by
+   * importance DESC then updated_time DESC. `limit` bounds the result.
+   */
+  listEntities?(namespace?: string, opts?: { types?: string[]; limit?: number }): KbEntity[];
+  /**
+   * Recent events in a namespace (newest world-time first), optionally only
+   * those with `ts` strictly after `sinceTs`. `limit` bounds the result.
+   */
+  listRecentEvents?(namespace?: string, opts?: { sinceTs?: string; limit?: number }): KbEvent[];
+  /**
+   * All relation edges touching an entity (as src OR dst), within its namespace.
+   * Powers the entity-page "Related [[entity]]" links.
+   */
+  queryRelationsForEntity?(entityId: string): KbRelation[];
+  /**
+   * Events referencing an entity (its id is in entities_json), newest first.
+   * Powers the entity-page "Timeline".
+   */
+  queryEventsForEntity?(entityId: string, namespace?: string, limit?: number): KbEvent[];
 
   /** kb_vec / kb_fts recall primitives (mirror searchL1Vector / searchL1Fts). */
   searchKbVector?(queryEmbedding: Float32Array, topK?: number, ownerKindFilter?: string): KbVectorSearchResult[];

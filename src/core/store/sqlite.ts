@@ -47,11 +47,16 @@ import {
   upsertFact as kbUpsertFact,
   upsertRelation as kbUpsertRelation,
   queryHeadFacts as kbQueryHeadFacts,
+  queryAllFacts as kbQueryAllFacts,
   queryEntityById as kbQueryEntityById,
   queryEntityByKey as kbQueryEntityByKey,
   queryFactById as kbQueryFactById,
   queryEventById as kbQueryEventById,
   queryEntitiesByTokens as kbQueryEntitiesByTokens,
+  listEntities as kbListEntities,
+  listRecentEvents as kbListRecentEvents,
+  queryRelationsForEntity as kbQueryRelationsForEntity,
+  queryEventsForEntity as kbQueryEventsForEntity,
   kbChunkId,
 } from "../kb/kb-queries.js";
 
@@ -673,7 +678,8 @@ export class VectorStore implements IMemoryStore {
           chunk_id TEXT PRIMARY KEY,
           record_id TEXT partition key,
           embedding float[${this.dimensions}] distance_metric=cosine,
-          updated_time TEXT DEFAULT ''
+          updated_time TEXT DEFAULT '',
+          chunk_size=8
         )
       `);
     }
@@ -762,7 +768,8 @@ export class VectorStore implements IMemoryStore {
           chunk_id TEXT PRIMARY KEY,
           record_id TEXT partition key,
           embedding float[${this.dimensions}] distance_metric=cosine,
-          recorded_at TEXT DEFAULT ''
+          recorded_at TEXT DEFAULT '',
+          chunk_size=8
         )
       `);
     }
@@ -2633,7 +2640,8 @@ export class VectorStore implements IMemoryStore {
             owner_id TEXT partition key,
             owner_kind TEXT,
             embedding float[${this.dimensions}] distance_metric=cosine,
-            updated_time TEXT DEFAULT ''
+            updated_time TEXT DEFAULT '',
+            chunk_size=8
           )
         `);
         // DELETE by partition key removes ALL chunk rows for an owner.
@@ -2752,6 +2760,12 @@ export class VectorStore implements IMemoryStore {
     return kbQueryHeadFacts(this.db, entityId);
   }
 
+  /** @see IMemoryStore.queryAllFacts */
+  queryAllFacts(entityId: string): KbFact[] {
+    if (!this.kbReady) return [];
+    return kbQueryAllFacts(this.db, entityId);
+  }
+
   /** @see IMemoryStore.queryEntityById */
   queryEntityById(id: string): KbEntity | null {
     if (!this.kbReady) return null;
@@ -2780,6 +2794,30 @@ export class VectorStore implements IMemoryStore {
   queryEntitiesByTokens(tokens: string[], namespace = "default", limit = 20): KbEntity[] {
     if (!this.kbReady) return [];
     return kbQueryEntitiesByTokens(this.db, tokens, namespace, limit);
+  }
+
+  /** @see IMemoryStore.listEntities */
+  listEntities(namespace = "default", opts: { types?: string[]; limit?: number } = {}): KbEntity[] {
+    if (!this.kbReady) return [];
+    return kbListEntities(this.db, namespace, opts);
+  }
+
+  /** @see IMemoryStore.listRecentEvents */
+  listRecentEvents(namespace = "default", opts: { sinceTs?: string; limit?: number } = {}): KbEvent[] {
+    if (!this.kbReady) return [];
+    return kbListRecentEvents(this.db, namespace, opts);
+  }
+
+  /** @see IMemoryStore.queryRelationsForEntity */
+  queryRelationsForEntity(entityId: string): KbRelation[] {
+    if (!this.kbReady) return [];
+    return kbQueryRelationsForEntity(this.db, entityId);
+  }
+
+  /** @see IMemoryStore.queryEventsForEntity */
+  queryEventsForEntity(entityId: string, namespace = "default", limit = 50): KbEvent[] {
+    if (!this.kbReady) return [];
+    return kbQueryEventsForEntity(this.db, entityId, namespace, limit);
   }
 
   /**
