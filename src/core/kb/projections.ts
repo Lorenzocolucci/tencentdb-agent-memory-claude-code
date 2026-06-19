@@ -184,10 +184,12 @@ export function projectPersonaBody(store: ProjectionStore, opts: ProjectionOptio
 
   const lines: PersonaLine[] = [];
   for (const entity of entities) {
+    if (looksLikeSecret(entity.name)) continue; // never surface a secret-named entity
     const heads = store.queryHeadFacts(entity.id);
     for (const fact of heads) {
       const section = personaSectionFor(fact.attribute);
       if (!section) continue; // NOT allow-listed → excluded (secret values land here)
+      if (looksLikeSecret(fact.value)) continue; // defensive: never emit a credential token
       lines.push({
         section,
         text: `- **${entity.name}** — ${humanizeAttr(fact.attribute)}: ${fact.value}`,
@@ -215,7 +217,9 @@ export function projectPersonaBody(store: ProjectionStore, opts: ProjectionOptio
   // Active projects: the project entities themselves (name + any HEAD facts that
   // are allow-listed). Listed as a dedicated section because "active projects" is
   // its own allow-list category in the blueprint.
-  const projectEntities = store.listEntities(namespace, { types: ["project"] });
+  const projectEntities = store
+    .listEntities(namespace, { types: ["project"] })
+    .filter((p) => !looksLikeSecret(p.name));
   if (projectEntities.length > 0) {
     const projLines = projectEntities
       .map((p) => `- **${p.name}**`)
@@ -287,6 +291,12 @@ export function projectScenes(
   const GENERAL = "__general__";
 
   for (const event of events) {
+    // SECURITY: never surface secret-bearing events in scenes. Scene summaries
+    // use entity.name and are auto-injected at session start; event text /
+    // entity names can carry codes/credentials (e.g. a secret-code value). Drop
+    // any event that references a secret-like entity or whose text contains a
+    // credential-shaped token. (Persona facts are already allow-listed.)
+    if (eventTouchesSecret(store, event)) continue;
     const dominant = dominantEntityId(store, event) ?? GENERAL;
     const bucket = byEntity.get(dominant);
     if (bucket) {
@@ -330,6 +340,29 @@ export function projectScenes(
   }
 
   return { scenes };
+}
+
+/**
+ * A credential-shaped token: ALLCAPS segments joined by hyphens ending in digits
+ * (MANGO-STELLARE-99, QUARZO-NEBULOSA-555, ZAFFIRO-LUNARE-77). Conservative.
+ */
+const CREDENTIAL_TOKEN = /\b[A-Z][A-Z0-9]{2,}-[A-Z0-9]{2,}(?:-[A-Z0-9]+)*-?\d{1,}\b/;
+
+/** True when a name/text looks like a secret or credential (keywords or token). */
+export function looksLikeSecret(text: string): boolean {
+  if (!text) return false;
+  if (/\b(secret|segreto|password|api[_\s-]?key|apikey|token|credential|credenziali)\b/i.test(text)) return true;
+  if (CREDENTIAL_TOKEN.test(text)) return true;
+  return false;
+}
+
+/** True when an event references a secret-like entity OR carries a credential token. */
+function eventTouchesSecret(store: ProjectionStore, event: KbEvent): boolean {
+  for (const id of event.entities) {
+    const e = store.queryEntityById(id);
+    if (e && looksLikeSecret(e.name)) return true;
+  }
+  return looksLikeSecret(event.text);
 }
 
 /** Resolve an event's dominant entity id (first referenced id that resolves). */
