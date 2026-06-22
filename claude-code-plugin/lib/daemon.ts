@@ -317,6 +317,11 @@ export class DaemonManager {
       cwd: this.dataDir,
       shell: process.platform === "win32",
       detached: true,
+      // Windows: shell+detached spawns a visible cmd.exe console that FLASHES on
+      // screen every time a hook (re)starts the gateway. windowsHide suppresses
+      // that console window — no behavioural change, the daemon still runs
+      // detached and logs to daemon.log. (No-op on macOS/Linux.)
+      windowsHide: true,
       stdio: ["ignore", logFd, logFd],
     });
     child.unref();
