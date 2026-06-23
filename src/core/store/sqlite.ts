@@ -23,6 +23,7 @@
 import { createRequire } from "node:module";
 import type { DatabaseSync, StatementSync } from "node:sqlite";
 import type { MemoryRecord } from "../record/l1-writer.js";
+import { initFoundationsSchema } from "../kb/foundations-schema.js";
 import type { EmbeddingProviderInfo } from "./embedding.js";
 import type {
   IMemoryStore,
@@ -2620,6 +2621,11 @@ export class VectorStore implements IMemoryStore {
       `);
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_rel_src ON relations(src_entity_id, type)");
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_rel_dst ON relations(dst_entity_id, type)");
+
+      // ── Sinapsys foundations (Phases A–E): memory_lifecycle / lessons /
+      //    memory_audit / context_fingerprints / relations.weight. Additive &
+      //    best-effort; never blocks the base KB from becoming ready.
+      initFoundationsSchema(this.db, this.logger);
 
       this.kbReady = true;
     } catch (err) {
