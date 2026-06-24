@@ -690,6 +690,17 @@ export function createL2Runner(opts: {
   let profileBaseline = new Map<string, { version: number; contentMd5: string; createdAtMs: number }>();
 
   return async (sessionKey: string, cursor?: string) => {
+    // ── Guard: skip L2 when the deterministic KB projection owns scene_blocks/ ──
+    // When the projection is the active owner, refreshKbProjections() (projectAll)
+    // already wrote scene_blocks/*.md from the canonical KB. Letting SceneExtractor
+    // also write there would fight the projection — the sibling of the L3 persona
+    // double-write that makes the injected <scene-navigation> alternate. Same
+    // readiness check as L3 so we never skip L2 when the kb path fell back to l1.
+    if (kbProjectionOwnsProjectedFiles(cfg, vectorStore, llmRunner)) {
+      logger.info(`${TAG} [L2] Skipped: deterministic KB projection owns scene_blocks (engine=kb, kbProjections=on)`);
+      return;
+    }
+
     logger.debug?.(
       `${TAG} [L2] session=${sessionKey}, updatedAfter=${cursor ?? "(full)"}`,
     );
@@ -828,6 +839,45 @@ export function createL2Runner(opts: {
 // ============================
 
 /**
+ * True when the deterministic KB projection is the active owner of the on-disk
+ * projected files (persona.md AND scene_blocks/), meaning the old LLM runners must
+ * NOT run: PersonaGenerator (L3) would fight over persona.md and SceneExtractor
+ * (L2) would fight over scene_blocks/ — either makes the injected <user-persona> /
+ * <scene-navigation> alternate. Mirrors the useKbEngine readiness check so we never
+ * skip the old runners when the engine fell back to l1.
+ *
+ * Conditions (ALL must hold):
+ *   1. engine === "kb"          — KB extraction is configured.
+ *   2. kbProjections === true   — deterministic refresh is explicitly enabled.
+ *   3. llmRunner is present     — KB extractor can actually run (no fallback).
+ *   4. store is KB-capable      — supportsKbWrite → projection refresh runs.
+ *
+ * If (3) or (4) is missing the L1 runner falls back to engine="l1", which means
+ * refreshKbProjections never executes and the projected files are NOT owned by the
+ * projection. In that fallback case this returns false so the old L2/L3 runners run.
+ *
+ * NOTE: the actual refresh run-condition also includes a per-trigger
+ * `kbWriteSucceeded` (see the refresh call site); this predicate INTENTIONALLY
+ * omits it. Ownership of persona.md + scene_blocks/ is PERSISTENT across triggers
+ * (the previous KB-write cycle already wrote them and they remain canonical), so
+ * the old L2/L3 runners must stay skipped even on a no-op cycle. Do NOT add
+ * `kbWriteSucceeded` here — it would let the old LLM runners overwrite the
+ * projection on cycles that wrote nothing, reintroducing the double-write bug.
+ */
+export function kbProjectionOwnsProjectedFiles(
+  cfg: MemoryTdaiConfig,
+  vectorStore: IMemoryStore | undefined,
+  llmRunner: import("../core/types.js").LLMRunner | undefined,
+): boolean {
+  return (
+    cfg.extraction.engine === "kb" &&
+    cfg.extraction.kbProjections === true &&
+    !!llmRunner &&
+    supportsKbWrite(vectorStore)
+  );
+}
+
+/**
  * Create the standard L3 runner function (persona generation).
  *
  * Uses PersonaTrigger to check if generation is needed, then runs
@@ -846,6 +896,18 @@ export function createL3Runner(opts: {
   const { pluginDataDir, cfg, openclawConfig, vectorStore, logger, instanceId, llmRunner } = opts;
 
   return async () => {
+    // ── Guard: skip L3 when the deterministic KB projection owns persona.md ──
+    // When engine=kb + kbProjections=on + llmRunner present + store kb-capable,
+    // refreshKbProjections() already wrote persona.md from the canonical KB.
+    // Allowing PersonaGenerator to run would overwrite it with a Chinese LLM
+    // narrative, making <user-persona> alternate between accurate and hallucinated.
+    // We check the SAME conditions as useKbEngine + kbWriteSucceeded to guarantee
+    // we never skip L3 when the KB path fell back to l1 (leaving persona.md stale).
+    if (kbProjectionOwnsProjectedFiles(cfg, vectorStore, llmRunner)) {
+      logger.info(`${TAG} [L3] Skipped: deterministic KB projection owns persona.md (engine=kb, kbProjections=on)`);
+      return;
+    }
+
     const trigger = new PersonaTrigger({
       dataDir: pluginDataDir,
       interval: cfg.persona.triggerEveryN,
