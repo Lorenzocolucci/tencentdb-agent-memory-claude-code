@@ -420,7 +420,7 @@ export class TdaiGateway {
     }
 
     const startMs = Date.now();
-    const result = await this.core.handleBeforeRecall(body.query, body.session_key);
+    const result = await this.core.handleBeforeRecall(body.query, body.session_key, body.project);
     const elapsed = Date.now() - startMs;
 
     // Deliver BOTH the stable context (persona/scene/guide) AND the dynamic

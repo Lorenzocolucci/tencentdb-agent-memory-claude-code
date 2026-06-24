@@ -15,17 +15,51 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 const PRINCIPLES_FILE = "principles.md";
+const PRINCIPLES_DIR = "principles";
 
-/** Read the curated principles for this data dir, or undefined when absent/empty. */
-export async function loadPrinciples(dataDir: string): Promise<string | undefined> {
+/** Read a file, returning its trimmed content or undefined when absent/empty. */
+async function readTrimmed(filePath: string): Promise<string | undefined> {
   try {
-    const raw = await fs.readFile(path.join(dataDir, PRINCIPLES_FILE), "utf-8");
-    const trimmed = raw.trim();
+    const trimmed = (await fs.readFile(filePath, "utf-8")).trim();
     return trimmed.length > 0 ? trimmed : undefined;
   } catch {
-    // Missing / unreadable principles file is a normal no-op.
-    return undefined;
+    return undefined; // missing / unreadable → normal no-op
   }
+}
+
+/**
+ * Reduce a project name to a safe, stable filename key: lowercase, keep only
+ * [a-z0-9._-], drop everything else (path separators, traversal). Returns ''
+ * when nothing safe remains — callers then skip the per-project lookup.
+ */
+export function sanitizeProjectKey(name: string): string {
+  // Drop unsafe chars (incl. path separators), then strip any leading dots so a
+  // traversal prefix like "../../" cannot survive as a "...."-prefixed filename.
+  return name.toLowerCase().replace(/[^a-z0-9._-]/g, "").replace(/^\.+/, "");
+}
+
+/**
+ * Load the binding principles for this data dir. Two layers, both BINDING:
+ *   - GLOBAL `principles.md` — cross-project working rules.
+ *   - PER-PROJECT `principles/<projectKey>.md` — that project's north-star/focus.
+ * Global comes first, the project's principles after (more specific last). Either
+ * may be absent; returns undefined only when BOTH are. Backward compatible: with
+ * no projectName it loads exactly the global file as before.
+ */
+export async function loadPrinciples(
+  dataDir: string,
+  projectName?: string,
+): Promise<string | undefined> {
+  const global = await readTrimmed(path.join(dataDir, PRINCIPLES_FILE));
+
+  let project: string | undefined;
+  if (projectName) {
+    const key = sanitizeProjectKey(projectName);
+    if (key) project = await readTrimmed(path.join(dataDir, PRINCIPLES_DIR, `${key}.md`));
+  }
+
+  const parts = [global, project].filter((p): p is string => p !== undefined);
+  return parts.length > 0 ? parts.join("\n\n") : undefined;
 }
 
 /** Wrap curated principles in a BINDING block (distinct from "reference only" facts). */

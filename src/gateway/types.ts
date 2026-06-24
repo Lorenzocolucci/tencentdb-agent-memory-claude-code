@@ -39,6 +39,8 @@ export interface RecallRequest {
   query: string;
   session_key: string;
   user_id?: string;
+  /** Project the session is in (basename of cwd) — selects per-project principles. */
+  project?: string;
 }
 
 export interface RecallResponse {

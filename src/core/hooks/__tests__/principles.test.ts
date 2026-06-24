@@ -11,7 +11,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadPrinciples, formatPrinciplesBlock } from "../principles.js";
+import { loadPrinciples, formatPrinciplesBlock, sanitizeProjectKey } from "../principles.js";
 
 describe("loadPrinciples", () => {
   let dir: string;
@@ -32,6 +32,67 @@ describe("loadPrinciples", () => {
   it("returns undefined when the file is empty or whitespace", async () => {
     fs.writeFileSync(path.join(dir, "principles.md"), "   \n\t\n");
     expect(await loadPrinciples(dir)).toBeUndefined();
+  });
+});
+
+describe("loadPrinciples — per-project", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "tdai-principles-proj-"));
+    fs.mkdirSync(path.join(dir, "principles"));
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it("combines global + per-project (global first, project after)", async () => {
+    fs.writeFileSync(path.join(dir, "principles.md"), "GLOBAL: determinismo assoluto.");
+    fs.writeFileSync(path.join(dir, "principles", "sofia-ai.md"), "PROJECT: Sofia north-star.");
+    const out = await loadPrinciples(dir, "sofia-ai");
+    expect(out).toBe("GLOBAL: determinismo assoluto.\n\nPROJECT: Sofia north-star.");
+  });
+
+  it("falls back to global-only when no project file exists", async () => {
+    fs.writeFileSync(path.join(dir, "principles.md"), "GLOBAL only.");
+    expect(await loadPrinciples(dir, "unknown-project")).toBe("GLOBAL only.");
+  });
+
+  it("returns project-only when there is no global file", async () => {
+    fs.writeFileSync(path.join(dir, "principles", "tutorai.md"), "PROJECT only.");
+    expect(await loadPrinciples(dir, "tutorai")).toBe("PROJECT only.");
+  });
+
+  it("behaves exactly as before when projectName is omitted (backward compat)", async () => {
+    fs.writeFileSync(path.join(dir, "principles.md"), "GLOBAL.");
+    fs.writeFileSync(path.join(dir, "principles", "x.md"), "should be ignored");
+    expect(await loadPrinciples(dir)).toBe("GLOBAL.");
+  });
+
+  it("resists path traversal in the project name (stays inside principles/)", async () => {
+    // A traversal attempt must not read the global file or anything outside.
+    fs.writeFileSync(path.join(dir, "principles.md"), "GLOBAL secret.");
+    const out = await loadPrinciples(dir, "../../principles");
+    // Sanitized key cannot escape; no project file matches → global-only.
+    expect(out).toBe("GLOBAL secret.");
+  });
+
+  it("ignores an empty/whitespace project file (global wins)", async () => {
+    fs.writeFileSync(path.join(dir, "principles.md"), "GLOBAL.");
+    fs.writeFileSync(path.join(dir, "principles", "blank.md"), "   \n");
+    expect(await loadPrinciples(dir, "blank")).toBe("GLOBAL.");
+  });
+});
+
+describe("sanitizeProjectKey", () => {
+  it("lowercases and keeps safe filename chars", () => {
+    expect(sanitizeProjectKey("Sofia-AI")).toBe("sofia-ai");
+    expect(sanitizeProjectKey("tencentdb_agent.memory")).toBe("tencentdb_agent.memory");
+  });
+  it("strips path separators and traversal", () => {
+    expect(sanitizeProjectKey("../../etc")).toBe("etc");
+    expect(sanitizeProjectKey("a/b\\c")).toBe("abc");
+  });
+  it("returns '' for an all-unsafe or empty name", () => {
+    expect(sanitizeProjectKey("")).toBe("");
+    expect(sanitizeProjectKey("///")).toBe("");
   });
 });
 

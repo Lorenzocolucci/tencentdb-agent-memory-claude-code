@@ -10,7 +10,7 @@
  */
 
 import { GatewayClient, RECALL_TIMEOUT_MS, CAPTURE_TIMEOUT_MS } from "./gateway-client.js";
-import { getSessionKey } from "./session-key.js";
+import { getSessionKey, getProjectName } from "./session-key.js";
 import { readAllTurns } from "./transcript.js";
 import { DaemonManager, readDaemonState, clearDaemonState } from "./daemon.js";
 import { appendFile, mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
@@ -97,9 +97,10 @@ async function handleUserPromptSubmit(data: HookStdin, client: GatewayClient): P
   if (!prompt) return "";
 
   const sessionKey = getSessionKey(cwd);
+  const project = getProjectName(cwd);
 
   // Primary path: L1/L2/L3 recall (structured atoms + persona + scene).
-  const recall = await client.recall(prompt, sessionKey);
+  const recall = await client.recall(prompt, sessionKey, project);
   let context = recall.context ?? "";
 
   // Fallback 1: daemon /search/conversations (FTS5 BM25 on L0 table).

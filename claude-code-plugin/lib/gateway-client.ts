@@ -133,12 +133,12 @@ export class GatewayClient {
     }
   }
 
-  async recall(query: string, sessionKey: string): Promise<RecallResult> {
+  async recall(query: string, sessionKey: string, project?: string): Promise<RecallResult> {
     // Recall uses RECALL_TIMEOUT_MS — short, non-blocking (Phase 3: HOOK CLIENT TIMEOUT).
     try {
       const token = await this.freshToken();
       const { status, body } = await this.rawRequest(
-        "POST", "/recall", { query, session_key: sessionKey }, token, RECALL_TIMEOUT_MS,
+        "POST", "/recall", { query, session_key: sessionKey, project }, token, RECALL_TIMEOUT_MS,
       );
       if (status !== 200) {
         await this.logFailure("POST", "/recall", this.describeStatus(status, body));

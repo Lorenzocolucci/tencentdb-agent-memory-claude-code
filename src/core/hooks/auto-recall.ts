@@ -142,6 +142,8 @@ export async function performAutoRecall(params: {
   sessionKey: string;
   cfg: MemoryTdaiConfig;
   pluginDataDir: string;
+  /** Project the session is in (basename of cwd) — selects per-project principles. */
+  projectName?: string;
   logger?: Logger;
   vectorStore?: IMemoryStore;
   embeddingService?: EmbeddingService;
@@ -172,11 +174,12 @@ async function performAutoRecallInner(params: {
   sessionKey: string;
   cfg: MemoryTdaiConfig;
   pluginDataDir: string;
+  projectName?: string;
   logger?: Logger;
   vectorStore?: IMemoryStore;
   embeddingService?: EmbeddingService;
 }): Promise<RecallResult | undefined> {
-  const { userText, cfg, pluginDataDir, logger, vectorStore, embeddingService } = params;
+  const { userText, cfg, pluginDataDir, projectName, logger, vectorStore, embeddingService } = params;
   const tRecallStart = performance.now();
 
   // Search relevant memories (L1 layer) — skip only when userText is empty/undefined
@@ -250,7 +253,13 @@ async function performAutoRecallInner(params: {
   }
   const tSceneEnd = performance.now();
 
-  if (memoryLines.length === 0 && !personaContent && !sceneNavigation) {
+  // Load the binding principles (global + per-project) BEFORE the "anything to
+  // inject?" gate. The north-star is the one thing that must surface even when a
+  // fresh project has no persona/scene/memory yet — otherwise the binding vision
+  // is silently dropped exactly when it matters most (the "forgot the vision" bug).
+  const principles = await loadPrinciples(pluginDataDir, projectName);
+
+  if (memoryLines.length === 0 && !personaContent && !sceneNavigation && !principles) {
     const totalMs = performance.now() - tRecallStart;
     logger?.info(
       `${TAG} ⏱ Recall timing: total=${totalMs.toFixed(0)}ms, ` +
@@ -260,7 +269,7 @@ async function performAutoRecallInner(params: {
       `persona=${(tPersonaEnd - tPersonaStart).toFixed(0)}ms, ` +
       `scene=${(tSceneEnd - tSceneStart).toFixed(0)}ms — no context to inject`,
     );
-    logger?.debug?.(`${TAG} No memories/persona/scenes to inject`);
+    logger?.debug?.(`${TAG} No memories/persona/scenes/principles to inject`);
     return undefined;
   }
 
@@ -276,9 +285,7 @@ async function performAutoRecallInner(params: {
   //   so it doesn't bust the system prompt cache.
   const stableParts: string[] = [];
   // Track A slice 2 — the binding project principles (the WHY) go FIRST, before
-  // persona/scene, framed as binding (not "for reference only" like facts). This
-  // is the fix to "forgot the vision": the north-star is now injected with force.
-  const principles = await loadPrinciples(pluginDataDir);
+  // persona/scene, framed as binding (not "for reference only" like facts).
   if (principles) {
     stableParts.push(formatPrinciplesBlock(principles));
   }

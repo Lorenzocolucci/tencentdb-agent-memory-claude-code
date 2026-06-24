@@ -278,7 +278,11 @@ export class TdaiCore {
    * Handle recall (memory retrieval) before an LLM turn.
    * Maps to: OpenClaw `before_prompt_build` / Hermes `prefetch()`.
    */
-  async handleBeforeRecall(userText: string, sessionKey: string): Promise<RecallResult> {
+  async handleBeforeRecall(
+    userText: string,
+    sessionKey: string,
+    projectName?: string,
+  ): Promise<RecallResult> {
     await this.storeReady?.catch(() => {});
 
     const result = await performAutoRecall({
@@ -287,6 +291,7 @@ export class TdaiCore {
       sessionKey,
       cfg: this.cfg,
       pluginDataDir: this.dataDir,
+      projectName,
       logger: this.logger,
       vectorStore: this.vectorStore,
       embeddingService: this.embeddingService,

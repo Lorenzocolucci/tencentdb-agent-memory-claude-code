@@ -10,7 +10,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 
 export function getSessionKey(cwd: string): string {
   const override = process.env.TDAI_SESSION_KEY;
@@ -19,4 +19,13 @@ export function getSessionKey(cwd: string): string {
   }
   const normalized = resolve(cwd);
   return createHash("sha256").update(normalized).digest("hex").slice(0, 16);
+}
+
+/**
+ * Human-readable project name for a working directory: the basename of the
+ * resolved cwd (e.g. C:\…\tencentdb-agent-memory → "tencentdb-agent-memory").
+ * Used to select per-project principles. Returns "" for a root/empty path.
+ */
+export function getProjectName(cwd: string): string {
+  return basename(resolve(cwd));
 }
