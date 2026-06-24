@@ -44,8 +44,10 @@ test-offload-sessions.sh
 *.tgz
 *.tar.gz
 
-# Local development notes (contributor-only, not shipped)
-docs/superpowers/
+# Local development notes (contributor-only, not shipped) — EXCEPT design specs,
+# which are the durable architectural record (the WHY behind the code).
+docs/superpowers/*
+!docs/superpowers/specs/
 
 # Per-developer Claude Code project instructions (contributor-only)
 CLAUDE.md
