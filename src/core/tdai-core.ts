@@ -33,6 +33,9 @@ import type { MemoryTdaiConfig } from "../config.js";
 import type { IMemoryStore } from "./store/types.js";
 import type { EmbeddingService } from "./store/embedding.js";
 import { scheduleConsolidation } from "./kb/consolidation-scheduler.js";
+import { extractSituation } from "./hooks/situation.js";
+import { buildFileInjection } from "./hooks/situation-injection.js";
+import { canonicalKey } from "./kb/kb-queries.js";
 import { performAutoRecall } from "./hooks/auto-recall.js";
 import { performAutoCapture } from "./hooks/auto-capture.js";
 import { executeMemorySearch, formatSearchResponse } from "./tools/memory-search.js";
@@ -122,6 +125,13 @@ export class TdaiCore {
    * of currently-running background tasks.
    */
   private readonly bgTasks = new Set<Promise<void>>();
+
+  /**
+   * Files whose proactive memory has already been injected in a given session
+   * (Track A 3+4). Enforces "once per file per session" so re-touching a file
+   * does not re-inject. Cleared for a session in {@link handleSessionEnd}.
+   */
+  private readonly injectedFilesBySession = new Map<string, Set<string>>();
 
   constructor(opts: TdaiCoreOptions) {
     this.hostAdapter = opts.hostAdapter;
@@ -385,6 +395,55 @@ export class TdaiCore {
       unregister: (t) => this.bgTasks.delete(t),
       logger: this.logger,
     });
+
+    // Drop the per-session "already injected files" set (bounded memory).
+    this.injectedFilesBySession.delete(sessionKey);
+  }
+
+  /**
+   * Handle a PostToolUse observation (Track A 3+4): when the agent touches a
+   * file, surface what the graph already knows about it — proactive injection
+   * by SITUATION (the file), not by query words. Returns the injection text, or
+   * {} for SILENCE. Silent-unless-relevant; once per file per session; never
+   * throws (memory must not break the turn).
+   */
+  async handleToolObservation(obs: {
+    sessionKey: string;
+    toolName: string;
+    toolInput: unknown;
+    toolOutputIsError?: boolean;
+  }): Promise<{ inject?: string }> {
+    if (!obs.sessionKey) return {};
+    await this.storeReady?.catch(() => {});
+    if (!this.vectorStore) return {};
+
+    const situation = extractSituation({
+      toolName: obs.toolName,
+      toolInput: obs.toolInput,
+      toolOutputIsError: obs.toolOutputIsError,
+    });
+    if (!situation.filePath) return {};
+
+    // Once per file per session — collapse slash/case variants via the canonical key.
+    const fileKey = canonicalKey("file", situation.filePath);
+    let injected = this.injectedFilesBySession.get(obs.sessionKey);
+    if (!injected) {
+      injected = new Set<string>();
+      this.injectedFilesBySession.set(obs.sessionKey, injected);
+    }
+    if (injected.has(fileKey)) return {};
+
+    try {
+      const block = buildFileInjection(this.vectorStore, situation.filePath);
+      if (!block) return {}; // silence — re-checked on a later touch if memory appears
+      injected.add(fileKey); // mark only once we actually injected
+      return { inject: block };
+    } catch (err) {
+      this.logger.warn(
+        `${TAG} tool observation failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {};
+    }
   }
 
   // ============================

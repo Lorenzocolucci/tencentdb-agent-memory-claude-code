@@ -157,6 +157,43 @@ export class GatewayClient {
   }
 
   /**
+   * POST /observe — PostToolUse proactive injection by situation. Short timeout
+   * (same budget as recall): if the gateway is slow/down, stay silent rather
+   * than block the turn. Returns "" for silence.
+   */
+  async observe(payload: {
+    toolName: string;
+    sessionKey: string;
+    toolInput?: unknown;
+    toolOutputIsError?: boolean;
+  }): Promise<string> {
+    try {
+      const token = await this.freshToken();
+      const { status, body } = await this.rawRequest(
+        "POST",
+        "/observe",
+        {
+          session_key: payload.sessionKey,
+          tool_name: payload.toolName,
+          tool_input: payload.toolInput,
+          tool_output_is_error: payload.toolOutputIsError,
+        },
+        token,
+        RECALL_TIMEOUT_MS,
+      );
+      if (status !== 200) {
+        await this.logFailure("POST", "/observe", this.describeStatus(status, body));
+        return "";
+      }
+      const parsed = JSON.parse(body) as { context?: string };
+      return parsed.context ?? "";
+    } catch (err) {
+      await this.logFailure("POST", "/observe", err instanceof Error ? err.message : String(err));
+      return "";
+    }
+  }
+
+  /**
    * POST /capture — uses CAPTURE_TIMEOUT_MS (generous) so slow gateway writes
    * are not falsely treated as failures (Phase 3: HOOK CLIENT TIMEOUT).
    *

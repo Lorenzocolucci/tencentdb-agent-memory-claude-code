@@ -28,6 +28,8 @@ import type {
   HealthResponse,
   RecallRequest,
   RecallResponse,
+  ObserveRequest,
+  ObserveResponse,
   CaptureRequest,
   CaptureResponse,
   MemorySearchRequest,
@@ -284,6 +286,8 @@ export class TdaiGateway {
           return await this.handleSearchMemories(req, res);
         case "POST /search/conversations":
           return await this.handleSearchConversations(req, res);
+        case "POST /observe":
+          return await this.handleObserve(req, res);
         case "POST /session/end":
           return await this.handleSessionEnd(req, res);
         case "POST /seed":
@@ -511,6 +515,25 @@ export class TdaiGateway {
       results: result.text,
       total: result.total,
     };
+    sendJson(res, 200, response);
+  }
+
+  private async handleObserve(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await parseJsonBody<ObserveRequest>(req);
+
+    if (!body.session_key || !body.tool_name) {
+      sendError(res, 400, "Missing required fields: session_key, tool_name");
+      return;
+    }
+
+    const result = await this.core.handleToolObservation({
+      sessionKey: body.session_key,
+      toolName: body.tool_name,
+      toolInput: body.tool_input,
+      toolOutputIsError: body.tool_output_is_error,
+    });
+
+    const response: ObserveResponse = { context: result.inject ?? "" };
     sendJson(res, 200, response);
   }
 

@@ -48,6 +48,22 @@ export interface RecallResponse {
 }
 
 // ============================
+// /observe (PostToolUse — proactive injection by situation)
+// ============================
+
+export interface ObserveRequest {
+  session_key: string;
+  tool_name: string;
+  tool_input?: unknown;
+  tool_output_is_error?: boolean;
+}
+
+export interface ObserveResponse {
+  /** Memory to inject (additionalContext), or "" for silence. */
+  context: string;
+}
+
+// ============================
 // /capture
 // ============================
 

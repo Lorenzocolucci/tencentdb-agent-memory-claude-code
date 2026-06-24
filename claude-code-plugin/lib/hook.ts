@@ -72,6 +72,7 @@ interface HookStdin {
   tool_name?: string;
   tool_input?: unknown;
   tool_response?: unknown;
+  tool_output_is_error?: boolean;
   tool_use_id?: string;
   stop_hook_active?: boolean;
 }
@@ -139,13 +140,32 @@ async function handleUserPromptSubmit(data: HookStdin, client: GatewayClient): P
   });
 }
 
-async function handlePostToolUse(_data: HookStdin, _client: GatewayClient): Promise<string> {
-  // No-op fallback. PostToolUse capture is intentionally deferred to a
-  // follow-up PR — see spec §5.3 for the buffer endpoint design. The
-  // hooks.json registration was removed so this handler is unreachable
-  // by default; it remains here only as a safety net if someone manually
-  // re-enables the PostToolUse hook before the follow-up lands.
-  return "";
+async function handlePostToolUse(data: HookStdin, client: GatewayClient): Promise<string> {
+  // Proactive injection by SITUATION (Track A 3+4): when the agent touches a
+  // file, surface what the graph already knows about it. Silent (returns "")
+  // unless relevant; the gateway enforces once-per-file-per-session.
+  const toolName = data.tool_name ?? "";
+  if (!toolName) return "";
+  const cwd = data.cwd ?? process.cwd();
+  const sessionKey = getSessionKey(cwd);
+
+  let context = await client.observe({
+    toolName,
+    sessionKey,
+    toolInput: data.tool_input,
+    toolOutputIsError: data.tool_output_is_error,
+  });
+  if (!context) return "";
+
+  if (context.length > MAX_INJECT_CHARS) {
+    context = context.slice(0, MAX_INJECT_CHARS - 100) + "\n\n[…truncated…]";
+  }
+  return JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "PostToolUse",
+      additionalContext: context,
+    },
+  });
 }
 
 async function handleStop(data: HookStdin, client: GatewayClient): Promise<string> {

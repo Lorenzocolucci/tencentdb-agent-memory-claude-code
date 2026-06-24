@@ -25,6 +25,19 @@
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/lib/hook.mjs\" post-tool-use",
+            "timeout": 5,
+            "statusMessage": "Checking memory for this file..."
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

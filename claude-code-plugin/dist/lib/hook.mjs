@@ -104,6 +104,30 @@ var GatewayClient = class {
 		}
 	}
 	/**
+	* POST /observe — PostToolUse proactive injection by situation. Short timeout
+	* (same budget as recall): if the gateway is slow/down, stay silent rather
+	* than block the turn. Returns "" for silence.
+	*/
+	async observe(payload) {
+		try {
+			const token = await this.freshToken();
+			const { status, body } = await this.rawRequest("POST", "/observe", {
+				session_key: payload.sessionKey,
+				tool_name: payload.toolName,
+				tool_input: payload.toolInput,
+				tool_output_is_error: payload.toolOutputIsError
+			}, token, RECALL_TIMEOUT_MS);
+			if (status !== 200) {
+				await this.logFailure("POST", "/observe", this.describeStatus(status, body));
+				return "";
+			}
+			return JSON.parse(body).context ?? "";
+		} catch (err) {
+			await this.logFailure("POST", "/observe", err instanceof Error ? err.message : String(err));
+			return "";
+		}
+	}
+	/**
 	* POST /capture — uses CAPTURE_TIMEOUT_MS (generous) so slow gateway writes
 	* are not falsely treated as failures (Phase 3: HOOK CLIENT TIMEOUT).
 	*
@@ -544,6 +568,7 @@ var DaemonManager = class {
 			cwd: this.dataDir,
 			shell: process.platform === "win32",
 			detached: true,
+			windowsHide: true,
 			stdio: [
 				"ignore",
 				logFd,
@@ -636,8 +661,22 @@ async function handleUserPromptSubmit(data, client) {
 		additionalContext: context
 	} });
 }
-async function handlePostToolUse(_data, _client) {
-	return "";
+async function handlePostToolUse(data, client) {
+	const toolName = data.tool_name ?? "";
+	if (!toolName) return "";
+	const sessionKey = getSessionKey(data.cwd ?? process.cwd());
+	let context = await client.observe({
+		toolName,
+		sessionKey,
+		toolInput: data.tool_input,
+		toolOutputIsError: data.tool_output_is_error
+	});
+	if (!context) return "";
+	if (context.length > MAX_INJECT_CHARS) context = context.slice(0, MAX_INJECT_CHARS - 100) + "\n\n[…truncated…]";
+	return JSON.stringify({ hookSpecificOutput: {
+		hookEventName: "PostToolUse",
+		additionalContext: context
+	} });
 }
 async function handleStop(data, client) {
 	if (data.stop_hook_active === true) return "";
