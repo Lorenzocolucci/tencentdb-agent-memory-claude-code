@@ -57,3 +57,8 @@ CLAUDE.md
 # Windows launcher secrets (provider API keys) - NEVER commit, local only
 gateway.secrets.env
 *.secrets.env
+
+# Local dev artifacts (Sinapsys)
+*.log
+kb-probe.mts
+.claude/

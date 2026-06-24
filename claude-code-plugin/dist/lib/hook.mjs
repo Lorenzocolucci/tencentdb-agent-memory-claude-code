@@ -81,12 +81,13 @@ var GatewayClient = class {
 			return false;
 		}
 	}
-	async recall(query, sessionKey) {
+	async recall(query, sessionKey, project) {
 		try {
 			const token = await this.freshToken();
 			const { status, body } = await this.rawRequest("POST", "/recall", {
 				query,
-				session_key: sessionKey
+				session_key: sessionKey,
+				project
 			}, token, RECALL_TIMEOUT_MS);
 			if (status !== 200) {
 				await this.logFailure("POST", "/recall", this.describeStatus(status, body));
@@ -273,6 +274,14 @@ function getSessionKey(cwd) {
 	if (override && override.length > 0) return override;
 	const normalized = resolve(cwd);
 	return createHash("sha256").update(normalized).digest("hex").slice(0, 16);
+}
+/**
+* Human-readable project name for a working directory: the basename of the
+* resolved cwd (e.g. C:\…\tencentdb-agent-memory → "tencentdb-agent-memory").
+* Used to select per-project principles. Returns "" for a root/empty path.
+*/
+function getProjectName(cwd) {
+	return basename(resolve(cwd));
 }
 //#endregion
 //#region lib/transcript.ts
@@ -642,7 +651,8 @@ async function handleUserPromptSubmit(data, client) {
 	const cwd = data.cwd ?? process.cwd();
 	if (!prompt) return "";
 	const sessionKey = getSessionKey(cwd);
-	let context = (await client.recall(prompt, sessionKey)).context ?? "";
+	const project = getProjectName(cwd);
+	let context = (await client.recall(prompt, sessionKey, project)).context ?? "";
 	if (!context) {
 		const conv = await client.searchConversations(prompt, {
 			limit: 3,
