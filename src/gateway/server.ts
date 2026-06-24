@@ -23,6 +23,7 @@ import { loadGatewayConfig } from "./config.js";
 import type { GatewayConfig } from "./config.js";
 import { initDataDirectories } from "../utils/pipeline-factory.js";
 import { SessionFilter } from "../utils/session-filter.js";
+import { composeRecallContext } from "./recall-context.js";
 import type {
   HealthResponse,
   RecallRequest,
@@ -418,10 +419,21 @@ export class TdaiGateway {
     const result = await this.core.handleBeforeRecall(body.query, body.session_key);
     const elapsed = Date.now() - startMs;
 
-    this.logger.info(`Recall completed in ${elapsed}ms: context=${(result.appendSystemContext?.length ?? 0)} chars`);
+    // Deliver BOTH the stable context (persona/scene/guide) AND the dynamic
+    // situation-relevant memories. Returning only appendSystemContext silently
+    // dropped the per-prompt <relevant-memories> — proactive injection OFF.
+    const context = composeRecallContext({
+      appendSystemContext: result.appendSystemContext,
+      prependContext: result.prependContext,
+    });
+
+    this.logger.info(
+      `Recall completed in ${elapsed}ms: context=${context.length} chars ` +
+      `(stable=${result.appendSystemContext?.length ?? 0}, memories=${result.prependContext?.length ?? 0})`,
+    );
 
     const response: RecallResponse = {
-      context: result.appendSystemContext ?? "",
+      context,
       strategy: result.recallStrategy,
       memory_count: result.recalledL1Memories?.length ?? 0,
     };
