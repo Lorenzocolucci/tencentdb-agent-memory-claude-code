@@ -502,6 +502,20 @@ export interface IMemoryStore {
   insertEvent?(event: KbEventInput): KbEvent;
 
   /**
+   * Run one deterministic consolidation pass for a finished session: reinforce
+   * the session's events + derived facts, then decay stale memories. Sync, NO
+   * LLM. Returns zeroed stats when KB is not ready; never throws (it runs on
+   * the session-end path). Optional so non-sqlite backends (TCVDB) can omit it
+   * and the scheduler no-ops.
+   */
+  consolidateSession?(params: {
+    sessionKey: string;
+    now: string;
+    staleAfterMs?: number;
+    namespace?: string;
+  }): { eventsReinforced: number; factsReinforced: number; staled: number };
+
+  /**
    * Bi-temporal supersession upsert of a single (entity, attribute) fact.
    * NEVER hard-deletes. See kb-queries.ts for the full algorithm.
    */

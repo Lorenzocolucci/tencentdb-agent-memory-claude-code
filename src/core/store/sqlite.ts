@@ -24,6 +24,7 @@ import { createRequire } from "node:module";
 import type { DatabaseSync, StatementSync } from "node:sqlite";
 import type { MemoryRecord } from "../record/l1-writer.js";
 import { initFoundationsSchema } from "../kb/foundations-schema.js";
+import { runConsolidation, type ConsolidationStats } from "../kb/consolidation-runner.js";
 import type { EmbeddingProviderInfo } from "./embedding.js";
 import type {
   IMemoryStore,
@@ -2736,6 +2737,19 @@ export class VectorStore implements IMemoryStore {
   insertEvent(event: KbEventInput): KbEvent {
     if (!this.kbReady) throw new Error(`${TAG} KB not ready — insertEvent unavailable`);
     return kbInsertEvent(this.db, event);
+  }
+
+  /** @see IMemoryStore.consolidateSession */
+  consolidateSession(params: {
+    sessionKey: string;
+    now: string;
+    staleAfterMs?: number;
+    namespace?: string;
+  }): ConsolidationStats {
+    // Unlike the CRUD primitives this never throws: it runs on the session-end
+    // path and must degrade to a no-op when the KB is unavailable.
+    if (!this.kbReady) return { eventsReinforced: 0, factsReinforced: 0, staled: 0 };
+    return runConsolidation(this.db, params);
   }
 
   /** @see IMemoryStore.upsertFact */

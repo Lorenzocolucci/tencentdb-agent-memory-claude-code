@@ -32,6 +32,7 @@ import type {
 import type { MemoryTdaiConfig } from "../config.js";
 import type { IMemoryStore } from "./store/types.js";
 import type { EmbeddingService } from "./store/embedding.js";
+import { scheduleConsolidation } from "./kb/consolidation-scheduler.js";
 import { performAutoRecall } from "./hooks/auto-recall.js";
 import { performAutoCapture } from "./hooks/auto-capture.js";
 import { executeMemorySearch, formatSearchResponse } from "./tools/memory-search.js";
@@ -363,8 +364,27 @@ export class TdaiCore {
   async handleSessionEnd(sessionKey: string): Promise<void> {
     if (!sessionKey) return;
     await this.storeReady?.catch(() => {});
-    if (!this.scheduler) return;
-    await this.scheduler.flushSession(sessionKey);
+
+    // Flush THIS session's buffered pipeline work (no-op when extraction is
+    // disabled and no scheduler exists).
+    if (this.scheduler) {
+      await this.scheduler.flushSession(sessionKey);
+    }
+
+    // Deterministic "sleep-time" consolidation (reinforce the session's
+    // events + facts, decay the stale). Fire-and-forget: deferred to a
+    // macrotask so the /session/end response is sent before the synchronous
+    // sweep, and tracked in bgTasks so destroy() drains it before the DB
+    // closes. A failing pass is logged and swallowed — it never breaks
+    // session-end.
+    scheduleConsolidation({
+      store: this.vectorStore,
+      sessionKey,
+      now: new Date().toISOString(),
+      register: (t) => this.bgTasks.add(t),
+      unregister: (t) => this.bgTasks.delete(t),
+      logger: this.logger,
+    });
   }
 
   // ============================
