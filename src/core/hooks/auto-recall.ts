@@ -20,6 +20,7 @@ import type { IMemoryStore, L1SearchResult, L1FtsResult } from "../store/types.j
 import { buildFtsQuery } from "../store/sqlite.js";
 import type { EmbeddingService, EmbeddingCallOptions } from "../store/embedding.js";
 import { sanitizeText, escapeXmlTags } from "../../utils/sanitize.js";
+import { redactSecrets } from "../../utils/redact-secrets.js";
 import { kbRecall, type KbRecallResult } from "../kb/retrieval.js";
 import { loadPrinciples, formatPrinciplesBlock } from "./principles.js";
 
@@ -369,7 +370,9 @@ async function runKbRecall(
   }
   const recallEmbeddingTimeoutMs = cfg.embedding?.recallTimeoutMs ?? cfg.embedding?.timeoutMs;
   try {
-    return await kbRecall(userText, {
+    // Redact secrets before the KB recall query is embedded (same egress guard
+    // as the L1 search path above).
+    return await kbRecall(redactSecrets(userText), {
       store: vectorStore,
       embeddingService,
       maxResults: cfg.recall.maxResults ?? 5,
@@ -472,8 +475,10 @@ async function searchMemories(
 ): Promise<SearchResult> {
   const emptyResult: SearchResult = { lines: [], timing: { ftsMs: 0, embeddingMs: 0, ftsHits: 0, embeddingHits: 0 } };
   // Strip gateway-injected inbound metadata (Sender, timestamps, media markers,
-  // base64 image data, etc.) so FTS / embedding queries are based on pure user intent.
-  const cleanText = sanitizeText(userText);
+  // base64 image data, etc.) so FTS / embedding queries are based on pure user
+  // intent — THEN redact secrets so a pasted credential in the prompt is never
+  // sent to the embedding provider as a query vector (recall-path egress leak).
+  const cleanText = redactSecrets(sanitizeText(userText));
 
   if (cleanText.length < 2) {
     logger?.debug?.(`${TAG} Query too short for memory search (raw=${userText.length}, clean=${cleanText.length})`);

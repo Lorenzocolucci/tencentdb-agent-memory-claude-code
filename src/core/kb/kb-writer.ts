@@ -32,6 +32,7 @@ import type {
 import type { EmbeddingService } from "../store/embedding.js";
 import type { Logger } from "../types.js";
 import type { KbDelta } from "./extraction-schema.js";
+import { redactSecrets } from "../../utils/redact-secrets.js";
 
 const TAG = "[memory-tdai][kb-writer]";
 
@@ -139,8 +140,8 @@ export async function applyKbDelta(
     const entity = store.resolveOrCreateEntity({
       namespace,
       type: e.type,
-      name: e.name,
-      aliases: e.aliases,
+      name: redactSecrets(e.name),
+      aliases: e.aliases?.map(redactSecrets),
       language: e.language,
       project,
       now,
@@ -167,7 +168,7 @@ export async function applyKbDelta(
       namespace,
       project,
       type: ev.type,
-      text: ev.text,
+      text: redactSecrets(ev.text),
       language: delta.language,
       entities: entityIds,
       sourceMessageIds: ev.source_message_ids,
@@ -186,8 +187,10 @@ export async function applyKbDelta(
 
     const fact = store.upsertFact({
       entityId,
-      attribute: f.attribute,
-      value: f.value,
+      // Redact attribute too: it feeds kb_fts + the embedding text. Redaction is
+      // deterministic, so attribute-keyed supersession stays consistent.
+      attribute: redactSecrets(f.attribute),
+      value: redactSecrets(f.value),
       validFrom: f.valid_from,
       confidence: f.confidence,
       sourceEventId,

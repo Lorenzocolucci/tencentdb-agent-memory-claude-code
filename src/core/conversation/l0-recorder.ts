@@ -18,6 +18,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { sanitizeText, stripCodeBlocks, shouldCaptureL0 } from "../../utils/sanitize.js";
+import { redactSecrets } from "../../utils/redact-secrets.js";
 
 // ============================
 // Types
@@ -251,7 +252,10 @@ export async function recordConversation(params: {
   // Step 3: Sanitize and filter
   const filtered = extracted
     .map((m) => {
-      let content = sanitizeText(m.content);
+      // Redact secrets FIRST — before this content is persisted to L0 JSONL,
+      // embedded, FTS-indexed, or read into L1/KB extraction downstream. This is
+      // the highest-leverage chokepoint (secret-leak audit, 2026-06-24).
+      let content = redactSecrets(sanitizeText(m.content));
       // Strip fenced code blocks from assistant replies to reduce embedding noise
       if (m.role === "assistant") {
         content = stripCodeBlocks(content);

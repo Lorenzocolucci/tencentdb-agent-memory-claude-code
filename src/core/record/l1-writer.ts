@@ -19,6 +19,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
+import { redactSecrets } from "../../utils/redact-secrets.js";
 import type { IMemoryStore } from "../store/types.js";
 import type { EmbeddingService } from "../store/embedding.js";
 
@@ -180,6 +181,11 @@ export async function writeMemory(params: {
     finalPriority = memory.priority;
     finalTimestamps = [now];
   }
+
+  // Defense-in-depth secret redaction before the JSONL write + embed. Chokepoint
+  // A (L0) starves most secrets upstream, but the extractor could reconstruct one
+  // into a memory; this guarantees no secret reaches L1 persist/embed.
+  finalContent = redactSecrets(finalContent);
 
   const record: MemoryRecord = {
     id: decision.record_id || generateMemoryId(),
