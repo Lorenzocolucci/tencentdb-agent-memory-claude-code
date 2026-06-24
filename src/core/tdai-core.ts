@@ -34,7 +34,14 @@ import type { IMemoryStore } from "./store/types.js";
 import type { EmbeddingService } from "./store/embedding.js";
 import { scheduleConsolidation } from "./kb/consolidation-scheduler.js";
 import { extractSituation } from "./hooks/situation.js";
-import { buildFileInjection } from "./hooks/situation-injection.js";
+import { buildFileInjection, resolveFileOwnerId } from "./hooks/situation-injection.js";
+import {
+  EMPTY_SITUATION,
+  updateSituation,
+  type SessionSituation,
+} from "./hooks/session-situation.js";
+import { inferTaskType } from "./hooks/task-type.js";
+import { buildSituationInjection } from "./hooks/fingerprint-injection.js";
 import { canonicalKey } from "./kb/kb-queries.js";
 import { performAutoRecall } from "./hooks/auto-recall.js";
 import { performAutoCapture } from "./hooks/auto-capture.js";
@@ -56,6 +63,11 @@ import { SessionFilter } from "../utils/session-filter.js";
 import { StandaloneLLMRunnerFactory } from "../adapters/standalone/llm-runner.js";
 
 const TAG = "[memory-tdai] [core]";
+
+/** Namespace for proactive-injection reads/writes (single-tenant today). */
+const NAMESPACE = "default";
+/** Bounded recent-fingerprint window scanned per situation match. */
+const FP_QUERY_LIMIT = 200;
 
 // ============================
 // Constructor options
@@ -132,6 +144,20 @@ export class TdaiCore {
    * does not re-inject. Cleared for a session in {@link handleSessionEnd}.
    */
   private readonly injectedFilesBySession = new Map<string, Set<string>>();
+
+  /**
+   * The rolling situation per session (Context Fingerprint / Idea 1): the SHAPE
+   * of recent work (files + error signatures + tool mix) a fingerprint is built
+   * and matched on. Cleared in {@link handleSessionEnd}.
+   */
+  private readonly sessionSituationByKey = new Map<string, SessionSituation>();
+
+  /**
+   * Owner ids already surfaced (by single-file OR situation injection) in a
+   * session — the shared dedup set so a memory is shown at most once per session
+   * across both injection paths. Cleared in {@link handleSessionEnd}.
+   */
+  private readonly injectedOwnersBySession = new Map<string, Set<string>>();
 
   constructor(opts: TdaiCoreOptions) {
     this.hostAdapter = opts.hostAdapter;
@@ -396,16 +422,25 @@ export class TdaiCore {
       logger: this.logger,
     });
 
-    // Drop the per-session "already injected files" set (bounded memory).
+    // Drop the per-session proactive-injection state (bounded memory).
     this.injectedFilesBySession.delete(sessionKey);
+    this.sessionSituationByKey.delete(sessionKey);
+    this.injectedOwnersBySession.delete(sessionKey);
   }
 
   /**
-   * Handle a PostToolUse observation (Track A 3+4): when the agent touches a
-   * file, surface what the graph already knows about it — proactive injection
-   * by SITUATION (the file), not by query words. Returns the injection text, or
-   * {} for SILENCE. Silent-unless-relevant; once per file per session; never
-   * throws (memory must not break the turn).
+   * Handle a PostToolUse observation. Two proactive-injection paths, both
+   * silent-unless-relevant and never throwing (memory must not break the turn):
+   *
+   *  1. Single-file (Track A 3+4): surface what the graph knows about the file
+   *     just touched, once per file per session.
+   *  2. Context Fingerprint (Idea 1): fold this event into the session's rolling
+   *     SITUATION (files + error signatures + tool mix), match it against past
+   *     fingerprints, and on a strong/medium match surface the memories that
+   *     mattered in a similar past situation — cross-session. When a memory is
+   *     surfaced, learn the link by persisting a fingerprint of the moment.
+   *
+   * Owners are deduped across both paths so a memory shows at most once/session.
    */
   async handleToolObservation(obs: {
     sessionKey: string;
@@ -415,35 +450,104 @@ export class TdaiCore {
   }): Promise<{ inject?: string }> {
     if (!obs.sessionKey) return {};
     await this.storeReady?.catch(() => {});
-    if (!this.vectorStore) return {};
+    const store = this.vectorStore;
+    if (!store) return {};
 
     const situation = extractSituation({
       toolName: obs.toolName,
       toolInput: obs.toolInput,
       toolOutputIsError: obs.toolOutputIsError,
     });
-    if (!situation.filePath) return {};
 
-    // Once per file per session — collapse slash/case variants via the canonical key.
-    const fileKey = canonicalKey("file", situation.filePath);
-    let injected = this.injectedFilesBySession.get(obs.sessionKey);
-    if (!injected) {
-      injected = new Set<string>();
-      this.injectedFilesBySession.set(obs.sessionKey, injected);
+    // Fold this event into the session's rolling situation (immutable).
+    const fileKey = situation.filePath ? canonicalKey("file", situation.filePath) : undefined;
+    const errorSignature = situation.isError ? `${obs.toolName}:error` : undefined;
+    const prevSit = this.sessionSituationByKey.get(obs.sessionKey) ?? EMPTY_SITUATION;
+    const curSit = updateSituation(prevSit, { toolName: obs.toolName, fileKey, errorSignature });
+    this.sessionSituationByKey.set(obs.sessionKey, curSit);
+
+    // Shared per-session owner dedup set (across both injection paths).
+    let owners = this.injectedOwnersBySession.get(obs.sessionKey);
+    if (!owners) {
+      owners = new Set<string>();
+      this.injectedOwnersBySession.set(obs.sessionKey, owners);
     }
-    if (injected.has(fileKey)) return {};
 
+    const blocks: string[] = [];
+    const surfacedNow: string[] = [];
+
+    // ── Path 1: single-file injection (once per file per session) ──
+    if (situation.filePath && fileKey) {
+      let injectedFiles = this.injectedFilesBySession.get(obs.sessionKey);
+      if (!injectedFiles) {
+        injectedFiles = new Set<string>();
+        this.injectedFilesBySession.set(obs.sessionKey, injectedFiles);
+      }
+      if (!injectedFiles.has(fileKey)) {
+        try {
+          const block = buildFileInjection(store, situation.filePath);
+          if (block) {
+            injectedFiles.add(fileKey);
+            blocks.push(block);
+            const ownerId = resolveFileOwnerId(store, situation.filePath);
+            if (ownerId && !owners.has(ownerId)) {
+              owners.add(ownerId);
+              surfacedNow.push(ownerId);
+            }
+          }
+        } catch (err) {
+          this.logger.warn(
+            `${TAG} file injection failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    }
+
+    // ── Path 2: Context Fingerprint match (cross-session, situation-shaped) ──
     try {
-      const block = buildFileInjection(this.vectorStore, situation.filePath);
-      if (!block) return {}; // silence — re-checked on a later touch if memory appears
-      injected.add(fileKey); // mark only once we actually injected
-      return { inject: block };
+      const current = {
+        fileKeys: curSit.fileKeys,
+        errorSignatures: curSit.errorSignatures,
+        taskType: inferTaskType(curSit),
+      };
+      const fingerprints = store.queryContextFingerprints?.(NAMESPACE, FP_QUERY_LIMIT) ?? [];
+      const match = buildSituationInjection(store, current, fingerprints, owners);
+      if (match) {
+        blocks.push(match.block);
+        for (const id of match.ownerIds) {
+          owners.add(id);
+          surfacedNow.push(id);
+        }
+      }
     } catch (err) {
       this.logger.warn(
-        `${TAG} tool observation failed: ${err instanceof Error ? err.message : String(err)}`,
+        `${TAG} situation match failed: ${err instanceof Error ? err.message : String(err)}`,
       );
-      return {};
     }
+
+    // ── Learn: persist a fingerprint of THIS moment when memory was surfaced ──
+    // (Only salient moments are worth storing — a situation with no associated
+    //  memory teaches nothing to surface later.)
+    if (surfacedNow.length > 0) {
+      try {
+        store.insertContextFingerprint?.({
+          sessionKey: obs.sessionKey,
+          now: new Date().toISOString(),
+          fileKeys: curSit.fileKeys,
+          errorSignatures: curSit.errorSignatures,
+          taskType: inferTaskType(curSit),
+          toolNames: curSit.toolNames,
+          matchedOwnerIds: surfacedNow,
+          namespace: NAMESPACE,
+        });
+      } catch (err) {
+        this.logger.warn(
+          `${TAG} fingerprint write failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    return blocks.length > 0 ? { inject: blocks.join("\n\n") } : {};
   }
 
   // ============================

@@ -17,6 +17,7 @@
 
 import type { MemoryRecord } from "../record/l1-writer.js";
 import type { EmbeddingProviderInfo } from "./embedding.js";
+import type { StoredFingerprint } from "../kb/fingerprint-writer.js";
 
 // Re-export so consumers can import everything from types.ts
 export type { MemoryRecord, EmbeddingProviderInfo };
@@ -514,6 +515,24 @@ export interface IMemoryStore {
     staleAfterMs?: number;
     namespace?: string;
   }): { eventsReinforced: number; factsReinforced: number; staled: number };
+
+  /**
+   * Context Fingerprint (Idea 1) — persist one situation signature
+   * {files + error signatures + task type + tool sequence → surfaced owner ids}.
+   * Best-effort, no-op when KB off. Returns the generated id (or null).
+   */
+  insertContextFingerprint?(params: {
+    sessionKey: string;
+    now: string;
+    fileKeys: readonly string[];
+    errorSignatures: readonly string[];
+    taskType: string;
+    toolNames: readonly string[];
+    matchedOwnerIds: readonly string[];
+    namespace?: string;
+  }): string | null;
+  /** Read recent fingerprints for a namespace, newest-first, bounded. [] when KB off. */
+  queryContextFingerprints?(namespace: string, limit: number): StoredFingerprint[];
 
   /**
    * Bi-temporal supersession upsert of a single (entity, attribute) fact.

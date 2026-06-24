@@ -79,3 +79,18 @@ export function buildFileInjection(store: IMemoryStore, filePath: string): strin
     "\n</file-memory>"
   );
 }
+
+/**
+ * Resolve the owner entity id for a touched file (full-path key, basename
+ * fallback), or null when the file is unknown. Used by the Context Fingerprint
+ * wiring to learn which owner a situation surfaced and to dedup against the
+ * single-file block — additive, no change to {@link buildFileInjection}.
+ */
+export function resolveFileOwnerId(store: IMemoryStore, filePath: string): string | null {
+  if (!store.queryEntityByKey) return null;
+  for (const key of fileKeyCandidates(filePath)) {
+    const found = store.queryEntityByKey(NAMESPACE, "file", key);
+    if (found) return found.id;
+  }
+  return null;
+}

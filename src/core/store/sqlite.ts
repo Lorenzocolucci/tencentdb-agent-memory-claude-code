@@ -25,6 +25,11 @@ import type { DatabaseSync, StatementSync } from "node:sqlite";
 import type { MemoryRecord } from "../record/l1-writer.js";
 import { initFoundationsSchema } from "../kb/foundations-schema.js";
 import { runConsolidation, type ConsolidationStats } from "../kb/consolidation-runner.js";
+import {
+  insertFingerprint as kbInsertFingerprint,
+  queryRecentFingerprints as kbQueryRecentFingerprints,
+  type StoredFingerprint,
+} from "../kb/fingerprint-writer.js";
 import type { EmbeddingProviderInfo } from "./embedding.js";
 import type {
   IMemoryStore,
@@ -2750,6 +2755,28 @@ export class VectorStore implements IMemoryStore {
     // path and must degrade to a no-op when the KB is unavailable.
     if (!this.kbReady) return { eventsReinforced: 0, factsReinforced: 0, staled: 0 };
     return runConsolidation(this.db, params);
+  }
+
+  /** @see IMemoryStore.insertContextFingerprint */
+  insertContextFingerprint(params: {
+    sessionKey: string;
+    now: string;
+    fileKeys: readonly string[];
+    errorSignatures: readonly string[];
+    taskType: string;
+    toolNames: readonly string[];
+    matchedOwnerIds: readonly string[];
+    namespace?: string;
+  }): string | null {
+    // Best-effort on the observe/session-end path — never throws.
+    if (!this.kbReady) return null;
+    return kbInsertFingerprint(this.db, params);
+  }
+
+  /** @see IMemoryStore.queryContextFingerprints */
+  queryContextFingerprints(namespace: string, limit: number): StoredFingerprint[] {
+    if (!this.kbReady) return [];
+    return kbQueryRecentFingerprints(this.db, namespace, limit);
   }
 
   /** @see IMemoryStore.upsertFact */
