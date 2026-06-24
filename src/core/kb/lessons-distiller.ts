@@ -1,24 +1,32 @@
 /**
- * Lesson distiller (Phase B, part 3) — turns one resolved-failure cluster into
- * a reusable lesson via the LLM. The runner is injected (LLMRunner), so this is
- * host-neutral and testable offline.
+ * Lesson distiller (Phase B, B2a+) — turns one cross-session failure cluster
+ * into a reusable lesson via the LLM. The runner is injected (LLMRunner), so
+ * this is host-neutral and testable offline.
+ *
+ * B2a contract changes (vs B1):
+ *   - trigger_pattern is REMOVED from DistilledLesson and from the JSON contract.
+ *     The LLM now returns only: domain, lesson_text, anti_patterns, confidence.
+ *     trigger_pattern is set deterministically by lesson-trigger.ts (canonical
+ *     fingerprint), never by the LLM.
+ *   - The prompt now honestly describes the input as "N recurrences of the same
+ *     class of failure across different sessions" + "fix(es) that resolved them
+ *     (if known)". The LLM distils ONE generalizable lesson for the class.
  *
  * Contract with the rest of Phase B: NEVER throws. A timeout, network error, or
  * unparseable model output yields `null` — the orchestrator simply skips that
  * cluster. Memory must never break the conversation.
  *
- * NOTE: the prompt is a first cut; have lo-llm-architect review it before the
- * cadence goes automatic.
+ * NOTE: prompt is a first cut; have lo-llm-architect review before auto cadence.
  */
 
 import type { LLMRunner } from "../types.js";
 
-/** The model's distilled output for one cluster. */
+// ── Public types ───────────────────────────────────────────────────────────────
+
+/** The model's distilled output for one cluster (B2a: no trigger_pattern). */
 export interface DistilledLesson {
   /** Short language-neutral area, e.g. "circuit-breaker", "twilio-templates". */
   domain: string;
-  /** The recurring situation that should trigger recall of this lesson. */
-  triggerPattern: string;
   /** The actionable lesson (what to do / what was learned). */
   lessonText: string;
   /** Mistakes to avoid (what NOT to do). */
@@ -30,31 +38,56 @@ export interface DistilledLesson {
 /** Minimal cluster shape the distiller accepts (satisfied by FailureCluster adapter). */
 export interface DistillableCluster {
   project: string;
-  bugText: string;
+  /** All bug event texts — presented as recurrences of the same failure class. */
+  bugTexts: string[];
+  /**
+   * Fix event texts pulled from fixed-by / caused relations (may be empty).
+   * An empty list means the resolution is unknown; the lesson can still
+   * warn about the recurring class of failure.
+   */
   fixTexts: string[];
 }
 
-export const LESSON_DISTILL_SYSTEM_PROMPT =
-  "You distill ONE resolved software failure (a bug and the fix(es) that resolved it) into a single reusable engineering lesson.\n" +
-  "Be specific and general at once: the lesson must help in a FUTURE similar situation, not just restate this incident.\n" +
-  'Reply with STRICT JSON only — no prose, no markdown fences — of exactly this shape:\n' +
-  '{"domain": string, "trigger_pattern": string, "lesson_text": string, "anti_patterns": string[], "confidence": number}\n' +
-  "- domain: 2-4 word language-neutral area (e.g. \"circuit-breaker\", \"jwt-refresh\").\n" +
-  "- trigger_pattern: the recurring situation in which this lesson should resurface.\n" +
-  "- lesson_text: one or two sentences, imperative, actionable.\n" +
-  "- anti_patterns: short phrases of what NOT to do (may be empty).\n" +
-  "- confidence: 0..1, how sure you are this generalizes.";
+// ── System prompt ──────────────────────────────────────────────────────────────
 
-/** Build the user prompt carrying the failure context (bug + every fix). */
+export const LESSON_DISTILL_SYSTEM_PROMPT =
+  "You distill a class of recurring software failures into a single reusable engineering lesson.\n" +
+  "You are given N RECURRENCES of the same failure across different sessions (not a single incident)\n" +
+  "and optionally the fix(es) that resolved one or more of them.\n" +
+  "Be specific and general at once: the lesson must help in a FUTURE similar situation, not restate history.\n" +
+  'Reply with STRICT JSON only — no prose, no markdown fences — of exactly this shape:\n' +
+  '{"domain": string, "lesson_text": string, "anti_patterns": string[], "confidence": number}\n' +
+  "- domain: 2-4 word language-neutral area (e.g. \"circuit-breaker\", \"jwt-refresh\").\n" +
+  "- lesson_text: one or two sentences, imperative, actionable. If fixes are unknown,\n" +
+  "  describe the class of failure and advise investigation.\n" +
+  "- anti_patterns: short phrases of what NOT to do (may be empty).\n" +
+  "- confidence: 0..1, how sure you are this generalises across sessions.";
+
+// ── Prompt builder ─────────────────────────────────────────────────────────────
+
+/** Build the user prompt carrying the failure context (recurrences + fixes). */
 export function buildDistillPrompt(c: DistillableCluster): string {
-  const fixes = c.fixTexts.map((t, i) => `  ${i + 1}. ${t}`).join("\n");
+  const n = c.bugTexts.length;
+  const recurrenceLines = c.bugTexts
+    .map((t, i) => `  RECURRENCE ${i + 1}: ${t}`)
+    .join("\n");
+
+  const fixSection =
+    c.fixTexts.length > 0
+      ? c.fixTexts.map((t, i) => `  ${i + 1}. ${t}`).join("\n")
+      : "  (unknown — the resolution was not captured)";
+
   return (
     `Project: ${c.project || "(unspecified)"}\n` +
-    `BUG (the failure):\n  ${c.bugText}\n` +
-    `FIX(es) (how it was resolved):\n${fixes}\n\n` +
+    `FAILURE CLASS — ${n} recurrence(s) across different sessions:\n` +
+    recurrenceLines + "\n\n" +
+    `KNOWN FIX(ES) (how at least one recurrence was resolved):\n` +
+    fixSection + "\n\n" +
     `Distill the single reusable lesson as STRICT JSON.`
   );
 }
+
+// ── JSON parsing helpers ───────────────────────────────────────────────────────
 
 /** Extract the first balanced JSON object from a model response (handles fences/prose). */
 function extractJsonObject(raw: string): string | null {
@@ -88,6 +121,8 @@ function stringArray(v: unknown): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
 }
 
+// ── Parser ─────────────────────────────────────────────────────────────────────
+
 /** Parse a model response into a DistilledLesson, or null if invalid. */
 export function parseDistilledLesson(raw: string): DistilledLesson | null {
   if (!raw || !raw.trim()) return null;
@@ -100,17 +135,19 @@ export function parseDistilledLesson(raw: string): DistilledLesson | null {
     return null;
   }
   const domain = typeof obj.domain === "string" ? obj.domain.trim() : "";
-  const triggerPattern = typeof obj.trigger_pattern === "string" ? obj.trigger_pattern.trim() : "";
   const lessonText = typeof obj.lesson_text === "string" ? obj.lesson_text.trim() : "";
-  if (!domain || !triggerPattern || !lessonText) return null;
+  // trigger_pattern is intentionally ignored if present in the LLM response —
+  // the runner derives it from canonicalTrigger(clusterTrigger(...)).
+  if (!domain || !lessonText) return null;
   return {
     domain,
-    triggerPattern,
     lessonText,
     antiPatterns: stringArray(obj.anti_patterns),
     confidence: clamp01(obj.confidence),
   };
 }
+
+// ── Distiller ──────────────────────────────────────────────────────────────────
 
 export interface DistillOptions {
   timeoutMs?: number;

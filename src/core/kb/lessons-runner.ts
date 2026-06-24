@@ -1,23 +1,18 @@
 /**
- * Lessons orchestrator (Phase B, B1+) — ties cross-session clustering to the
- * LLM distiller and the writer.
+ * Lessons orchestrator (Phase B, B2a+) — clusters → trigger → distill → write.
  *
- * Flow per FailureCluster:
- *   1. Skip if any bug event already covered by a lesson (dedup by event id).
- *   2. Build a DistillableCluster from the cluster's bugTexts.
- *   3. Distill via the LLM (skip on null — never throws).
- *   4. Write: insert new HEAD when (domain, trigger) is new; otherwise
- *      "accept-if-improves" — supersede old HEAD only when the new lesson
- *      scores higher (v1: confidence; eval-set scoring lands at B3).
- *
- * evidence_count = cluster.bugEventIds.length (distinct cross-session bugs).
- * Async + LLM, but the runner is injected → unit-testable offline.
+ * B2a: trigger_pattern = canonicalTrigger(clusterTrigger(...)), never LLM text.
+ * Fix texts from fixed-by/caused relations only (not bugTexts.slice(1)).
+ * DB helpers in lessons-runner-db.ts.
  */
 
 import type { DatabaseSync } from "node:sqlite";
 import type { LLMRunner } from "../types.js";
 import { selectFailureClusters, type FailureCluster } from "./bug-clusters.js";
 import type { EmbeddingReader } from "./bug-embeddings.js";
+import { extractErrorSignatures } from "./error-signature-extractor.js";
+import { clusterTrigger, canonicalTrigger, type PerBugBreakdown } from "./lesson-trigger.js";
+import { loadEntityMap, resolvePerBugFiles, loadFixTexts } from "./lessons-runner-db.js";
 import {
   distillLesson,
   type DistillableCluster,
@@ -52,7 +47,8 @@ export interface LessonsRunStats {
   skippedNotImproved: number;
 }
 
-/** Has any lesson already recorded ANY of this cluster's bug event ids? (dedup) */
+// ── Dedup ─────────────────────────────────────────────────────────────────────
+
 function clusterAlreadyCovered(db: DatabaseSync, bugEventIds: readonly string[]): boolean {
   for (const id of bugEventIds) {
     const row = db
@@ -63,16 +59,102 @@ function clusterAlreadyCovered(db: DatabaseSync, bugEventIds: readonly string[])
   return false;
 }
 
-/** Map a FailureCluster to a minimal DistillableCluster for the prompt. */
-function toDistillable(cluster: FailureCluster): DistillableCluster {
+// ── Distillable adapter ───────────────────────────────────────────────────────
+
+function toDistillable(cluster: FailureCluster, fixTexts: string[]): DistillableCluster {
   return {
     project: cluster.project,
-    bugText: cluster.bugTexts[0] ?? "",
-    // Remaining bug recurrences are treated as "fix texts" to give the LLM full
-    // context. B2 will replace this with a proper trigger fingerprint prompt.
-    fixTexts: cluster.bugTexts.slice(1),
+    bugTexts: [...cluster.bugTexts],
+    fixTexts,
   };
 }
+
+// ── Cluster processor ─────────────────────────────────────────────────────────
+
+async function processCluster(
+  db: DatabaseSync,
+  llmRunner: LLMRunner,
+  params: DistillLessonsParams,
+  cluster: FailureCluster,
+  stats: LessonsRunStats,
+): Promise<void> {
+  if (clusterAlreadyCovered(db, cluster.bugEventIds)) {
+    stats.skippedDuplicate += 1;
+    return;
+  }
+
+  // Per-bug breakdowns for canonical trigger computation
+  const entityMapRaw = loadEntityMap(db, cluster.bugEventIds);
+  const perBugFiles = resolvePerBugFiles(db, cluster.bugEventIds, entityMapRaw);
+
+  const breakdowns: PerBugBreakdown[] = cluster.bugEventIds.map((bugId, i) => ({
+    bugEventId: bugId,
+    files: perBugFiles.get(bugId) ?? [],
+    errorSignatures: extractErrorSignatures(cluster.bugTexts[i] ?? ""),
+    // taskType: live events have no task_type field (honesty-check: spec §2)
+    taskType: "",
+  }));
+
+  const triggerFp = clusterTrigger(cluster, breakdowns);
+  const triggerPattern = canonicalTrigger(triggerFp);
+
+  // Fix texts from relations (NOT bugTexts.slice(1) — those are recurrences).
+  // Pass entityMapRaw so loadFixTexts can traverse ent_* relation endpoints
+  // without an extra DB query (the map is already built above).
+  const fixTexts = loadFixTexts(db, cluster.bugEventIds, entityMapRaw);
+
+  const distilled = await distillLesson(
+    toDistillable(cluster, fixTexts),
+    llmRunner,
+    params.distill,
+  );
+  if (!distilled) {
+    stats.skippedUndistillable += 1;
+    return;
+  }
+  stats.distilled += 1;
+
+  const head = queryHeadLessonByTrigger(db, {
+    namespace: cluster.namespace,
+    domain: distilled.domain,
+    triggerPattern,
+  });
+
+  if (head && distilled.confidence <= head.confidence) {
+    stats.skippedNotImproved += 1;
+    return;
+  }
+
+  const inserted = insertLesson(
+    db,
+    {
+      namespace: cluster.namespace,
+      project: cluster.project,
+      domain: distilled.domain,
+      triggerPattern,
+      lessonText: distilled.lessonText,
+      antiPatterns: distilled.antiPatterns,
+      evidenceEventIds: cluster.bugEventIds,
+      confidence: distilled.confidence,
+      version: head ? head.version + 1 : 1,
+      provenance: {
+        sessionKeys: cluster.sessionKeys,
+        source: "phase-b2a-cluster-distiller",
+      },
+      now: params.now,
+    },
+    params.nowMs,
+  );
+
+  if (head) {
+    supersedeLesson(db, head.id, inserted.id, params.now);
+    stats.superseded += 1;
+  } else {
+    stats.inserted += 1;
+  }
+}
+
+// ── Main export ───────────────────────────────────────────────────────────────
 
 /**
  * Run one lesson-distillation pass over cross-session failure clusters. Returns
@@ -105,58 +187,10 @@ export async function distillLessons(
   stats.candidates = clusters.length;
 
   for (const cluster of clusters) {
-    if (clusterAlreadyCovered(db, cluster.bugEventIds)) {
-      stats.skippedDuplicate += 1;
-      continue;
-    }
-
-    const distilled = await distillLesson(toDistillable(cluster), llmRunner, params.distill);
-    if (!distilled) {
+    try {
+      await processCluster(db, llmRunner, params, cluster, stats);
+    } catch {
       stats.skippedUndistillable += 1;
-      continue;
-    }
-    stats.distilled += 1;
-
-    const head = queryHeadLessonByTrigger(db, {
-      namespace: cluster.namespace,
-      domain: distilled.domain,
-      triggerPattern: distilled.triggerPattern,
-    });
-
-    // accept-if-improves: only replace an existing HEAD when the new lesson
-    // scores higher. v1 score = confidence; eval-set scoring lands at B3.
-    if (head && distilled.confidence <= head.confidence) {
-      stats.skippedNotImproved += 1;
-      continue;
-    }
-
-    // evidence_count = number of distinct bug events in the cross-session cluster.
-    const inserted = insertLesson(
-      db,
-      {
-        namespace: cluster.namespace,
-        project: cluster.project,
-        domain: distilled.domain,
-        triggerPattern: distilled.triggerPattern,
-        lessonText: distilled.lessonText,
-        antiPatterns: distilled.antiPatterns,
-        evidenceEventIds: cluster.bugEventIds,
-        confidence: distilled.confidence,
-        version: head ? head.version + 1 : 1,
-        provenance: {
-          sessionKeys: cluster.sessionKeys,
-          source: "phase-b1-cluster-distiller",
-        },
-        now: params.now,
-      },
-      params.nowMs,
-    );
-
-    if (head) {
-      supersedeLesson(db, head.id, inserted.id, params.now);
-      stats.superseded += 1;
-    } else {
-      stats.inserted += 1;
     }
   }
 
