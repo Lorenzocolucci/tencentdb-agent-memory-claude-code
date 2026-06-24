@@ -1,5 +1,6 @@
 # 🏛️ SINAPSYS — Foundations Blueprint (le fondamenta che reggono tutto l'edificio)
-> v1 — 24 giugno 2026 — Lorenzo + Socio. Da validare PRIMA di scrivere il codice dello schema.
+> v1 — 24 giugno 2026 — Lorenzo + Socio. Schema validato e COSTRUITO.
+> **STATO 2026-06-24 sera:** fondamenta LIVE · Fase A live · Fase B **B1 (`a3c81c4`) + B2a (`2a4cc5c`) costruite e live**. Dettaglio moduli/stato: `docs/superpowers/specs/2026-06-24-track-b-mistake-notebook-design.md` + `docs/HANDOFF-2026-06-24-trackB.md`.
 > Principio: ogni fase futura (A→E) e ogni angolo vendibile si aggancia a queste fondamenta SENZA demolire. Tutto additivo (`IF NOT EXISTS` / `ALTER TABLE ADD COLUMN`), stile `initKbSchema()` esistente. Il KB live non si rompe mai.
 
 ---

@@ -1,6 +1,6 @@
 # Track B — Deep Mistake Notebook (L3) — Design Spec
 
-> Date: 2026-06-24 · Branch: `feat/memory-excellence` · Status: DESIGN (no code until approved)
+> Date: 2026-06-24 · Branch: `feat/memory-excellence` · Status: **B1 + B2a BUILT & LIVE** (commits `a3c81c4`, `2a4cc5c`; suite 304 green); B2b (live injection wiring) + B3 remaining
 > Scope decided with Lorenzo: design the full arc **B1 + B2 + B3** in one spec, build in slices starting B1.
 > Read first: blueprint Idea 3 / Fase 4 (`C:\Sinapsys\01-vision-and-plan\MEMORIA-BLUEPRINT.md`),
 > cards `sinapsys-phase-b-direction`, `sinapsys-dual-track-direction`.
