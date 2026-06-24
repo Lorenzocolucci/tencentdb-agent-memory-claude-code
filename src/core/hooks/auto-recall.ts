@@ -21,6 +21,7 @@ import { buildFtsQuery } from "../store/sqlite.js";
 import type { EmbeddingService, EmbeddingCallOptions } from "../store/embedding.js";
 import { sanitizeText, escapeXmlTags } from "../../utils/sanitize.js";
 import { kbRecall, type KbRecallResult } from "../kb/retrieval.js";
+import { loadPrinciples, formatPrinciplesBlock } from "./principles.js";
 
 const TAG = "[memory-tdai] [recall]";
 
@@ -274,6 +275,13 @@ async function performAutoRecallInner(params: {
   //   L1 relevant memories — different every turn, moved out of system prompt
   //   so it doesn't bust the system prompt cache.
   const stableParts: string[] = [];
+  // Track A slice 2 — the binding project principles (the WHY) go FIRST, before
+  // persona/scene, framed as binding (not "for reference only" like facts). This
+  // is the fix to "forgot the vision": the north-star is now injected with force.
+  const principles = await loadPrinciples(pluginDataDir);
+  if (principles) {
+    stableParts.push(formatPrinciplesBlock(principles));
+  }
   if (personaContent) {
     // personaContent is ALREADY escaped at write time (persona-generator.ts:203
     // calls escapeXmlTags before saving persona.md). Do NOT escape again here —
