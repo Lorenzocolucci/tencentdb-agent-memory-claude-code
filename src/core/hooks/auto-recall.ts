@@ -23,6 +23,7 @@ import { sanitizeText, escapeXmlTags } from "../../utils/sanitize.js";
 import { redactSecrets } from "../../utils/redact-secrets.js";
 import { kbRecall, type KbRecallResult } from "../kb/retrieval.js";
 import { loadPrinciples, formatPrinciplesBlock } from "./principles.js";
+import { buildSessionBanner, type SessionBannerTracker } from "./session-banner.js";
 
 const TAG = "[memory-tdai] [recall]";
 
@@ -135,6 +136,8 @@ export interface RecallResult {
   recalledL3Persona?: string | null;
   /** Effective search strategy used */
   recallStrategy?: string;
+  /** True when this result includes the session-open banner (caller commits the tracker slot). */
+  bannerEmitted?: boolean;
 }
 
 export async function performAutoRecall(params: {
@@ -148,6 +151,8 @@ export async function performAutoRecall(params: {
   logger?: Logger;
   vectorStore?: IMemoryStore;
   embeddingService?: EmbeddingService;
+  /** When provided, prepends the session-open banner on the first turn of each sessionKey. */
+  bannerTracker?: SessionBannerTracker;
 }): Promise<RecallResult | undefined> {
   const { cfg, logger } = params;
   const timeoutMs = cfg.recall.timeoutMs ?? 5000;
@@ -179,8 +184,9 @@ async function performAutoRecallInner(params: {
   logger?: Logger;
   vectorStore?: IMemoryStore;
   embeddingService?: EmbeddingService;
+  bannerTracker?: SessionBannerTracker;
 }): Promise<RecallResult | undefined> {
-  const { userText, cfg, pluginDataDir, projectName, logger, vectorStore, embeddingService } = params;
+  const { userText, cfg, pluginDataDir, projectName, logger, vectorStore, embeddingService, bannerTracker } = params;
   const tRecallStart = performance.now();
 
   // Search relevant memories (L1 layer) — skip only when userText is empty/undefined
@@ -243,9 +249,11 @@ async function performAutoRecallInner(params: {
   // Load full scene navigation (L2 layer)
   const tSceneStart = performance.now();
   let sceneNavigation: string | undefined;
+  let sceneCount = 0;
   try {
     const sceneIndex = await readSceneIndex(pluginDataDir);
     if (sceneIndex.length > 0) {
+      sceneCount = sceneIndex.length;
       sceneNavigation = generateSceneNavigation(sceneIndex, pluginDataDir);
       logger?.debug?.(`${TAG} Scene navigation generated: ${sceneIndex.length} scenes`);
     }
@@ -316,6 +324,27 @@ async function performAutoRecallInner(params: {
       `<relevant-memories>\n以下是当前对话召回的相关记忆，不代表当前任务进程，仅作为参考：\n\n${safeMemoryLines.join("\n")}\n</relevant-memories>`;
   }
 
+  // Session-open banner: inject instruction on FIRST turn of each sessionKey.
+  // PEEK only (pending) — the caller commits the slot (markEmitted) after this
+  // result is actually returned, so a timed-out recall never burns the banner.
+  // Wrapped so any error is swallowed — the banner must never break a turn.
+  let bannerEmitted = false;
+  if (bannerTracker?.pending(params.sessionKey)) {
+    try {
+      const recentEventText = resolveRecentEventText(vectorStore);
+      const banner = buildSessionBanner({
+        projectName,
+        personaLoaded: personaContent !== undefined,
+        sceneCount,
+        recentEventText,
+      });
+      prependContext = prependContext ? `${banner}\n\n${prependContext}` : banner;
+      bannerEmitted = true;
+    } catch {
+      // Banner errors are silently swallowed — memory must never block the turn.
+    }
+  }
+
   // Append memory tools usage guide to the stable part so the agent knows
   // how to actively retrieve deeper context when the injected snippets
   // are not enough. This is static content and benefits from caching.
@@ -345,7 +374,31 @@ async function performAutoRecallInner(params: {
     recalledL1Memories,
     recalledL3Persona: personaContent ?? null,
     recallStrategy: effectiveStrategy,
+    bannerEmitted,
   };
+}
+
+// ============================
+// Session-open banner helpers
+// ============================
+
+/**
+ * Return the text of the single most-recent KB event (if the store supports it
+ * and has data). Returns undefined when unavailable — the banner omits the
+ * "ultimo:" segment gracefully.
+ *
+ * Deliberately NOT async: listRecentEvents is a sync SQLite read (MaybePromise
+ * returning the value directly). If the method is absent or throws, returns
+ * undefined without blocking the turn.
+ */
+function resolveRecentEventText(vectorStore?: IMemoryStore): string | undefined {
+  if (!vectorStore?.listRecentEvents) return undefined;
+  try {
+    const events = vectorStore.listRecentEvents("default", { limit: 1 });
+    return events[0]?.text || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // ============================

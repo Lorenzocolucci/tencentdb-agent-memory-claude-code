@@ -44,6 +44,7 @@ import { inferTaskType } from "./hooks/task-type.js";
 import { buildSituationInjection } from "./hooks/fingerprint-injection.js";
 import { canonicalKey } from "./kb/kb-queries.js";
 import { performAutoRecall } from "./hooks/auto-recall.js";
+import { SessionBannerTracker } from "./hooks/session-banner.js";
 import { performAutoCapture } from "./hooks/auto-capture.js";
 import { executeMemorySearch, formatSearchResponse } from "./tools/memory-search.js";
 import { executeConversationSearch, formatConversationSearchResponse } from "./tools/conversation-search.js";
@@ -158,6 +159,12 @@ export class TdaiCore {
    * across both injection paths. Cleared in {@link handleSessionEnd}.
    */
   private readonly injectedOwnersBySession = new Map<string, Set<string>>();
+
+  /**
+   * Tracks which sessionKeys have already fired the session-open banner.
+   * One TRUE per sessionKey per process lifetime (in-memory, long-lived).
+   */
+  private readonly bannerTracker = new SessionBannerTracker();
 
   constructor(opts: TdaiCoreOptions) {
     this.hostAdapter = opts.hostAdapter;
@@ -295,7 +302,15 @@ export class TdaiCore {
       logger: this.logger,
       vectorStore: this.vectorStore,
       embeddingService: this.embeddingService,
+      bannerTracker: this.bannerTracker,
     });
+
+    // Commit the banner slot ONLY after a real (non-timed-out) result actually
+    // carried it, so a slow/timed-out first turn retries the banner next turn
+    // instead of permanently losing it (the once-per-session guarantee).
+    if (result?.bannerEmitted) {
+      this.bannerTracker.markEmitted(sessionKey);
+    }
 
     return result ?? {};
   }
