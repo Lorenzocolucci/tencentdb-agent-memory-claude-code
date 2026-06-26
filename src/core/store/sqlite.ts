@@ -2012,17 +2012,37 @@ export class VectorStore implements IMemoryStore {
   async reindexAll(
     embedFn: (text: string) => Promise<Float32Array | Float32Array[]>,
     onProgress?: (done: number, total: number, layer: "L1" | "L0") => void,
+    opts?: { resume?: boolean },
   ): Promise<{ l1Count: number; l0Count: number }> {
     if (this.degraded || !this.vecTablesReady) {
       if (this.degraded) this.logger?.warn(`${TAG} reindexAll skipped: VectorStore is in degraded mode`);
       return { l1Count: 0, l0Count: 0 };
     }
 
+    // Resume mode: skip records that ALREADY have ≥1 chunk vector, so a reindex
+    // killed mid-run can be re-run and only embeds the still-missing tail (each
+    // run advances the frontier; progress accumulates). Building the skip-set is
+    // best-effort — if the DISTINCT query fails it degrades to a full reindex.
+    const buildEmbeddedSet = (table: "l1_vec" | "l0_vec"): Set<string> | null => {
+      if (!opts?.resume) return null;
+      try {
+        const rows = this.db.prepare(`SELECT DISTINCT record_id FROM ${table}`).all() as Array<{ record_id: string }>;
+        const set = new Set(rows.map((r) => r.record_id));
+        this.logger?.info(`${TAG} reindex resume: ${set.size} ${table} records already embedded → will be skipped`);
+        return set;
+      } catch (err) {
+        this.logger?.warn?.(`${TAG} reindex resume: could not read embedded ${table} (full reindex): ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      }
+    };
+
     try {
       // ── Re-embed L1 ──
       const l1Rows = this.getAllL1Texts();
+      const embeddedL1 = buildEmbeddedSet("l1_vec");
       let l1Done = 0;
       for (const { record_id, content, updated_time } of l1Rows) {
+        if (embeddedL1?.has(record_id)) { l1Done++; onProgress?.(l1Done, l1Rows.length, "L1"); continue; }
         try {
           const chunkVectors = VectorStore.toChunkVectors(await embedFn(content));
           // Wrap delete+insert in a transaction to prevent orphan vectors.
@@ -2054,8 +2074,10 @@ export class VectorStore implements IMemoryStore {
 
       // ── Re-embed L0 ──
       const l0Rows = this.getAllL0Texts();
+      const embeddedL0 = buildEmbeddedSet("l0_vec");
       let l0Done = 0;
       for (const { record_id, message_text, recorded_at } of l0Rows) {
+        if (embeddedL0?.has(record_id)) { l0Done++; onProgress?.(l0Done, l0Rows.length, "L0"); continue; }
         try {
           const chunkVectors = VectorStore.toChunkVectors(await embedFn(message_text));
           // Wrap delete+insert in a transaction to prevent orphan vectors.

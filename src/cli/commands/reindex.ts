@@ -39,6 +39,8 @@ export interface ReindexCommandOptions {
   configFile?: string;
   /** Override the live-gateway safety guard and reindex anyway. */
   force: boolean;
+  /** Resume mode: skip records that already have ≥1 chunk vector (embed only the missing tail). */
+  resume?: boolean;
 }
 
 /**
@@ -51,6 +53,7 @@ export function registerReindexCommand(parent: Command, ctx: SeedCliContext): vo
     .requiredOption('--data-dir <dir>', 'Plugin data directory that contains vectors.db')
     .option('--config <file>', 'Path to memory-tdai config override file (JSON, deep-merged on top of current plugin config)')
     .option('--force', 'Reindex even if the gateway appears to be running on the same DB (UNSAFE — can lose vectors / crash the gateway)', false)
+    .option('--resume', 'Skip records that already have vectors — only embed the missing tail (safe to re-run after an interrupted reindex)', false)
     .addHelpText('after', `
 Examples:
   openclaw memory-tdai reindex --data-dir ~/.openclaw/memory-tdai
@@ -68,6 +71,7 @@ Notes:
         dataDir: rawOpts.dataDir as string,
         configFile: rawOpts.config as string | undefined,
         force: rawOpts.force === true,
+        resume: rawOpts.resume === true,
       };
       await runReindexCommand(opts, ctx);
     });
@@ -189,6 +193,7 @@ export async function runReindexCommand(opts: ReindexCommandOptions, ctx: SeedCl
       const pct = total > 0 ? ((done / total) * 100).toFixed(0) : '100';
       process.stdout.write(`\r  [${layer}] ${done}/${total} ${pct}%    `);
     },
+    { resume: opts.resume === true },
   );
 
   // Release resources.

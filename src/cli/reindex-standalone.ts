@@ -60,6 +60,7 @@ interface ParsedArgs {
   dataDir?: string;
   configFile?: string;
   force: boolean;
+  resume: boolean;
 }
 
 /**
@@ -68,7 +69,7 @@ interface ParsedArgs {
  * installed in the standalone environment this entry targets.
  */
 function parseArgs(argv: readonly string[]): ParsedArgs {
-  const out: ParsedArgs = { force: false };
+  const out: ParsedArgs = { force: false, resume: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     switch (arg) {
@@ -80,6 +81,9 @@ function parseArgs(argv: readonly string[]): ParsedArgs {
         break;
       case "--force":
         out.force = true;
+        break;
+      case "--resume":
+        out.resume = true;
         break;
       case "--help":
       case "-h":
@@ -153,6 +157,7 @@ async function main(): Promise<void> {
     dataDir,
     configFile: args.configFile,
     force: args.force,
+    resume: args.resume,
   };
 
   await runReindexCommand(opts, ctx);
