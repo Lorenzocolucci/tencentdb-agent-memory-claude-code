@@ -279,6 +279,41 @@ describe("performAutoRecall — session-open banner integration", () => {
     expect(r2?.prependContext?.includes("<session-open-banner>") ?? false).toBe(false);
   });
 
+  it("keys the banner on sessionId — distinct sessions sharing a sessionKey each get one", async () => {
+    // The bug this guards: sessionKey is STABLE per project across many cc
+    // sessions, so keying the banner on sessionKey fires it once per
+    // gateway-process-lifetime (≈ never re-fires). cc gives a fresh session_id
+    // per session — keying on it makes the banner fire once per real session.
+    const tracker = new SessionBannerTracker();
+    const base = {
+      userText: "what do you remember about me?",
+      actorId: "actor-1",
+      sessionKey: "sess-integration",
+      cfg,
+      pluginDataDir: dir,
+      logger: silentLogger,
+      vectorStore: store,
+      embeddingService: fakeEmbeddingService,
+      bannerTracker: tracker,
+    };
+
+    // Session A — first turn emits; caller commits with the SAME key it peeked.
+    const a1 = await performAutoRecall({ ...base, sessionId: "sid-A" });
+    expect(a1?.bannerEmitted, "session A first turn must emit").toBe(true);
+    tracker.markEmitted("sid-A");
+
+    // Session A again — slot consumed, no re-emit.
+    const a2 = await performAutoRecall({ ...base, sessionId: "sid-A" });
+    expect(a2?.bannerEmitted ?? false, "same session must not re-emit").toBe(false);
+
+    // Session B — NEW session_id, SAME sessionKey (same project) — must emit.
+    const b1 = await performAutoRecall({ ...base, sessionId: "sid-B" });
+    expect(
+      b1?.bannerEmitted,
+      "a new session under the same project must re-emit the banner",
+    ).toBe(true);
+  });
+
   it("PEEKS only — without markEmitted the banner re-appears (timeout-loss safe)", async () => {
     // Simulates a first turn whose result is DISCARDED (e.g. recall timeout):
     // the caller never calls markEmitted, so the banner must retry next turn

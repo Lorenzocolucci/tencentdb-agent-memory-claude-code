@@ -41,6 +41,8 @@ export interface RecallRequest {
   user_id?: string;
   /** Project the session is in (basename of cwd) — selects per-project principles. */
   project?: string;
+  /** cc session id (changes per session) — session-open banner once-per-session key. */
+  session_id?: string;
 }
 
 export interface RecallResponse {

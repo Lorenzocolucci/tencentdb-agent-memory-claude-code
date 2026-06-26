@@ -100,7 +100,9 @@ async function handleUserPromptSubmit(data: HookStdin, client: GatewayClient): P
   const project = getProjectName(cwd);
 
   // Primary path: L1/L2/L3 recall (structured atoms + persona + scene).
-  const recall = await client.recall(prompt, sessionKey, project);
+  // Pass cc's session_id so the session-open banner fires once per real session
+  // (sessionKey is stable per project and would fire it ~once per gateway boot).
+  const recall = await client.recall(prompt, sessionKey, project, data.session_id);
   let context = recall.context ?? "";
 
   // Fallback 1: daemon /search/conversations (FTS5 BM25 on L0 table).

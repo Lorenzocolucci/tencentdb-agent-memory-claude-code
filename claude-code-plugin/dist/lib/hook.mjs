@@ -81,13 +81,14 @@ var GatewayClient = class {
 			return false;
 		}
 	}
-	async recall(query, sessionKey, project) {
+	async recall(query, sessionKey, project, sessionId) {
 		try {
 			const token = await this.freshToken();
 			const { status, body } = await this.rawRequest("POST", "/recall", {
 				query,
 				session_key: sessionKey,
-				project
+				project,
+				session_id: sessionId
 			}, token, RECALL_TIMEOUT_MS);
 			if (status !== 200) {
 				await this.logFailure("POST", "/recall", this.describeStatus(status, body));
@@ -652,7 +653,7 @@ async function handleUserPromptSubmit(data, client) {
 	if (!prompt) return "";
 	const sessionKey = getSessionKey(cwd);
 	const project = getProjectName(cwd);
-	let context = (await client.recall(prompt, sessionKey, project)).context ?? "";
+	let context = (await client.recall(prompt, sessionKey, project, data.session_id)).context ?? "";
 	if (!context) {
 		const conv = await client.searchConversations(prompt, {
 			limit: 3,

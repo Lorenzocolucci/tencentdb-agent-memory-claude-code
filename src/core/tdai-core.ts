@@ -289,6 +289,7 @@ export class TdaiCore {
     userText: string,
     sessionKey: string,
     projectName?: string,
+    sessionId?: string,
   ): Promise<RecallResult> {
     await this.storeReady?.catch(() => {});
 
@@ -299,6 +300,7 @@ export class TdaiCore {
       cfg: this.cfg,
       pluginDataDir: this.dataDir,
       projectName,
+      sessionId,
       logger: this.logger,
       vectorStore: this.vectorStore,
       embeddingService: this.embeddingService,
@@ -308,8 +310,9 @@ export class TdaiCore {
     // Commit the banner slot ONLY after a real (non-timed-out) result actually
     // carried it, so a slow/timed-out first turn retries the banner next turn
     // instead of permanently losing it (the once-per-session guarantee).
+    // Key MUST match the one performAutoRecall peeked (sessionId ?? sessionKey).
     if (result?.bannerEmitted) {
-      this.bannerTracker.markEmitted(sessionKey);
+      this.bannerTracker.markEmitted(sessionId ?? sessionKey);
     }
 
     return result ?? {};

@@ -24,6 +24,10 @@ import { redactSecrets } from "../../utils/redact-secrets.js";
 import { kbRecall, type KbRecallResult } from "../kb/retrieval.js";
 import { loadPrinciples, formatPrinciplesBlock } from "./principles.js";
 import { buildSessionBanner, type SessionBannerTracker } from "./session-banner.js";
+import {
+  buildCornerstones,
+  type CornerstoneInjectionTracker,
+} from "../distinctiveness/cornerstone-runner.js";
 
 const TAG = "[memory-tdai] [recall]";
 
@@ -148,11 +152,23 @@ export async function performAutoRecall(params: {
   pluginDataDir: string;
   /** Project the session is in (basename of cwd) — selects per-project principles. */
   projectName?: string;
+  /**
+   * Claude Code session id — CHANGES every new session (unlike sessionKey, which
+   * is stable per project). Used as the banner's once-per-session key so the
+   * "sul pezzo" banner re-fires on each new session, not once per gateway
+   * process. Falls back to sessionKey when absent (older hook / non-cc caller).
+   */
+  sessionId?: string;
   logger?: Logger;
   vectorStore?: IMemoryStore;
   embeddingService?: EmbeddingService;
-  /** When provided, prepends the session-open banner on the first turn of each sessionKey. */
+  /** When provided, prepends the session-open banner on the first turn of each session. */
   bannerTracker?: SessionBannerTracker;
+  /**
+   * When provided, injects the cornerstone memory block (Idea 5: Distinctiveness Scorer)
+   * alongside the heat-ranked scenes at session start.
+   */
+  cornerstoneTracker?: CornerstoneInjectionTracker;
 }): Promise<RecallResult | undefined> {
   const { cfg, logger } = params;
   const timeoutMs = cfg.recall.timeoutMs ?? 5000;
@@ -181,12 +197,14 @@ async function performAutoRecallInner(params: {
   cfg: MemoryTdaiConfig;
   pluginDataDir: string;
   projectName?: string;
+  sessionId?: string;
   logger?: Logger;
   vectorStore?: IMemoryStore;
   embeddingService?: EmbeddingService;
   bannerTracker?: SessionBannerTracker;
+  cornerstoneTracker?: CornerstoneInjectionTracker;
 }): Promise<RecallResult | undefined> {
-  const { userText, cfg, pluginDataDir, projectName, logger, vectorStore, embeddingService, bannerTracker } = params;
+  const { userText, cfg, pluginDataDir, projectName, logger, vectorStore, embeddingService, bannerTracker, cornerstoneTracker } = params;
   const tRecallStart = performance.now();
 
   // Search relevant memories (L1 layer) — skip only when userText is empty/undefined
@@ -312,6 +330,22 @@ async function performAutoRecallInner(params: {
     stableParts.push(`<scene-navigation>\n${escapeXmlTags(sceneNavigation)}\n</scene-navigation>`);
   }
 
+  // Idea 5: Distinctiveness Scorer — inject top-K cornerstone memories ALONGSIDE
+  // the heat-ranked scenes (not replacing them). Only active when a
+  // cornerstoneTracker is provided so the feature is opt-in per deployment.
+  // Fully fault-tolerant: buildCornerstones swallows all errors and returns "".
+  if (cornerstoneTracker && vectorStore) {
+    const cornerstoneBlock = await buildCornerstones({
+      vectorStore,
+      embeddingService,
+      injectionTracker: cornerstoneTracker,
+      logger,
+    });
+    if (cornerstoneBlock) {
+      stableParts.push(cornerstoneBlock);
+    }
+  }
+
   // Dynamic part: L1 relevant memories (changes every turn) → prependContext (user prompt)
   let prependContext: string | undefined;
   if (memoryLines.length > 0) {
@@ -324,12 +358,16 @@ async function performAutoRecallInner(params: {
       `<relevant-memories>\n以下是当前对话召回的相关记忆，不代表当前任务进程，仅作为参考：\n\n${safeMemoryLines.join("\n")}\n</relevant-memories>`;
   }
 
-  // Session-open banner: inject instruction on FIRST turn of each sessionKey.
+  // Session-open banner: inject instruction on FIRST turn of each SESSION.
+  // Keyed on sessionId (changes per session) with a sessionKey fallback — keying
+  // on sessionKey alone fired the banner once per gateway-process lifetime
+  // (sessionKey is stable per project), so it effectively never re-fired.
   // PEEK only (pending) — the caller commits the slot (markEmitted) after this
   // result is actually returned, so a timed-out recall never burns the banner.
   // Wrapped so any error is swallowed — the banner must never break a turn.
+  const bannerKey = params.sessionId ?? params.sessionKey;
   let bannerEmitted = false;
-  if (bannerTracker?.pending(params.sessionKey)) {
+  if (bannerTracker?.pending(bannerKey)) {
     try {
       const recentEventText = resolveRecentEventText(vectorStore);
       const banner = buildSessionBanner({
