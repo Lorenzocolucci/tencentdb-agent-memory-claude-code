@@ -51,8 +51,9 @@ import type {
 } from "./types.js";
 import { queryHeadLessonsByFile as kbQueryHeadLessonsByFile } from "../kb/lessons-writer.js";
 import { distillLessons as kbDistillLessons } from "../kb/lessons-runner.js";
-import { ensureLifecycle, confirmProvenance } from "../kb/lifecycle-writer.js";
-import { serializeProvenance, type ProvenanceStamp } from "../kb/provenance.js";
+import { ensureLifecycle, confirmProvenance, rejectProvenance, markGatePending, getLifecycle } from "../kb/lifecycle-writer.js";
+import { serializeProvenance, parseProvenance, gateStateOf, type ProvenanceStamp } from "../kb/provenance.js";
+import { classifyStakes, shouldGate } from "../kb/stakes.js";
 import type { LLMRunner } from "../types.js";
 import {
   resolveOrCreateEntity as kbResolveOrCreateEntity,
@@ -2091,6 +2092,121 @@ export class VectorStore implements IMemoryStore {
         `[memory-tdai][provenance] confirmMemory failed for ${params.ownerKind} ${params.ownerId} ` +
           `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
       );
+    }
+  }
+
+  /**
+   * Tombstone a memory as rejected (Lorenzo said NO to the gate question). Marks
+   * its provenance `rejected` (kept, never hard-deleted) + writes the audit trail.
+   * When a `factId` is given, drops that fact from the HEAD set (valid_to = now) so
+   * it stops driving action while the row itself survives. One transaction.
+   */
+  rejectMemory(params: {
+    ownerId: string;
+    ownerKind: "fact" | "event";
+    now: string;
+    factId?: string;
+  }): void {
+    try {
+      this.db.prepare("BEGIN").run();
+      try {
+        rejectProvenance(this.db, {
+          ownerId: params.ownerId,
+          ownerKind: params.ownerKind,
+          now: params.now,
+        });
+        if (params.factId) {
+          this.db
+            .prepare("UPDATE facts SET valid_to = ? WHERE id = ?")
+            .run(params.now, params.factId);
+        }
+        this.db.prepare("COMMIT").run();
+      } catch (txErr) {
+        try { this.db.prepare("ROLLBACK").run(); } catch { /* ignore */ }
+        throw txErr;
+      }
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][provenance] rejectMemory failed for ${params.ownerKind} ${params.ownerId} ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Mark a memory as pending the ask-loop (Phase 2 gate). Off the critical path:
+   * failures are swallowed + logged. Never re-gates an already pending/rejected unit.
+   */
+  gateMemory(params: {
+    ownerId: string;
+    ownerKind: "fact" | "event";
+    now: string;
+    stakes: "none" | "high";
+    stakesDomain:
+      | "payment" | "credential" | "destructive" | "prod" | "exfil" | "vision" | null;
+  }): void {
+    try {
+      markGatePending(this.db, {
+        ownerId: params.ownerId,
+        ownerKind: params.ownerKind,
+        now: params.now,
+        stakes: params.stakes,
+        stakesDomain: params.stakesDomain,
+      });
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][provenance] gateMemory failed for ${params.ownerKind} ${params.ownerId} ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Recall-time stakes gate (Phase 2 wiring). For each recalled unit, classify
+   * stakes and — if it is unverified, high-stakes, and not yet handled — mark it
+   * pending the ask-loop. This NEVER removes a unit from injection (the soul stays
+   * intact: trust gates ACTION, not injection); it only writes the gate state as a
+   * side effect. Best-effort: off the critical path, each unit isolated, all errors
+   * swallowed + logged. `eventType`/`distinctiveness` are optional — when present
+   * (future recall plumbing) the vision branch activates with no change here.
+   */
+  gateRecalledUnits(
+    units: ReadonlyArray<{
+      owner_id: string;
+      owner_kind: "fact" | "event";
+      text: string;
+      eventType?: string;
+      distinctiveness?: number;
+    }>,
+    now: string,
+  ): void {
+    for (const u of units) {
+      try {
+        const stakes = classifyStakes({
+          content: u.text,
+          eventType: u.eventType,
+          distinctiveness: u.distinctiveness,
+        });
+        if (stakes.stakes !== "high") continue;
+        const life = getLifecycle(this.db, u.owner_id, u.owner_kind);
+        if (!life) continue;
+        const prov = parseProvenance(life.provenance_json);
+        if (!shouldGate({ trust: prov.trust, stakes: stakes.stakes, gateState: gateStateOf(prov) })) {
+          continue;
+        }
+        this.gateMemory({
+          ownerId: u.owner_id,
+          ownerKind: u.owner_kind,
+          now,
+          stakes: stakes.stakes,
+          stakesDomain: stakes.stakes_domain,
+        });
+      } catch (err) {
+        this.logger?.warn?.(
+          `[memory-tdai][provenance] gateRecalledUnits failed for ${u.owner_kind} ${u.owner_id} ` +
+            `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
   }
 

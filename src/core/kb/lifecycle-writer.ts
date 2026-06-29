@@ -12,7 +12,16 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import { recordAudit } from "./memory-audit.js";
-import { parseProvenance, serializeProvenance, deriveTrust } from "./provenance.js";
+import {
+  parseProvenance,
+  serializeProvenance,
+  deriveTrust,
+  withPendingGate,
+  withRejectedGate,
+  gateStateOf,
+  type StakesLevel,
+  type StakesDomain,
+} from "./provenance.js";
 
 export interface LifecycleRow {
   owner_id: string;
@@ -185,6 +194,91 @@ export function confirmProvenance(
       before: { trust: before.trust, origin: before.origin },
       after: { trust: after.trust, origin: after.origin },
       reason: "confirmed by Lorenzo",
+      namespace: cur.namespace,
+    },
+    p.now,
+  );
+  return getLifecycle(db, p.ownerId, p.ownerKind);
+}
+
+export interface MarkGatePendingParams {
+  ownerId: string;
+  ownerKind: string;
+  now: string;
+  stakes: StakesLevel;
+  stakesDomain: StakesDomain | null;
+}
+
+/**
+ * Mark a memory unit as pending the ask-loop (Phase 2 gate). Idempotent-ish: only
+ * a `clear` memory transitions; an already pending/rejected one is left untouched
+ * (we never re-gate). Writes one audit row (operation="gate", actor="system").
+ * Returns the (possibly unchanged) row.
+ */
+export function markGatePending(
+  db: DatabaseSync,
+  p: MarkGatePendingParams,
+): LifecycleRow | null {
+  const cur = ensureLifecycle(db, { ownerId: p.ownerId, ownerKind: p.ownerKind, now: p.now });
+  const before = parseProvenance(cur.provenance_json);
+  if (gateStateOf(before) !== "clear") return cur; // never re-gate
+  const after = withPendingGate(before, { stakes: p.stakes, stakes_domain: p.stakesDomain });
+  db.prepare(
+    `UPDATE memory_lifecycle SET provenance_json = ?, updated_time = ?
+       WHERE owner_id = ? AND owner_kind = ?`,
+  ).run(serializeProvenance(after), p.now, p.ownerId, p.ownerKind);
+
+  recordAudit(
+    db,
+    {
+      ownerId: p.ownerId,
+      ownerKind: p.ownerKind,
+      operation: "gate",
+      actor: "system",
+      before: { gate_state: gateStateOf(before) },
+      after: { gate_state: "pending_confirmation", stakes: p.stakes, stakes_domain: p.stakesDomain },
+      reason: `stakes gate: ${p.stakesDomain ?? "high"}`,
+      namespace: cur.namespace,
+    },
+    p.now,
+  );
+  return getLifecycle(db, p.ownerId, p.ownerKind);
+}
+
+export interface RejectProvenanceParams {
+  ownerId: string;
+  ownerKind: string;
+  now: string;
+}
+
+/**
+ * Tombstone a memory unit: Lorenzo said NO to the gate question. Marks the stamp
+ * `rejected` (KEPT, not hard-deleted — the burned child learns to discriminate,
+ * it does not forget the fire) and writes one audit row (operation="reject",
+ * actor="user"). Returns the updated row.
+ */
+export function rejectProvenance(
+  db: DatabaseSync,
+  p: RejectProvenanceParams,
+): LifecycleRow | null {
+  const cur = ensureLifecycle(db, { ownerId: p.ownerId, ownerKind: p.ownerKind, now: p.now });
+  const before = parseProvenance(cur.provenance_json);
+  const after = withRejectedGate(before, p.now);
+  db.prepare(
+    `UPDATE memory_lifecycle SET provenance_json = ?, updated_time = ?
+       WHERE owner_id = ? AND owner_kind = ?`,
+  ).run(serializeProvenance(after), p.now, p.ownerId, p.ownerKind);
+
+  recordAudit(
+    db,
+    {
+      ownerId: p.ownerId,
+      ownerKind: p.ownerKind,
+      operation: "reject",
+      actor: "user",
+      before: { gate_state: gateStateOf(before) },
+      after: { gate_state: "rejected", rejected_at: p.now },
+      reason: "rejected by Lorenzo",
       namespace: cur.namespace,
     },
     p.now,
