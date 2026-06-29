@@ -35,6 +35,21 @@ describe("captureSessionRecap", () => {
     expect(insert).not.toHaveBeenCalled();
   });
 
+  it("scopes the recap to the most recent session_id (excludes older sessions under the same key)", () => {
+    const inserted: KbEventInput[] = [];
+    const store = {
+      listEventsBySession: () => [
+        evt({ id: "old", session_id: "sid_old", type: "decision", text: "OLD session decision", source_message_ids: ["mo"], ts: "2026-06-20T10:00:00.000Z" }),
+        evt({ id: "new", session_id: "sid_new", type: "decision", text: "NEW session decision", source_message_ids: ["mn"], ts: "2026-06-29T10:00:00.000Z" }),
+      ],
+      insertEvent: (e: KbEventInput) => { inserted.push(e); return evt({}); },
+    } as any;
+    captureSessionRecap({ store, sessionKey: "s1", now: "2026-06-29T11:00:00.000Z" });
+    expect(inserted).toHaveLength(1);
+    expect(inserted[0].text).toContain("NEW session decision");
+    expect(inserted[0].text).not.toContain("OLD session decision");
+  });
+
   it("never throws when the store lacks listEventsBySession", () => {
     expect(() => captureSessionRecap({ store: {} as any, sessionKey: "s1", now: "n" })).not.toThrow();
   });

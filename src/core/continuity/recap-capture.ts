@@ -6,9 +6,22 @@
  * Off the critical path: every failure is swallowed (memory must never break
  * the conversation). No-ops when the store lacks the required capabilities.
  */
-import type { IMemoryStore } from "../store/types.js";
+import type { IMemoryStore, KbEvent } from "../store/types.js";
 import { selectThread } from "./recap-selector.js";
 import { buildRecapText } from "./recap-builder.js";
+
+/**
+ * Narrow a session_key's events to the single most recent session_id (the
+ * session that just ended). Falls back to all events when session_id is absent.
+ */
+function scopeToLatestSession(events: readonly KbEvent[]): readonly KbEvent[] {
+  let latest: KbEvent | undefined;
+  for (const e of events) if (!latest || e.ts > latest.ts) latest = e;
+  const sid = latest?.session_id;
+  if (!sid) return events;
+  const scoped = events.filter((e) => e.session_id === sid);
+  return scoped.length > 0 ? scoped : events;
+}
 
 const TAG = "[memory-tdai] [continuity]";
 const RECAP_TYPE = "session_recap";
@@ -35,7 +48,12 @@ export function captureSessionRecap(params: {
     const events = store.listEventsBySession(sessionKey);
     if (events.length === 0) return;
 
-    const input = selectThread(events, now);
+    // session_key is stable per project and aggregates MANY sessions (a month
+    // of work). "Dove eravamo" must describe the session that JUST ended, so
+    // scope to the most recent session_id (the ending session) before building.
+    const sessionEvents = scopeToLatestSession(events);
+
+    const input = selectThread(sessionEvents, now);
     const text = buildRecapText(input);
     if (!text) {
       logger?.debug?.(`${TAG} no anchored thread for session=${sessionKey} — no recap`);

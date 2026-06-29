@@ -34,7 +34,10 @@ export function buildRecapText(input: RecapInput): string {
   if (!nextStepLine && threadLines.length === 0) return "";
 
   const date = input.sessionDateIso.slice(0, 10);
-  const out: string[] = [`DOVE ERAVAMO — ${input.project} (${date})`, ""];
+  const header = input.project
+    ? `DOVE ERAVAMO — ${input.project} (${date})`
+    : `DOVE ERAVAMO (${date})`;
+  const out: string[] = [header, ""];
 
   if (nextStepLine) {
     out.push("PROSSIMO PASSO:");
