@@ -46,6 +46,8 @@ import { buildSituationInjection } from "./hooks/fingerprint-injection.js";
 import { canonicalKey } from "./kb/kb-queries.js";
 import { performAutoRecall } from "./hooks/auto-recall.js";
 import { SessionBannerTracker } from "./hooks/session-banner.js";
+import { CornerstoneInjectionTracker } from "./distinctiveness/cornerstone-runner.js";
+import { CornerstoneSessionCache } from "./distinctiveness/cornerstone-cache.js";
 import { performAutoCapture } from "./hooks/auto-capture.js";
 import { executeMemorySearch, formatSearchResponse } from "./tools/memory-search.js";
 import { executeConversationSearch, formatConversationSearchResponse } from "./tools/conversation-search.js";
@@ -166,6 +168,10 @@ export class TdaiCore {
    * One TRUE per sessionKey per process lifetime (in-memory, long-lived).
    */
   private readonly bannerTracker = new SessionBannerTracker();
+  // Idea 5 (Distinctiveness Scorer): decay tracker (long-lived) + per-session block
+  // cache so the corpus-embedding cost runs once per session, not per turn.
+  private readonly cornerstoneTracker = new CornerstoneInjectionTracker();
+  private readonly cornerstoneCache = new CornerstoneSessionCache();
 
   constructor(opts: TdaiCoreOptions) {
     this.hostAdapter = opts.hostAdapter;
@@ -306,6 +312,8 @@ export class TdaiCore {
       vectorStore: this.vectorStore,
       embeddingService: this.embeddingService,
       bannerTracker: this.bannerTracker,
+      cornerstoneTracker: this.cornerstoneTracker,
+      cornerstoneCache: this.cornerstoneCache,
     });
 
     // Commit the banner slot ONLY after a real (non-timed-out) result actually
@@ -314,6 +322,13 @@ export class TdaiCore {
     // Key MUST match the one performAutoRecall peeked (sessionId ?? sessionKey).
     if (result?.bannerEmitted) {
       this.bannerTracker.markEmitted(sessionId ?? sessionKey);
+    }
+
+    // Commit the cornerstone block to the per-session cache ONLY after a real
+    // (non-timed-out) result, so the expensive corpus-embed runs once per session
+    // and a timed-out first turn recomputes next turn instead of caching nothing.
+    if (result?.cornerstonePending) {
+      this.cornerstoneCache.commit(result.cornerstonePending.key, result.cornerstonePending.block);
     }
 
     return result ?? {};

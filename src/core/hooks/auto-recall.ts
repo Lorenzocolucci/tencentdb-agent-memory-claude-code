@@ -29,6 +29,7 @@ import {
   buildCornerstones,
   type CornerstoneInjectionTracker,
 } from "../distinctiveness/cornerstone-runner.js";
+import { CornerstoneSessionCache } from "../distinctiveness/cornerstone-cache.js";
 import {
   MEMORY_TOOLS_GUIDE,
   RELEVANT_MEMORIES_HEADER,
@@ -139,6 +140,14 @@ export interface RecallResult {
   recallStrategy?: string;
   /** True when this result includes the session-open banner (caller commits the tracker slot). */
   bannerEmitted?: boolean;
+  /**
+   * Set when the cornerstone block was computed THIS turn (a cache miss). The
+   * caller commits it to the CornerstoneSessionCache ONLY after a real
+   * (non-timed-out) result, so a timed-out first turn recomputes next turn
+   * instead of caching a discarded block (mirrors the banner deferred commit).
+   * `block` is "" when there was nothing to inject (still a valid commit → no recompute).
+   */
+  cornerstonePending?: { key: string; block: string };
 }
 
 export async function performAutoRecall(params: {
@@ -166,6 +175,12 @@ export async function performAutoRecall(params: {
    * alongside the heat-ranked scenes at session start.
    */
   cornerstoneTracker?: CornerstoneInjectionTracker;
+  /**
+   * Session-scoped cache so the cornerstone block is computed ONCE per session
+   * (the embed-the-corpus cost stays off the per-turn critical path). Required
+   * alongside cornerstoneTracker for the cornerstone block to be injected.
+   */
+  cornerstoneCache?: CornerstoneSessionCache;
 }): Promise<RecallResult | undefined> {
   const { cfg, logger } = params;
   const timeoutMs = cfg.recall.timeoutMs ?? 5000;
@@ -200,8 +215,9 @@ async function performAutoRecallInner(params: {
   embeddingService?: EmbeddingService;
   bannerTracker?: SessionBannerTracker;
   cornerstoneTracker?: CornerstoneInjectionTracker;
+  cornerstoneCache?: CornerstoneSessionCache;
 }): Promise<RecallResult | undefined> {
-  const { userText, cfg, pluginDataDir, projectName, logger, vectorStore, embeddingService, bannerTracker, cornerstoneTracker } = params;
+  const { userText, cfg, pluginDataDir, projectName, logger, vectorStore, embeddingService, bannerTracker, cornerstoneTracker, cornerstoneCache } = params;
   const tRecallStart = performance.now();
 
   // Search relevant memories (L1 layer) — skip only when userText is empty/undefined
@@ -328,18 +344,31 @@ async function performAutoRecallInner(params: {
   }
 
   // Idea 5: Distinctiveness Scorer — inject top-K cornerstone memories ALONGSIDE
-  // the heat-ranked scenes (not replacing them). Only active when a
-  // cornerstoneTracker is provided so the feature is opt-in per deployment.
+  // the heat-ranked scenes (not replacing them). Only active when BOTH a
+  // cornerstoneTracker and a cornerstoneCache are provided (opt-in per deployment).
   // Fully fault-tolerant: buildCornerstones swallows all errors and returns "".
-  if (cornerstoneTracker && vectorStore) {
-    const cornerstoneBlock = await buildCornerstones({
-      vectorStore,
-      embeddingService,
-      injectionTracker: cornerstoneTracker,
-      logger,
-    });
-    if (cornerstoneBlock) {
-      stableParts.push(cornerstoneBlock);
+  //
+  // 1×/session: the corpus-embedding cost runs only on the FIRST turn of a session
+  // (cache MISS). Subsequent turns reuse the cached block string — zero embedding
+  // calls on the per-turn critical path. The cache is committed by the caller after
+  // a real (non-timed-out) result, so a timed-out first turn recomputes next turn.
+  let cornerstonePending: { key: string; block: string } | undefined;
+  if (cornerstoneTracker && cornerstoneCache && vectorStore) {
+    const csKey = params.sessionId ?? params.sessionKey;
+    const cached = cornerstoneCache.get(csKey);
+    if (cached !== undefined) {
+      // HIT (including ""=computed-empty) → reuse, NO embedding work this turn.
+      if (cached) stableParts.push(cached);
+    } else {
+      // MISS → compute once for this session (off the critical path: returns "").
+      const cornerstoneBlock = await buildCornerstones({
+        vectorStore,
+        embeddingService,
+        injectionTracker: cornerstoneTracker,
+        logger,
+      });
+      if (cornerstoneBlock) stableParts.push(cornerstoneBlock);
+      cornerstonePending = { key: csKey, block: cornerstoneBlock };
     }
   }
 
@@ -421,6 +450,7 @@ async function performAutoRecallInner(params: {
     recalledL3Persona: personaContent ?? null,
     recallStrategy: effectiveStrategy,
     bannerEmitted,
+    cornerstonePending,
   };
 }
 
