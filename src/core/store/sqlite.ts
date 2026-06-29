@@ -47,7 +47,9 @@ import type {
   KbRelationInput,
   KbVectorSearchResult,
   KbFtsSearchResult,
+  KbLessonHit,
 } from "./types.js";
+import { queryHeadLessonsByFile as kbQueryHeadLessonsByFile } from "../kb/lessons-writer.js";
 import {
   resolveOrCreateEntity as kbResolveOrCreateEntity,
   insertEvent as kbInsertEvent,
@@ -2901,6 +2903,17 @@ export class VectorStore implements IMemoryStore {
   queryEventsForEntity(entityId: string, namespace = "default", limit = 50): KbEvent[] {
     if (!this.kbReady) return [];
     return kbQueryEventsForEntity(this.db, entityId, namespace, limit);
+  }
+
+  /** @see IMemoryStore.queryHeadLessonsByFile */
+  queryHeadLessonsByFile(fileEntityId: string, namespace = "default", limit = 3): KbLessonHit[] {
+    if (!this.kbReady) return [];
+    return kbQueryHeadLessonsByFile(this.db, fileEntityId, namespace, limit).map((r) => ({
+      domain: r.domain,
+      lessonText: r.lesson_text,
+      confidence: r.confidence,
+      evidenceCount: r.evidence_count,
+    }));
   }
 
   /**

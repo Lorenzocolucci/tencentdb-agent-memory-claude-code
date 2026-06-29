@@ -101,6 +101,40 @@ export function queryHeadLessonByTrigger(db: DatabaseSync, key: TriggerKey): Les
   return (row as LessonRow) ?? null;
 }
 
+/**
+ * HEAD lessons whose trigger_pattern.files contains `fileEntityId` (B2b read).
+ *
+ * This is the RETRIEVAL counterpart to queryHeadLessonByTrigger (which is an
+ * exact-trigger lookup for write-time dedup). Here the agent touched ONE file at
+ * PostToolUse time and we want every live lesson whose recurring-failure pattern
+ * involves that file, so Proactive Injection can resurface it unbidden.
+ *
+ * Matching uses json_each over the canonical trigger JSON's `$.files` array
+ * (file entity ids), so a lesson triggered by {fileA, fileB} surfaces when EITHER
+ * is touched. Only HEAD versions (superseded_by IS NULL) are returned, ranked by
+ * confidence then evidence_count (strongest, best-attested lesson first).
+ */
+export function queryHeadLessonsByFile(
+  db: DatabaseSync,
+  fileEntityId: string,
+  namespace = "default",
+  limit = 3,
+): LessonRow[] {
+  const rows = db
+    .prepare(
+      `SELECT * FROM lessons
+        WHERE namespace = ? AND superseded_by IS NULL
+          AND EXISTS (
+            SELECT 1 FROM json_each(lessons.trigger_pattern, '$.files')
+            WHERE json_each.value = ?
+          )
+        ORDER BY confidence DESC, evidence_count DESC, version DESC
+        LIMIT ?`,
+    )
+    .all(namespace, fileEntityId, limit);
+  return rows as LessonRow[];
+}
+
 /** Link an old lesson to the new version that replaces it (old leaves HEAD). */
 export function supersedeLesson(db: DatabaseSync, oldId: string, newId: string, now: string): void {
   db.prepare(

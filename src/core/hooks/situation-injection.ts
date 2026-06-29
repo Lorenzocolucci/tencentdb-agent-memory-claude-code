@@ -9,8 +9,9 @@
  * GOLDEN RULE (Lorenzo's choice): silent unless relevant. Unknown file, or a
  * known file with nothing tied to it → return null. No noise, ever.
  *
- * Lessons (Track B) plug in here later: once the Mistake Notebook is populated,
- * a file's lessons join the facts/events in this block.
+ * Lessons (Track B / B2b) join here: once the Mistake Notebook is populated, a
+ * file's recurring-failure lessons surface ALONGSIDE its facts/events — a lesson
+ * resurfaces unbidden the moment the agent touches a file in its trigger pattern.
  */
 
 import type { IMemoryStore } from "../store/types.js";
@@ -19,6 +20,7 @@ import { canonicalKey } from "../kb/kb-queries.js";
 const NAMESPACE = "default";
 const MAX_FACTS = 6;
 const MAX_EVENTS = 4;
+const MAX_LESSONS = 2;
 const MAX_LINE = 160;
 
 function clip(s: string): string {
@@ -62,9 +64,19 @@ export function buildFileInjection(store: IMemoryStore, filePath: string): strin
 
   const facts = store.queryHeadFacts(entity.id).slice(0, MAX_FACTS);
   const events = store.queryEventsForEntity(entity.id, NAMESPACE, MAX_EVENTS);
-  if (facts.length === 0 && events.length === 0) return null; // nothing tied → silence
+  // Track B (B2b): recurring-failure lessons whose trigger involves this file.
+  const lessons = store.queryHeadLessonsByFile
+    ? store.queryHeadLessonsByFile(entity.id, NAMESPACE, MAX_LESSONS)
+    : [];
+  if (facts.length === 0 && events.length === 0 && lessons.length === 0) {
+    return null; // nothing tied → silence
+  }
 
   const lines: string[] = [];
+  // Lessons FIRST — a "you've failed here before" warning outranks raw facts.
+  for (const l of lessons) {
+    lines.push(`- ⚠️ lesson [${l.domain}, ${l.evidenceCount}× evidence]: ${clip(l.lessonText)}`);
+  }
   for (const f of facts) {
     lines.push(`- ${f.attribute}: ${clip(f.value)}`);
   }

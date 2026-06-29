@@ -290,6 +290,19 @@ export interface KbFtsSearchResult {
   score: number;
 }
 
+/**
+ * A lesson surfaced for a touched file (Mistake Notebook B2b read shape).
+ * Lean projection of a `lessons` HEAD row — only what Proactive Injection needs.
+ */
+export interface KbLessonHit {
+  domain: string;
+  lessonText: string;
+  /** 0–1; higher = better-attested across recurrences. */
+  confidence: number;
+  /** How many failure events back this lesson. */
+  evidenceCount: number;
+}
+
 /** Input payload for inserting an event (append-only). */
 export interface KbEventInput {
   /** Optional caller-supplied id; when absent a ULID-like id is generated. */
@@ -616,6 +629,13 @@ export interface IMemoryStore {
    * Powers the entity-page "Timeline".
    */
   queryEventsForEntity?(entityId: string, namespace?: string, limit?: number): KbEvent[];
+
+  /**
+   * HEAD lessons (Mistake Notebook) whose trigger pattern involves `fileEntityId`.
+   * Powers Track B's proactive injection: a recurring-failure lesson resurfaces
+   * when the agent touches a file in its trigger. Returns [] when KB/lessons off.
+   */
+  queryHeadLessonsByFile?(fileEntityId: string, namespace?: string, limit?: number): KbLessonHit[];
 
   /** kb_vec / kb_fts recall primitives (mirror searchL1Vector / searchL1Fts). */
   searchKbVector?(queryEmbedding: Float32Array, topK?: number, ownerKindFilter?: string): KbVectorSearchResult[];
