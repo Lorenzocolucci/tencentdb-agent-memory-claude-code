@@ -1,26 +1,35 @@
 /**
- * Phase B manual trial — distill `lessons` from real bug→fix clusters.
+ * Phase B manual trial — preview / persist `lessons` from real bug→fix clusters.
  *
- * DRY by default: selects candidate clusters from the LIVE KB (read-only),
- * distills each via the live LLM, and PRINTS the proposed lesson. NOTHING is
- * written. Inspect the quality, then re-run with --write to persist.
+ * Since the auto-distiller now runs on every session end (tdai-core.handleSessionEnd
+ * → store.runLessonDistillation), this tool is for MANUAL inspection: preview which
+ * cross-session failure clusters exist and what the LLM would distil, before (or
+ * instead of) waiting for the automatic pass.
+ *
+ * DRY by default: selects candidate clusters from the LIVE KB (read-only) via
+ * selectFailureClusters, distils each via the live LLM, and PRINTS the proposal.
+ * NOTHING is written. Re-run with --write to persist via distillLessons (the same
+ * path the gateway uses automatically).
  *
  * Run:
  *   node_modules/.bin/tsx tools/lessons-run.mts [--write] [--limit N] [--db PATH]
  *
- * Reads LLM creds from the same TDAI_LLM_* env vars the gateway uses
- * (baseUrl/apiKey/model). Never prints the key.
+ * Reads LLM creds from the same TDAI_LLM_* env vars the gateway uses. Never prints
+ * the key. Loads sqlite-vec so the bug-clustering reader can read kb_vec.
  */
 
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { DatabaseSync } from "node:sqlite";
 
-import { selectLessonCandidates } from "../src/core/kb/lessons-candidates.js";
-import { distillLesson } from "../src/core/kb/lessons-distiller.js";
+import { selectFailureClusters } from "../src/core/kb/bug-clusters.js";
+import { distillLesson, type DistillableCluster } from "../src/core/kb/lessons-distiller.js";
 import { distillLessons } from "../src/core/kb/lessons-runner.js";
 import { StandaloneLLMRunnerFactory } from "../src/adapters/standalone/llm-runner.js";
 import type { Logger } from "../src/core/types.js";
+
+const require = createRequire(import.meta.url);
 
 const DEFAULT_DB = path.join(
   os.homedir(),
@@ -52,9 +61,13 @@ const logger: Logger = {
   error: (m: string) => process.stderr.write(`${m}\n`),
 };
 
-/** Set a busy timeout via prepare().run() (node:sqlite db.exec trips a false-positive hook). */
-function setBusyTimeout(db: DatabaseSync, ms: number): void {
-  db.prepare(`PRAGMA busy_timeout = ${ms}`).run();
+/** Open the live DB with sqlite-vec loaded (bug clustering reads kb_vec). */
+function openDb(dbPath: string, readOnly: boolean): DatabaseSync {
+  const db = new DatabaseSync(dbPath, { readOnly, allowExtension: true });
+  db.enableLoadExtension(true);
+  require("sqlite-vec").load(db);
+  db.prepare("PRAGMA busy_timeout = 8000").run();
+  return db;
 }
 
 function buildRunner() {
@@ -85,8 +98,8 @@ async function main(): Promise<void> {
   );
 
   if (write) {
-    const db = new DatabaseSync(dbPath);
-    setBusyTimeout(db, 5000);
+    // The SAME path the gateway runs automatically on session end.
+    const db = openDb(dbPath, false);
     try {
       const stats = await distillLessons(db, runner, {
         now: new Date().toISOString(),
@@ -100,25 +113,25 @@ async function main(): Promise<void> {
   }
 
   // DRY: read-only, print proposals, write nothing.
-  const db = new DatabaseSync(dbPath, { readOnly: true });
+  const db = openDb(dbPath, true);
   try {
-    const clusters = selectLessonCandidates(db, { limit });
+    const clusters = selectFailureClusters(db, {}).slice(0, limit);
     process.stdout.write(`\nDRY RUN — ${clusters.length} candidate cluster(s):\n`);
     let i = 0;
     for (const c of clusters) {
       i++;
       process.stdout.write(
-        `\n────────────────────────────────────────\n[${i}] session=${c.sessionKey} project=${c.project || "-"}\n`,
+        `\n────────────────────────────────────────\n` +
+          `[${i}] ${c.bugEventIds.length} recurrence(s) across ${c.distinctSessionCount} session(s) · project=${c.project || "-"}\n`,
       );
-      process.stdout.write(`  BUG: ${c.bugText}\n`);
-      c.fixTexts.forEach((t, k) => process.stdout.write(`  FIX${k + 1}: ${t}\n`));
-      const lesson = await distillLesson(c, runner);
+      c.bugTexts.forEach((t, k) => process.stdout.write(`  BUG${k + 1}: ${t}\n`));
+      const distillable: DistillableCluster = { project: c.project, bugTexts: c.bugTexts, fixTexts: [] };
+      const lesson = await distillLesson(distillable, runner);
       if (!lesson) {
         process.stdout.write(`  → LESSON: (distillation failed / unparseable)\n`);
         continue;
       }
       process.stdout.write(`  → domain: ${lesson.domain}\n`);
-      process.stdout.write(`  → trigger: ${lesson.triggerPattern}\n`);
       process.stdout.write(`  → lesson: ${lesson.lessonText}\n`);
       process.stdout.write(`  → anti-patterns: ${JSON.stringify(lesson.antiPatterns)}\n`);
       process.stdout.write(`  → confidence: ${lesson.confidence}\n`);
