@@ -48,6 +48,7 @@ import { performAutoRecall } from "./hooks/auto-recall.js";
 import { SessionBannerTracker } from "./hooks/session-banner.js";
 import { CornerstoneInjectionTracker, buildCornerstones } from "./distinctiveness/cornerstone-runner.js";
 import { CornerstoneSessionCache } from "./distinctiveness/cornerstone-cache.js";
+import { renderGroundedTrustInterrupt } from "./kb/grounded-trust-ask.js";
 import { performAutoCapture } from "./hooks/auto-capture.js";
 import { executeMemorySearch, formatSearchResponse } from "./tools/memory-search.js";
 import { executeConversationSearch, formatConversationSearchResponse } from "./tools/conversation-search.js";
@@ -336,7 +337,28 @@ export class TdaiCore {
       this.buildCornerstoneInBackground(result.cornerstoneMiss.key);
     }
 
-    return result ?? {};
+    // Grounded Trust Phase 3: surface the INTERRUPT for any uncertain, high-stakes
+    // memory now pending Lorenzo's confirmation. Prepended to the turn context so
+    // the agent must raise it before acting. Best-effort: never breaks the turn.
+    const out: RecallResult = result ?? {};
+    try {
+      const store = this.vectorStore as
+        | { getPendingAsks?: (n?: number) => import("./kb/grounded-trust-ask.js").PendingAsk[] }
+        | undefined;
+      if (store && typeof store.getPendingAsks === "function") {
+        const asks = store.getPendingAsks(5);
+        const block = renderGroundedTrustInterrupt(asks);
+        if (block) {
+          out.prependContext = out.prependContext ? `${block}\n\n${out.prependContext}` : block;
+        }
+      }
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][grounded-trust] interrupt injection failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    return out;
   }
 
   /**
@@ -442,6 +464,35 @@ export class TdaiCore {
       text: formatConversationSearchResponse(result),
       total: result.total,
     };
+  }
+
+  /**
+   * Grounded Trust ask-loop (Phase 3): record Lorenzo's answer to a gated memory.
+   * `decision="confirm"` → the memory becomes authoritative (trusted); `"reject"`
+   * → it is tombstoned (kept, never hard-deleted). Off the critical path: returns
+   * a human line, never throws. Maps to: tdai_confirm_memory / tdai_reject_memory.
+   */
+  async resolveGatedMemory(params: {
+    ownerId: string;
+    ownerKind: "fact" | "event";
+    decision: "confirm" | "reject";
+  }): Promise<{ ok: boolean; text: string }> {
+    await this.storeReady?.catch(() => {});
+    const store = this.vectorStore;
+    if (!store) return { ok: false, text: "Memory store unavailable." };
+    const now = new Date().toISOString();
+    try {
+      if (params.decision === "confirm") {
+        store.confirmMemory({ ownerId: params.ownerId, ownerKind: params.ownerKind, now });
+        return { ok: true, text: `Confermato: il ricordo ${params.ownerKind} ${params.ownerId} è ora autorevole.` };
+      }
+      store.rejectMemory({ ownerId: params.ownerId, ownerKind: params.ownerKind, now });
+      return { ok: true, text: `Rifiutato: il ricordo ${params.ownerKind} ${params.ownerId} è stato marcato come errato (lapide).` };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger?.warn?.(`[memory-tdai][grounded-trust] resolveGatedMemory failed (non-fatal): ${msg}`);
+      return { ok: false, text: `Operazione non riuscita: ${msg}` };
+    }
   }
 
   /**

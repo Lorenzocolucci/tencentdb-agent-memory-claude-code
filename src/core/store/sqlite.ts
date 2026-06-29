@@ -2210,6 +2210,104 @@ export class VectorStore implements IMemoryStore {
     }
   }
 
+  /**
+   * Surface memories pending the ask-loop (gate_state = pending_confirmation),
+   * newest first, with their display text + origin + stakes domain. The Phase 3
+   * interrupt block is rendered from these. Off the critical path: on any failure
+   * returns []. Fact text is rendered "attribute: value"; event text is the event.
+   */
+  getPendingAsks(limit = 10): Array<{
+    owner_id: string;
+    owner_kind: "fact" | "event";
+    text: string;
+    origin: import("../kb/provenance.js").ProvenanceOrigin;
+    stakes_domain: import("../kb/provenance.js").StakesDomain | null;
+  }> {
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT owner_id, owner_kind, provenance_json
+             FROM memory_lifecycle
+            WHERE json_extract(provenance_json, '$.gate_state') = 'pending_confirmation'
+            ORDER BY updated_time DESC
+            LIMIT ?`,
+        )
+        .all(Math.max(1, Math.min(limit, 50))) as Array<{
+        owner_id: string;
+        owner_kind: string;
+        provenance_json: string;
+      }>;
+
+      const out: Array<{
+        owner_id: string;
+        owner_kind: "fact" | "event";
+        text: string;
+        origin: import("../kb/provenance.js").ProvenanceOrigin;
+        stakes_domain: import("../kb/provenance.js").StakesDomain | null;
+      }> = [];
+      for (const r of rows) {
+        const kind = r.owner_kind === "fact" ? "fact" : "event";
+        const prov = parseProvenance(r.provenance_json);
+        let text = "";
+        if (kind === "event") {
+          const ev = this.db.prepare("SELECT text FROM events WHERE id = ?").get(r.owner_id) as
+            | { text: string }
+            | undefined;
+          text = ev?.text ?? "";
+        } else {
+          const f = this.db
+            .prepare("SELECT attribute, value FROM facts WHERE id = ?")
+            .get(r.owner_id) as { attribute: string; value: string } | undefined;
+          text = f ? `${f.attribute}: ${f.value}` : "";
+        }
+        if (!text) continue;
+        out.push({
+          owner_id: r.owner_id,
+          owner_kind: kind,
+          text,
+          origin: prov.origin,
+          stakes_domain: prov.stakes_domain ?? null,
+        });
+      }
+      return out;
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][provenance] getPendingAsks failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return [];
+    }
+  }
+
+  /**
+   * Grounded Trust Phase 4 (learning): the keys of recalled units that Lorenzo has
+   * REJECTED, so the recall path can suppress them from injection — a tombstoned
+   * memory must never drive action again. Keys are "ownerKind:ownerId". Best-effort:
+   * on error returns an empty set (fail-open = show the memory, never break recall).
+   * Facts are already dropped from HEAD by rejectMemory (valid_to); this also covers
+   * append-only events, which have no validity window.
+   */
+  rejectedOwnerKeys(
+    units: ReadonlyArray<{ owner_id: string; owner_kind: "fact" | "event" }>,
+  ): Set<string> {
+    const rejected = new Set<string>();
+    try {
+      for (const u of units) {
+        const life = getLifecycle(this.db, u.owner_id, u.owner_kind);
+        if (!life) continue;
+        if (gateStateOf(parseProvenance(life.provenance_json)) === "rejected") {
+          rejected.add(`${u.owner_kind}:${u.owner_id}`);
+        }
+      }
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][provenance] rejectedOwnerKeys failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    return rejected;
+  }
+
   async reindexAll(
     embedFn: (text: string) => Promise<Float32Array | Float32Array[]>,
     onProgress?: (done: number, total: number, layer: "L1" | "L0") => void,

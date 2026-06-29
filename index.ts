@@ -486,6 +486,62 @@ export default function register(api: OpenClawPluginApi) {
     },
     { name: "tdai_conversation_search" },
   );
+
+  // tdai_confirm_memory / tdai_reject_memory — Grounded Trust ask-loop (Phase 3).
+  // The agent calls these to re-bind Lorenzo's answer to a gated (pending) memory:
+  // confirm → the memory becomes authoritative; reject → it is tombstoned (kept).
+  const groundedTrustResolve = (decision: "confirm" | "reject") =>
+    async (_toolCallId: string, params: Record<string, unknown>) => {
+      const ownerId = String(params.owner_id ?? "");
+      const ownerKind = params.owner_kind === "fact" ? "fact" : "event";
+      if (!ownerId) {
+        return { content: [{ type: "text" as const, text: "owner_id is required" }], details: { error: "missing owner_id" } };
+      }
+      try {
+        const res = await core.resolveGatedMemory({ ownerId, ownerKind, decision });
+        report("tool_call", { tool: `tdai_${decision}_memory`, ownerId, ownerKind, success: res.ok });
+        return { content: [{ type: "text" as const, text: res.text }], details: { ok: res.ok } };
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        api.logger.error(`${TAG} [tool] tdai_${decision}_memory failed: ${errMsg}`);
+        return { content: [{ type: "text" as const, text: `Operation failed: ${errMsg}` }], details: { error: errMsg } };
+      }
+    };
+
+  const groundedTrustParams = {
+    type: "object" as const,
+    properties: {
+      owner_id: { type: "string", description: "The memory id from the grounded-trust-interrupt block" },
+      owner_kind: { type: "string", enum: ["event", "fact"], description: "Whether the memory is an event or a fact" },
+    },
+    required: ["owner_id", "owner_kind"],
+  };
+
+  api.registerTool(
+    {
+      name: "tdai_confirm_memory",
+      label: "Confirm Memory",
+      description:
+        "Record that Lorenzo CONFIRMED an uncertain memory raised in a grounded-trust-interrupt block. " +
+        "Call this ONLY after Lorenzo explicitly confirms the memory is correct. It becomes authoritative and is never re-asked.",
+      parameters: groundedTrustParams,
+      execute: groundedTrustResolve("confirm"),
+    },
+    { name: "tdai_confirm_memory" },
+  );
+
+  api.registerTool(
+    {
+      name: "tdai_reject_memory",
+      label: "Reject Memory",
+      description:
+        "Record that Lorenzo REJECTED an uncertain memory raised in a grounded-trust-interrupt block. " +
+        "Call this ONLY after Lorenzo says the memory is wrong. It is tombstoned (kept for the audit trail, never acted on, never re-asked).",
+      parameters: groundedTrustParams,
+      execute: groundedTrustResolve("reject"),
+    },
+    { name: "tdai_reject_memory" },
+  );
   } else {
     api.logger.debug?.(`${TAG} Memory tools (tdai_memory_search, tdai_conversation_search) not registered — memory features disabled`);
   }

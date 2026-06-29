@@ -497,7 +497,7 @@ async function runKbRecall(
   try {
     // Redact secrets before the KB recall query is embedded (same egress guard
     // as the L1 search path above).
-    return await kbRecall(redactSecrets(userText), {
+    const results = await kbRecall(redactSecrets(userText), {
       store: vectorStore,
       embeddingService,
       maxResults: cfg.recall.maxResults ?? 5,
@@ -505,6 +505,37 @@ async function runKbRecall(
       embeddingTimeoutMs: recallEmbeddingTimeoutMs,
       logger,
     });
+
+    // Grounded Trust Phase 2 wiring: mark uncertain, high-stakes recalled units as
+    // pending the ask-loop. Best-effort, off the critical path (gateRecalledUnits
+    // swallows its own errors). Trust gates ACTION, not injection — the units stay
+    // in `results` unchanged; only their gate state is written.
+    const gate = (vectorStore as { gateRecalledUnits?: (u: unknown[], now: string) => void })
+      .gateRecalledUnits;
+    if (typeof gate === "function") {
+      gate.call(
+        vectorStore,
+        results.map((r) => ({ owner_id: r.owner_id, owner_kind: r.owner_kind, text: r.text })),
+        new Date().toISOString(),
+      );
+    }
+
+    // Grounded Trust Phase 4: suppress tombstoned (rejected) memories from injection
+    // — a memory Lorenzo declared wrong must never drive action again. Best-effort.
+    const rejectedKeys = (vectorStore as {
+      rejectedOwnerKeys?: (u: Array<{ owner_id: string; owner_kind: string }>) => Set<string>;
+    }).rejectedOwnerKeys;
+    if (typeof rejectedKeys === "function") {
+      const rejected = rejectedKeys.call(
+        vectorStore,
+        results.map((r) => ({ owner_id: r.owner_id, owner_kind: r.owner_kind })),
+      );
+      if (rejected.size > 0) {
+        return results.filter((r) => !rejected.has(`${r.owner_kind}:${r.owner_id}`));
+      }
+    }
+
+    return results;
   } catch (err) {
     logger?.warn?.(`${TAG} [kb] KB recall failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
     return [];

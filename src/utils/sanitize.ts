@@ -290,7 +290,7 @@ export function pickRecentUnique(texts: string[], max: number): string[] {
 export function escapeXmlTags(text: string): string {
   // Escape closing tags that match our injection section boundaries
   return text.replace(
-    /<\/?(?:user-persona|relevant-memories|scene-navigation|relevant-scenes|memory-tools-guide|system|assistant|session-open-banner|cornerstone-memories|session-recap)>/gi,
+    /<\/?(?:user-persona|relevant-memories|scene-navigation|relevant-scenes|memory-tools-guide|system|assistant|session-open-banner|cornerstone-memories|session-recap|grounded-trust-interrupt)>/gi,
     (match) => match.replace(/</g, "&lt;").replace(/>/g, "&gt;"),
   );
 }
