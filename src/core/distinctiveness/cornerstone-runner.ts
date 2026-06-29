@@ -144,11 +144,6 @@ export async function buildCornerstones(params: {
       return "";
     }
 
-    // Record injection timestamps so the decay applies next session.
-    for (const cs of selected) {
-      injectionTracker.recordInjection(cs.id, nowIso);
-    }
-
     const injectionInput: InjectionCornerstone[] = selected.map((cs) => ({
       id: cs.id,
       content: cs.content,
@@ -156,6 +151,13 @@ export async function buildCornerstones(params: {
     }));
 
     const block = buildCornerstoneBlock(injectionInput);
+
+    // Record injection timestamps AFTER the block is successfully built,
+    // so decay is only applied when memories are actually injected.
+    for (const cs of selected) {
+      injectionTracker.recordInjection(cs.id, nowIso);
+    }
+
     logger?.debug?.(`${TAG} Cornerstone block built: ${selected.length} memory/ies`);
     return block;
   } catch (err) {
@@ -197,22 +199,32 @@ async function buildNeighborMap(
     ? { timeoutMs: embeddingTimeoutMs }
     : undefined;
 
-  // Process candidates sequentially to avoid hammering the embedding service.
-  // For production use with large corpora, this should be batched or cached.
-  for (const candidate of candidates) {
+  // Batch-embed all candidate texts in a single API call to reduce latency.
+  let embeddings: Float32Array[];
+  try {
+    embeddings = await embeddingService.embedBatch(
+      candidates.map((c) => c.text),
+      callOpts,
+    );
+  } catch {
+    logger?.debug?.(`${TAG} Batch embedding failed — isolation defaults to 1.0`);
+    return result;
+  }
+
+  // Query vector store for each candidate's neighbors (searchKbVector is sync).
+  for (let i = 0; i < candidates.length; i++) {
     try {
-      const embedding = await embeddingService.embed(candidate.text, callOpts);
       // ownerKindFilter = "event" to only compare events vs events.
-      const hits = vectorStore.searchKbVector(embedding, neighborTopK + 1, "event");
+      const hits = vectorStore.searchKbVector(embeddings[i], neighborTopK + 1, "event");
       // Exclude the candidate itself from its own neighbor list.
       const neighbors: NeighborEntry[] = hits
-        .filter((h) => h.owner_id !== candidate.id)
+        .filter((h) => h.owner_id !== candidates[i].id)
         .slice(0, neighborTopK)
         .map((h) => ({ id: h.owner_id, cosineSim: h.score }));
-      result.set(candidate.id, neighbors);
+      result.set(candidates[i].id, neighbors);
     } catch {
-      // Per-event failure → empty neighbors (isolation=1.0 = conservative/neutral).
-      result.set(candidate.id, []);
+      // Per-candidate failure → empty neighbors (isolation=1.0 = conservative/neutral).
+      result.set(candidates[i].id, []);
     }
   }
 
