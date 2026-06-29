@@ -82,6 +82,13 @@ export function initFoundationsSchema(db: DatabaseSync, logger?: FoundationsLogg
     `);
     ddl("CREATE INDEX IF NOT EXISTS idx_life_tier_state ON memory_lifecycle(namespace, tier, state)");
     ddl("CREATE INDEX IF NOT EXISTS idx_life_decay ON memory_lifecycle(decay_at)");
+    // Grounded Trust (Phase 3): getPendingAsks runs each recall turn. Without an
+    // index this json_extract filter full-scans memory_lifecycle every turn (0
+    // pending = scan to end), slowing recall. Expression index → O(log n + matches);
+    // pending rows are rare (conservative gate), so the lookup is tiny.
+    ddl(
+      "CREATE INDEX IF NOT EXISTS idx_life_gate_state ON memory_lifecycle(json_extract(provenance_json, '$.gate_state'))",
+    );
 
     // ── Brick 2 — lessons (Mistake Notebook, Phase B) ──────────────────────
     // Distilled procedural strategies from successes AND failures. Versioned for
