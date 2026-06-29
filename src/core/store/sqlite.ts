@@ -63,7 +63,7 @@ import {
   listEntities as kbListEntities,
   listRecentEvents as kbListRecentEvents,
   listEventsBySession as kbListEventsBySession,
-  latestEventByProjectType as kbLatestEventByProjectType,
+  latestEventBySessionKeyType as kbLatestEventBySessionKeyType,
   queryRelationsForEntity as kbQueryRelationsForEntity,
   queryEventsForEntity as kbQueryEventsForEntity,
   kbChunkId,
@@ -2885,10 +2885,10 @@ export class VectorStore implements IMemoryStore {
     return kbListEventsBySession(this.db, sessionKey);
   }
 
-  /** @see IMemoryStore.latestEventByProjectType */
-  latestEventByProjectType(project: string, type: string): KbEvent | undefined {
+  /** @see IMemoryStore.latestEventBySessionKeyType */
+  latestEventBySessionKeyType(sessionKey: string, type: string): KbEvent | undefined {
     if (!this.kbReady) return undefined;
-    return kbLatestEventByProjectType(this.db, project, type);
+    return kbLatestEventBySessionKeyType(this.db, sessionKey, type);
   }
 
   /** @see IMemoryStore.queryRelationsForEntity */

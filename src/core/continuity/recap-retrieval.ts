@@ -14,14 +14,14 @@ interface Logger {
 
 export function latestRecapBlock(params: {
   store: IMemoryStore;
-  project: string;
+  sessionKey: string;
   logger?: Logger;
 }): string {
-  const { store, project, logger } = params;
+  const { store, sessionKey, logger } = params;
   try {
-    if (!project) return "";
-    if (typeof store.latestEventByProjectType !== "function") return "";
-    const recap = store.latestEventByProjectType(project, RECAP_TYPE);
+    if (!sessionKey) return "";
+    if (typeof store.latestEventBySessionKeyType !== "function") return "";
+    const recap = store.latestEventBySessionKeyType(sessionKey, RECAP_TYPE);
     if (!recap) return "";
     return buildSessionRecapBlock(recap.text);
   } catch (err) {

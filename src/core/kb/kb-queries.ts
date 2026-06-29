@@ -1027,21 +1027,27 @@ export function listEventsBySession(db: DatabaseSync, sessionKey: string): KbEve
 }
 
 /**
- * Most recent event of a given type for a project (newest world-time first),
- * or undefined. Used by the session-continuity recap injection to fetch the
- * latest `session_recap` for the current project. Deterministic — no embeddings.
+ * Most recent event of a given type for a session_key (newest world-time
+ * first), or undefined. Used by the session-continuity recap injection to fetch
+ * the latest `session_recap` for the current context. Deterministic — no
+ * embeddings.
+ *
+ * WHY session_key (not project): the `project` column is empty on captured
+ * events, while `session_key` is verified-stable per project across many
+ * sessions (one key spans a month / 25 session_ids). session_key is therefore
+ * the reliable per-project join for cross-session continuity.
  */
-export function latestEventByProjectType(
+export function latestEventBySessionKeyType(
   db: DatabaseSync,
-  project: string,
+  sessionKey: string,
   type: string,
 ): KbEvent | undefined {
-  const p = project?.trim();
+  const k = sessionKey?.trim();
   const t = type?.trim();
-  if (!p || !t) return undefined;
+  if (!k || !t) return undefined;
   const row = db
-    .prepare("SELECT * FROM events WHERE project = ? AND type = ? ORDER BY ts DESC, id DESC LIMIT 1")
-    .get(p, t) as Record<string, unknown> | undefined;
+    .prepare("SELECT * FROM events WHERE session_key = ? AND type = ? ORDER BY ts DESC, id DESC LIMIT 1")
+    .get(k, t) as Record<string, unknown> | undefined;
   return row ? rowToEvent(row) : undefined;
 }
 

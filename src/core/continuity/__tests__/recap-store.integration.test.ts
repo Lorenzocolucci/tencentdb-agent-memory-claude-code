@@ -38,16 +38,16 @@ describe("recap store queries", () => {
     expect(s1.every((e) => e.session_key === "s1")).toBe(true);
   });
 
-  it("latestEventByProjectType returns the newest matching event", () => {
-    store.insertEvent({ sessionKey: "s1", ts: "2026-06-29T10:00:00.000Z", project: "p", type: "session_recap", text: "old" });
-    store.insertEvent({ sessionKey: "s2", ts: "2026-06-29T12:00:00.000Z", project: "p", type: "session_recap", text: "new" });
-    store.insertEvent({ sessionKey: "s3", ts: "2026-06-29T13:00:00.000Z", project: "other", type: "session_recap", text: "wrongproj" });
+  it("latestEventBySessionKeyType returns the newest matching event", () => {
+    store.insertEvent({ sessionKey: "sk", ts: "2026-06-29T10:00:00.000Z", type: "session_recap", text: "old" });
+    store.insertEvent({ sessionKey: "sk", ts: "2026-06-29T12:00:00.000Z", type: "session_recap", text: "new" });
+    store.insertEvent({ sessionKey: "other", ts: "2026-06-29T13:00:00.000Z", type: "session_recap", text: "wrongkey" });
 
-    const latest = store.latestEventByProjectType!("p", "session_recap");
+    const latest = store.latestEventBySessionKeyType!("sk", "session_recap");
     expect(latest?.text).toBe("new");
   });
 
-  it("latestEventByProjectType returns undefined when nothing matches", () => {
-    expect(store.latestEventByProjectType!("nope", "session_recap")).toBeUndefined();
+  it("latestEventBySessionKeyType returns undefined when nothing matches", () => {
+    expect(store.latestEventBySessionKeyType!("nope", "session_recap")).toBeUndefined();
   });
 });

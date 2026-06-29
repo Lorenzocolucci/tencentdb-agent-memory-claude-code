@@ -600,8 +600,12 @@ export interface IMemoryStore {
   /** All events for a session (chronological). Optional — backends may omit. */
   listEventsBySession?(sessionKey: string): KbEvent[];
 
-  /** Most recent event of a given type for a project, or undefined. Optional. */
-  latestEventByProjectType?(project: string, type: string): KbEvent | undefined;
+  /**
+   * Most recent event of a given type for a session_key, or undefined. Optional.
+   * session_key is the verified-stable per-project join (the `project` column is
+   * empty on captured events).
+   */
+  latestEventBySessionKeyType?(sessionKey: string, type: string): KbEvent | undefined;
   /**
    * All relation edges touching an entity (as src OR dst), within its namespace.
    * Powers the entity-page "Related [[entity]]" links.

@@ -381,10 +381,11 @@ async function performAutoRecallInner(params: {
       bannerEmitted = true;
 
       // "Dove eravamo" — on the first turn, prepend the previous session's
-      // anchored recap for THIS project (reconstruction, not a doc dump).
-      // Off the critical path: latestRecapBlock returns "" on any failure.
-      if (projectName && vectorStore) {
-        const recapBlock = latestRecapBlock({ store: vectorStore, project: projectName, logger });
+      // anchored recap for THIS context, joined on session_key (stable per
+      // project; the events' `project` column is empty). Reconstruction, not a
+      // doc dump. Off the critical path: latestRecapBlock returns "" on failure.
+      if (vectorStore && params.sessionKey) {
+        const recapBlock = latestRecapBlock({ store: vectorStore, sessionKey: params.sessionKey, logger });
         if (recapBlock) {
           prependContext = prependContext ? `${recapBlock}\n\n${prependContext}` : recapBlock;
         }
