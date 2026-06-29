@@ -12,6 +12,7 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import { recordAudit } from "./memory-audit.js";
+import { parseProvenance, serializeProvenance, deriveTrust } from "./provenance.js";
 
 export interface LifecycleRow {
   owner_id: string;
@@ -143,4 +144,50 @@ export function reinforce(db: DatabaseSync, params: ReinforceParams): LifecycleR
   );
 
   return getLifecycle(db, ownerId, ownerKind) as LifecycleRow;
+}
+
+export interface ConfirmProvenanceParams {
+  ownerId: string;
+  ownerKind: string;
+  now: string;
+}
+
+/**
+ * Flip a memory unit's provenance stamp to lorenzo_confirmed/trusted and write one
+ * audit row (operation="confirm", actor="user"). Creates the lifecycle row first if
+ * missing. Returns the updated row, or null if absent after.
+ */
+export function confirmProvenance(
+  db: DatabaseSync,
+  p: ConfirmProvenanceParams,
+): LifecycleRow | null {
+  const cur = ensureLifecycle(db, { ownerId: p.ownerId, ownerKind: p.ownerKind, now: p.now });
+  const before = parseProvenance(cur.provenance_json);
+  const after = {
+    ...before,
+    origin: "lorenzo_confirmed" as const,
+    trust: deriveTrust("lorenzo_confirmed"),
+    confirmed_by: "lorenzo" as const,
+    confirmed_at: p.now,
+  };
+  db.prepare(
+    `UPDATE memory_lifecycle SET provenance_json = ?, updated_time = ?
+       WHERE owner_id = ? AND owner_kind = ?`,
+  ).run(serializeProvenance(after), p.now, p.ownerId, p.ownerKind);
+
+  recordAudit(
+    db,
+    {
+      ownerId: p.ownerId,
+      ownerKind: p.ownerKind,
+      operation: "confirm",
+      actor: "user",
+      before: { trust: before.trust, origin: before.origin },
+      after: { trust: after.trust, origin: after.origin },
+      reason: "confirmed by Lorenzo",
+      namespace: cur.namespace,
+    },
+    p.now,
+  );
+  return getLifecycle(db, p.ownerId, p.ownerKind);
 }
