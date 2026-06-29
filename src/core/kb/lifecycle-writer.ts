@@ -178,6 +178,9 @@ export function confirmProvenance(
     trust: deriveTrust("lorenzo_confirmed"),
     confirmed_by: "lorenzo" as const,
     confirmed_at: p.now,
+    // Resolving the question CLEARS the gate: a confirmed memory must stop
+    // surfacing in getPendingAsks (asked once, learned forever).
+    gate_state: "clear" as const,
   };
   db.prepare(
     `UPDATE memory_lifecycle SET provenance_json = ?, updated_time = ?
