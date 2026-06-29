@@ -341,7 +341,8 @@ Debugging no longer means probing an opaque database — it becomes a determinis
 | Hermes Gateway adapter | `TdaiCore + HostAdapter`, decoupled from the host framework |
 | Local backend | `SQLite + sqlite-vec`, ready to use out of the box |
 | Hybrid retrieval | BM25 + vector + RRF — supports both keyword and semantic recall |
-| Agent tools | `tdai_memory_search` / `tdai_conversation_search` |
+| Agent tools | `tdai_memory_search` / `tdai_conversation_search` / `tdai_confirm_memory` / `tdai_reject_memory` |
+| Grounded Trust | Uncertain, high-stakes memories are gated: the agent is interrupted to confirm with the user before acting; confirm → authoritative, reject → tombstoned (learned, never re-asked) |
 
 ---
 

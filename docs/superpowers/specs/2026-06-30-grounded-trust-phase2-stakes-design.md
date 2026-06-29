@@ -1,6 +1,10 @@
 # Grounded Trust — Phase 2: the "consequential action" gate (stakes)
 
-> Design DRAFT, 2026-06-30 (Lorenzo & Socio). Status: **DRAFT — not approved, no code.**
+> Design, 2026-06-30 (Lorenzo & Socio). Status: **IMPLEMENTED 2026-06-30** — built TDD,
+> commit e665cfc on `feat/memory-excellence`. stakes.ts (operative + vision branches),
+> provenance v2 gate fields, markGatePending/rejectMemory/gateRecalledUnits. All tests
+> green; deployed live. Phase 3+4 (ask-loop + learning) build on this — see
+> `2026-06-30-grounded-trust-phase3-4-ask-loop-and-learning-design.md`.
 > Parent pillar: [the child and the fire](./2026-06-29-grounded-trust-child-and-fire-design.md).
 > Builds on Phase 1 ([provenance](./2026-06-29-grounded-trust-phase1-provenance-design.md),
 > IMPLEMENTED). This is **Phase 2 of 4**. It builds ONLY the gate that decides *when*

@@ -1,8 +1,19 @@
 # Grounded Trust — "the child and the fire" pillar
 
-> Opening design, 2026-06-29 (Lorenzo & Socio). Status: VISION + DIRECTION captured,
-> NOT yet built. Next-session trigger phrase: *"Partiamo a costruire il pilastro
-> del bambino con il fuoco."*
+> Opening design, 2026-06-29 (Lorenzo & Socio).
+> **Status: FULLY IMPLEMENTED + DEPLOYED LIVE 2026-06-30.** All four phases built
+> TDD on `feat/memory-excellence`:
+> - Phase 1 — provenance/trust foundation (`...-phase1-provenance-design.md`, commits
+>   b805f60/e036912/afb0c27/75a497d).
+> - Phase 2 — the "consequential action" stakes gate, operative + vision
+>   (`...-phase2-stakes-design.md`, commit e665cfc).
+> - Phase 3+4 — the ask-loop (INTERRUPT model) + learning
+>   (`...-phase3-4-ask-loop-and-learning-design.md`, commits 8018dd1/5614fc2/437b5c4/f76594c).
+> Deployed: gateway reloaded the new `dist/`, `/health` + `/recall` = 200. The full
+> loop is proven by `grounded-trust-loop.test.ts` (which caught a real bug: confirm
+> was not clearing the gate → fixed in 437b5c4). See memory card
+> `sinapsys-grounded-trust-phase2-draft`. NOT yet observed firing on an organic
+> recall (needs an uncertain high-stakes memory to resurface naturally).
 
 ## The problem this was born from (but it outgrew)
 
