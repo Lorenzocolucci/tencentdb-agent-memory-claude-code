@@ -12,65 +12,65 @@ import type { MemoryRecord, ExtractedMemory } from "../record/l1-writer.js";
 // System Prompt
 // ============================
 
-export const CONFLICT_DETECTION_SYSTEM_PROMPT = `你是记忆冲突检测器。批量比较多条【新记忆】与【统一候选记忆池】中的已有记忆，逐条决定如何处理。
+export const CONFLICT_DETECTION_SYSTEM_PROMPT = `You are a memory conflict detector. Batch-compare multiple [New Memories] against existing memories in the [Unified Candidate Pool] and decide how to handle each one.
 
-## 最高原则：保守优先，宁可保留两条，绝不误删
+## Overriding Principle: Prefer Caution — Better to Keep Two Entries Than to Delete One by Mistake
 
-合并是破坏性操作：被合并的旧记忆会被**物理删除**。因此只有在你**确信**两条记忆是字面上的同一条原子事实时才允许合并。任何不确定，一律选择 store 或 skip（两条都保留）。漏合并只是轻微冗余，误合并会永久丢失记忆——后者代价远高于前者。
+Merging is a destructive operation: the old memory that gets merged is **physically deleted**. Therefore you may only merge when you are **certain** that two memories are literally the same atomic fact. When in doubt, always choose store or skip (keeping both). Missing a merge causes only minor redundancy; a wrong merge causes permanent memory loss — the latter is far costlier.
 
-## 硬性禁止（违反任何一条都会导致记忆丢失，绝对不可触犯）
+## Hard Prohibitions (violating any one will cause memory loss — absolute)
 
-1. **禁止跨 type 合并**：persona / episodic / instruction 三类之间**永远不能**互相 merge 或 update。type 不同 → 直接判定为不同记忆，只能 store 或 skip。
-2. **禁止多对多合并**：一条新记忆**最多**只能对应候选池中的**一条**旧记忆。target_ids 数组长度只能是 0 或 1，绝不允许 2 个及以上。
-3. **禁止抬高优先级**：merge / update 后的 merged_priority **只能取新旧两条记忆 priority 的较大值**，绝不允许超过这个最大值。不准"酌情提升"。
-4. **episodic 事件永不去重**：两条 episodic 记忆只要日期、时间、任务、地点中任意一项不同，就是**不同事件**，必须各自保留（双方 store/skip），禁止 merge/update。
+1. **No cross-type merging**: the three types persona / episodic / instruction can **never** be merged or updated into each other. Different type → treat as different memories; only store or skip is allowed.
+2. **No many-to-one merging**: one new memory may correspond to **at most one** existing memory in the candidate pool. The target_ids array length must be 0 or 1 — never 2 or more.
+3. **No priority inflation**: after a merge / update, merged_priority **must be the greater of the two memories' priorities** — never exceed that maximum. No "discretionary boosting".
+4. **Episodic events are never deduplicated**: two episodic memories are **different events** if any one of date, time, task, or location differs — each must be kept (both store/skip); merge/update is forbidden.
 
-## 判断逻辑（仅在不触犯上述硬性禁止时适用）
+## Decision Logic (applies only when none of the hard prohibitions above are triggered)
 
-对每条新记忆，依次检查：
+For each new memory, check in order:
 
-1. **type 是否相同？** 不同 → 只能 store 或 skip，结束判断。
-2. **是否字面同一条原子事实？**（subsumption：一条记忆的信息完全被另一条包含，描述的是同一主体、同一属性/同一事件、同一时间）
-   - 否 → store（新增）。
-   - 是 → 进入第 3 步。
-3. **新旧哪条更优？**
-   - 旧记忆已完整覆盖新记忆、新记忆无任何增量 → **skip**（丢弃新记忆，保留旧记忆，不删除任何东西）。
-   - 新记忆是对**同一条**旧记忆的更具体/更晚/纠错版本 → **update**（target_ids 恰好 1 个，覆盖那一条旧记忆）。
-4. **任何犹豫 → store**。只要你无法确信是同一条原子事实，就当作新记忆 store，绝不 merge。
+1. **Are the types the same?** If not → only store or skip; end.
+2. **Are they literally the same atomic fact?** (subsumption: one memory's information is fully contained in the other, describing the same subject, same attribute/event, same time)
+   - No → store (add as new).
+   - Yes → proceed to step 3.
+3. **Which one is better?**
+   - The old memory already fully covers the new one, and the new one adds nothing → **skip** (discard new memory; keep old memory; delete nothing).
+   - The new memory is a more specific / more recent / corrected version of **that one** old memory → **update** (target_ids exactly 1; replace that one old memory).
+4. **Any hesitation → store**. If you cannot be certain they are the same atomic fact, treat the new one as a new memory and store it — never merge.
 
-## 各动作定义
+## Action Definitions
 
-- "store"：视为新信息，新增当前记忆。**不删除任何旧记忆**（target_ids 为空）。
-- "skip"：旧记忆已足够，新记忆无增量，丢弃当前新记忆。**不删除任何旧记忆**（target_ids 为空）。
-- "update"：新记忆是**同一条**旧记忆的更优版本（同 type、同一原子事实、更具体或更晚或纠错）。以新记忆覆盖那**唯一一条**旧记忆，可保留旧记忆中仍正确的细节。target_ids 长度恰为 1。
-- "merge"：仅在**同 type**、且新记忆与候选池中**恰好一条**旧记忆是同一条原子事实、信息互补不矛盾时使用，合并为一条。target_ids 长度恰为 1。**如有任何疑问，改用 store。**
+- "store": treat as new information; add the current memory. **Do not delete any old memory** (target_ids empty).
+- "skip": the old memory is sufficient; the new one adds nothing; discard the new memory. **Do not delete any old memory** (target_ids empty).
+- "update": the new memory is a better version of **that one** old memory (same type, same atomic fact, more specific or more recent or a correction). Replace that **single** old memory with the new one; you may retain still-correct details from the old one. target_ids length exactly 1.
+- "merge": use **only** when (a) same type and (b) the new memory and **exactly one** old memory in the pool are the same atomic fact with complementary information that does not contradict. Combine into one. target_ids length exactly 1. **If any doubt, use store instead.**
 
-## timestamp 处理
-- update / merge 时，merged_timestamps = 新记忆时间戳 ∪ 被覆盖那一条旧记忆的时间戳（去重排序）。
-- store / skip 时省略。
+## timestamp handling
+- update / merge: merged_timestamps = timestamps of the new memory ∪ timestamps of the one replaced old memory (deduplicated, sorted).
+- store / skip: omit.
 
-## 输出格式
+## Output Format
 
-严格输出 JSON 数组，每个元素对应一条新记忆的决策。不输出任何其他内容：
+Output strictly a JSON array; each element corresponds to the decision for one new memory. Output nothing else:
 
 [
   {
-    "record_id": "新记忆的 record_id",
+    "record_id": "record_id of the new memory",
     "action": "store|update|skip|merge",
-    "target_ids": ["要替换的那一条旧记忆 record_id（最多 1 个；store/skip 时省略或为空数组）"],
-    "merged_content": "合并/更新后的记忆内容（merge/update 时必填）",
-    "merged_type": "必须与被合并旧记忆和新记忆的 type 完全一致（merge/update 时必填）",
+    "target_ids": ["record_id of the single old memory to replace (at most 1; omit or empty array for store/skip)"],
+    "merged_content": "merged/updated memory content (required for merge/update)",
+    "merged_type": "must match the type of both the old and new memories exactly (required for merge/update)",
     "merged_priority": 85,
-    "merged_timestamps": ["合并后的时间戳数组（merge/update 时必填）"]
+    "merged_timestamps": ["array of merged timestamps (required for merge/update)"]
   }
 ]
 
-字段说明：
-- target_ids：要替换的旧记忆 ID 数组。长度**只能是 0 或 1**。store/skip 时省略或为空。
-- merged_content：merge/update 时的最终记忆文本。store/skip 时省略。
-- merged_type：必须等于新记忆与被合并旧记忆共同的 type（跨 type 已被禁止，因此三者 type 必然相同）。
-- merged_priority：取新旧两条记忆 priority 的**较大值**，不得超过该最大值（0-100 整数，merge/update 时必填）。
-- merged_timestamps：新记忆 + 被合并那一条旧记忆的时间戳，去重排序。`;
+Field notes:
+- target_ids: array of old memory IDs to replace. Length **must be 0 or 1**. Omit or leave empty for store/skip.
+- merged_content: the final memory text for merge/update. Omit for store/skip.
+- merged_type: must equal the shared type of the new and old memories (cross-type is already prohibited, so all three will have the same type).
+- merged_priority: the **greater** of the two memories' priorities; must not exceed that maximum (integer 0–100; required for merge/update).
+- merged_timestamps: timestamps of the new memory + the one merged old memory, deduplicated and sorted.`;
 
 // ============================
 // Prompt Builder
@@ -123,10 +123,10 @@ export function formatBatchConflictPrompt(matches: CandidateMatch[]): string {
 
   let poolSection: string;
   if (poolList.length === 0) {
-    poolSection = "## 统一候选记忆池\n\n（空，没有已有记忆，所有新记忆直接 store）";
+    poolSection = "## Unified Candidate Pool\n\n(empty — no existing memories; all new memories go directly to store)";
   } else {
     const poolStr = JSON.stringify(poolList, null, 2);
-    poolSection = `## 统一候选记忆池（共 ${poolList.length} 条已有记忆）\n\n${poolStr}`;
+    poolSection = `## Unified Candidate Pool (${poolList.length} existing memories)\n\n${poolStr}`;
   }
 
   // Step 3: Format each new memory with its related candidate IDs
@@ -135,7 +135,7 @@ export function formatBatchConflictPrompt(matches: CandidateMatch[]): string {
     const relatedNote =
       relatedIds.length > 0
         ? JSON.stringify(relatedIds)
-        : "[]（无相似候选，直接 store）";
+        : "[] (no similar candidates — store directly)";
 
     const memStr = JSON.stringify(
       {
@@ -149,7 +149,7 @@ export function formatBatchConflictPrompt(matches: CandidateMatch[]): string {
       2,
     );
 
-    return `### 第 ${idx + 1} 条新记忆 (record_id: ${m.newMemory.record_id})\n${memStr}\n\n【关联候选 ID】${relatedNote}`;
+    return `### New Memory ${idx + 1} (record_id: ${m.newMemory.record_id})\n${memStr}\n\n[Related Candidate IDs] ${relatedNote}`;
   });
 
   const newMemoriesText = memoryParts.join(
@@ -161,9 +161,9 @@ export function formatBatchConflictPrompt(matches: CandidateMatch[]): string {
 
 ${"═".repeat(50)}
 
-## 待判断的新记忆（共 ${matches.length} 条）
+## New Memories to Evaluate (${matches.length} total)
 
 ${newMemoriesText}
 
-请逐条判断并输出决策 JSON 数组。当某条新记忆的候选列表为空时，该条直接输出 action=store。`;
+Evaluate each memory in turn and output the decision JSON array. When a new memory's candidate list is empty, output action=store for that entry.`;
 }

@@ -18,126 +18,126 @@ import type { ConversationMessage } from "../conversation/l0-recorder.js";
 // System Prompt (verbatim from the Phase 2 spec)
 // ============================
 
-export const KB_EXTRACTION_SYSTEM_PROMPT = `你是一个"实体中心记忆抽取引擎 / entity-centric memory extractor"。
-你的唯一任务：把一个对话窗口（≤10 条消息，含 id/role/timestamp）转换成一个**严格的 JSON 对象 KbDelta**。
-本系统服务于一个**编程/工程协作 agent**。最有价值的记忆是技术工作事实：决定、bug、修复、配置/架构选择、用户偏好、重要状态变化。
+export const KB_EXTRACTION_SYSTEM_PROMPT = `You are an "entity-centric memory extractor".
+Your ONLY task: convert one conversation window (≤10 messages, each with id/role/timestamp) into a **strict JSON object: a KbDelta**.
+This system serves a **programming / engineering collaboration agent**. The most valuable memories are technical work facts: decisions, bugs, fixes, config/architecture choices, user preferences, important state changes.
 
-规则 0 —— 输出语言（最高优先级，#1 质量红线，违反即判定失败）
-所有**输出文本字段**（entity.name、entity.aliases、fact.value、event.text）**必须使用对话窗口本身的语言**：
-窗口是意大利文 → 全部用意大利文；英文 → 英文；中文 → 才用中文。
-**绝不**把英文/意大利文翻译成中文。判定标准是【窗口消息】的语言，而**不是**本提示词的语言。
-顶层 "language" 字段 = **窗口的主语言**（英文窗口→"en"，意文→"it"），同样按窗口判定，绝不因为本提示词是中文就填 "zh"。
-唯一例外：attribute 键名（见规则 5）始终是英文 snake_case；type/relation 枚举值始终是英文。
-  正确 (IT 窗口 → IT 输出)：{"type":"decision","text":"Deciso di rimandare la raccolta dell'IBAN a dopo la chiamata."}
-  错误 (被翻译成中文)：    {"type":"decision","text":"决定把 IBAN 的收集推迟到通话之后。"}   ← 禁止
+RULE 0 — OUTPUT LANGUAGE (highest priority, #1 quality red line; violating it = failure)
+All **output text fields** (entity.name, entity.aliases, fact.value, event.text) **MUST use the language of the conversation window itself**:
+window is Italian → everything in Italian; English → English; Chinese → only then Chinese.
+**NEVER** translate English/Italian into Chinese. The deciding factor is the language of the [window messages], **NOT** the language of this prompt.
+The top-level "language" field = **the window's primary language** (English window → "en", Italian → "it"); decide it from the window too, never default to "zh" just because this prompt is in English.
+The ONLY exception: attribute keys (see Rule 5) are always English snake_case; type/relation enum values are always English.
+  Correct (IT window → IT output): {"type":"decision","text":"Deciso di rimandare la raccolta dell'IBAN a dopo la chiamata."}
+  Wrong: the same sentence rewritten into Chinese (or any language other than the window's) ← forbidden, never translate the source language away
 
-规则 1 —— STATE（facts）vs EVENT（events）拆分
-• fact = 某实体当前的属性值（STATE），回答"现在情况是什么"。例：project "Sofia" 的 "iban_delivery"="template WhatsApp"；bug "booking-loop" 的 "status"="open"。
-• event = 发生过的、不可变的一件事（EVENT），回答"发生了什么、何时"。
-• 一个决定通常同时产生 BOTH：一个 event（决定动作本身，带时间）+ 一个 fact（决定导致的最新状态），并用 fact.source_event_ref 指回该 event。
-• 一个 bug 通常：entity(type=bug) + event(type=bug) + fact(attribute=status,value=open)；修复后追加 event(type=fix) + 把 status 改为 fixed。
+RULE 1 — STATE (facts) vs EVENT (events) split
+• fact = an entity's CURRENT attribute value (STATE), answering "what is the situation now". E.g. project "Sofia" → "iban_delivery"="template WhatsApp"; bug "booking-loop" → "status"="open".
+• event = something that happened, immutable (EVENT), answering "what happened, and when".
+• A decision usually produces BOTH: an event (the decision act itself, with a timestamp) + a fact (the latest state the decision caused), with fact.source_event_ref pointing back to that event.
+• A bug usually: entity(type=bug) + event(type=bug) + fact(attribute=status,value=open); after the fix, append event(type=fix) + change status to fixed.
 
-规则 2 —— 原子化：一条 fact 只表达一个 (entity,attribute,value)；一条 event 只表达一句原子陈述。禁止多段落/列表塞进单个 value/text。
+RULE 2 — Atomicity: one fact expresses exactly one (entity,attribute,value); one event expresses exactly one atomic statement. Never stuff multiple paragraphs/lists into a single value/text.
 
-规则 2.5 —— 完整性（与规则 3.5 互补，不冲突）：在**有**真实工作内容的窗口里，要抽取其中**所有**具体技术事实——每个 bug、错误码（如 42703）、根因、失败的尝试（"X 被证明无效/INEFFECTIVE"）、决定、配置值/环境变量（如 ENABLE_LEADDOC_BACKFILL=true）、用户稳定偏好，都要成为**独立的** fact/event。**绝不**因为窗口里另有更显眼的任务就只挑一条而丢掉其余——一个繁忙窗口产生多条 events/facts 是正常且期望的。技术事实就算出现在助手的长消息/调查报告里（不是"我搜索了X"这类过程自述，而是"根因是Y""错误码42703""Z无效"这类**结论性发现**），同样要抽取。判据：具体技术内容=尽量抽全；纯任务脚手架/噪声=空。
+RULE 2.5 — Completeness (complements Rule 3.5, no conflict): in a window that DOES contain real work, extract **every** concrete technical fact in it — each bug, error code (e.g. 42703), root cause, failed attempt ("X proved INEFFECTIVE"), decision, config value / environment variable (e.g. ENABLE_LEADDOC_BACKFILL=true), and stable user preference must become an **independent** fact/event. **Never** pick just one and drop the rest because some other task in the window looks more prominent — a busy window producing multiple events/facts is normal and expected. A technical fact still counts even when it appears inside a long assistant message / investigation report (NOT process self-narration like "I searched X", but **conclusive findings** like "the root cause is Y", "error code 42703", "Z is ineffective"). Criterion: concrete technical content = extract it all; pure task scaffolding / noise = empty.
 
-规则 3 —— 绝不抽取（命中任一 → 完全跳过）：
-• AI 自身的配置/系统提示词/角色设定/agent 人设。
-• CLAUDE.md、规则文件、约定、"非协商规则"、工作流、路由表、工具/CLI 清单（AI 既有设定，非本次新事实）。
-• 助手自己的检索输出/状态观察："I searched X and didn't find it"、"found N results"、"grep 返回空"、"读取了文件 Y"（过程性自述，不是记忆——这是旧版本垃圾与混淆的根源）。
-• 任务编排脚手架：\`<task>\`/\`<objective>\`/\`<continuation>\`/\`<scheduled-task>\` 等任务框架标签、"Stop hook feedback"/TASKMASTER 停止检查、调度任务自动运行提示、纯任务清单（"Fix P1–P4"、"steps 1–7"、"T1–T8 investigation"）——这些是给 AI 的指令脚手架，不是要记住的事实。例外：若其中夹带**具体技术事实**（某个 bug、错误码如 42703、决定、文件/配置改动、客户规则），仍抽取那个事实本身，但忽略指令外壳。
-• 琐碎闲聊/问候/纯情绪；一次性临时工具请求。
-口诀：来自既有配置 / AI 自述过程 / 任务指令外壳 = 不抽取；来自本次对话的工作内容（决定/bug/修复/改动/用户稳定偏好）= 抽取。
+RULE 3 — NEVER extract (match any one → skip entirely):
+• The AI's own configuration / system prompt / role definition / agent persona.
+• CLAUDE.md, rule files, conventions, "non-negotiable rules", workflows, routing tables, tool/CLI lists (existing AI setup, not new facts from this conversation).
+• The assistant's own search output / status observations: "I searched X and didn't find it", "found N results", "grep returned empty", "read file Y" (process self-narration, not memory — this was the source of old-version garbage and confusion).
+• Task-orchestration scaffolding: \`<task>\`/\`<objective>\`/\`<continuation>\`/\`<scheduled-task>\` and similar task-framework tags, "Stop hook feedback"/TASKMASTER stop checks, scheduled-task auto-run notices, pure task checklists ("Fix P1–P4", "steps 1–7", "T1–T8 investigation") — these are instruction scaffolding for the AI, not facts to remember. Exception: if such scaffolding embeds a **concrete technical fact** (a specific bug, an error code like 42703, a decision, a file/config change, a client rule), still extract that fact itself but ignore the instruction shell.
+• Trivial chit-chat / greetings / pure emotion; one-off temporary tool requests.
+Mnemonic: from existing config / AI self-narration / task-instruction shell = do not extract; from the actual work content of this conversation (decisions/bugs/fixes/changes/stable user preferences) = extract.
 
-规则 3.5 —— 宁空勿编（最高纪律，违反即判定失败）：
-• 如果窗口主要是上述噪声/指令、信号很弱、或你不确定 → **输出空 delta** {"language":"<窗口语言>","entities":[],"facts":[],"events":[],"relations":[]}。
-• 绝不为了"必须有产出"而编造实体/属性/值。没有真实的工作事实就返回空——空是正确且常见的结果。
-• 输出文本只能用窗口的**单一**语言（见规则 0），绝不混入其它语言/文字 token（如把瑞典语 "kvalitet"、阿拉伯语 "موفق" 混进意大利文）——出现混语即说明你在硬编，应改为空 delta。
+RULE 3.5 — Prefer empty over invented (top discipline; violating it = failure):
+• If the window is mostly the noise/instructions above, the signal is weak, or you are unsure → **output an empty delta** {"language":"<window language>","entities":[],"facts":[],"events":[],"relations":[]}.
+• NEVER fabricate entities/attributes/values just to "have output". If there is no real work fact, return empty — empty is a correct and common result.
+• Output text may use ONLY the window's **single** language (see Rule 0); never mix in tokens of another language/script (e.g. don't drop Swedish "kvalitet" or Arabic "موفق" into Italian) — mixed language means you are hard-fabricating, so switch to an empty delta.
 
-规则 4 —— 实体：type ∈ {person|project|library|file|decision|bug|preference|concept}。name=源语言显示名（稳定、可跨会话识别）。aliases=其它写法/语言变体，帮助确定性解析器跨会话归并（如 name="FABLE_PLAN", aliases=["fable plan","piano fable"]）。每个实体一个窗口内唯一 ref（"e1"...），ref 仅 JSON 内部引用，不是 db id。
-  • type 必须用上面 8 个枚举之一。任何不在表里的概念（代码/密钥/密码/token/IBAN/标识符/术语/规范…）一律归到 **concept**，绝不发明新 type（如 "secret_code" 是错的）。
-  • 关键：当用户要你"记住某个值/代码/密钥/IBAN X"时，**字面值 X 属于 fact.value，不是 entity.name**。entity.name 用人类标签（如 "codice segreto"、"IBAN cliente"、"codice di test"），fact 用 attribute="value"（或更具体如 secret_code/iban/token）、value=字面值 X 本身。绝不把 X 当成 name 而把无关词（如 "important"）塞进 value。
+RULE 4 — Entities: type ∈ {person|project|library|file|decision|bug|preference|concept}. name = source-language display name (stable, identifiable across sessions). aliases = other spellings / language variants that help the deterministic resolver merge across sessions (e.g. name="FABLE_PLAN", aliases=["fable plan","piano fable"]). Each entity gets one ref unique within the window ("e1"...); ref is a JSON-internal reference only, NOT a db id.
+  • type MUST be one of the 8 enums above. Any concept not in the table (code/secret/password/token/IBAN/identifier/term/spec…) goes under **concept**; never invent a new type (e.g. "secret_code" is wrong).
+  • Key: when the user asks you to "remember some value/code/secret/IBAN X", the **literal value X belongs in fact.value, NOT in entity.name**. Use a human label for entity.name (e.g. "codice segreto", "IBAN cliente", "codice di test"), and put the value in a fact with attribute="value" (or more specific, e.g. secret_code/iban/token) and value = the literal X itself. Never put X as the name and stuff an unrelated word (e.g. "important") into value.
 
-规则 5 —— attribute 键永远英文 snake_case、语言中立（status, iban_delivery, default_branch, role, db_engine, os, preferred_language, location...），value 保持源语言。键英文、值源语言，分离。
+RULE 5 — attribute keys are always English snake_case and language-neutral (status, iban_delivery, default_branch, role, db_engine, os, preferred_language, location...), while value keeps the source language. Key in English, value in source language — kept separate.
 
-规则 6 —— events：type ∈ {decision|bug|fix|config_change|observation|preference_stated|task|result}。ts=世界时间 ISO8601（无显式时间则用该消息 timestamp）。entity_refs=涉及的实体 ref。source_message_ids=**原样照抄**窗口里来源消息的 id（如 "msg_1718_ab12"），绝不发明 id，只能用窗口中确实出现的 id。每个 event 唯一 ref（"ev1"），供 fact.source_event_ref 引用。
+RULE 6 — events: type ∈ {decision|bug|fix|config_change|observation|preference_stated|task|result}. ts = world time ISO8601 (if no explicit time, use that message's timestamp). entity_refs = the entity refs involved. source_message_ids = **copy verbatim** the id(s) of the source message(s) in the window (e.g. "msg_1718_ab12"); never invent ids, only use ids that actually appear in the window. Each event gets a unique ref ("ev1") for fact.source_event_ref to reference.
 
-规则 7 —— relations（重要！不要偷懒，这是知识图谱的连接）：type ∈ {uses|depends-on|fixed-by|caused|supersedes|recurs-in|decided-in|related-to}。src_ref/dst_ref 必须是本 JSON 已定义的 entity ref。
-  ⚠️ src_ref 和 dst_ref **只能是 entity 的 ref（e1/e2/e3…），绝不能是 event 的 ref（ev1/ev2…）**——relation 连接的是两个实体，不是事件。引用未在 entities 里定义的 ref = 错误。
-  **只要两个实体在本窗口里有任何真实联系，就必须输出一条 relation**——不要只列实体却不连它们。常见映射：
-  • file/项目 用到 库 → uses；bug 由 文件/改动 修复 → fixed-by；原因实体 导致 bug/结果 → caused；A 依赖 B → depends-on；新决定/值 取代旧的 → supersedes；bug 在某 文件/项目 反复出现 → recurs-in；决定 发生在某 项目/会话 → decided-in。
-  • 如果联系真实但不属于上述任何一类，用通用的 **related-to**（绝不因为找不到精确类型就省略这条边）。
-  例：file "auto-recall.ts" --uses--> library "sqlite-vec"；bug "booking-loop" --fixed-by--> file "booking.ts"；bug "error 42703" --caused--> concept "PostgREST schema cache"；project "Sofia" --related-to--> concept "IBAN cliente"。
+RULE 7 — relations (important! don't be lazy — this is the knowledge-graph wiring): type ∈ {uses|depends-on|fixed-by|caused|supersedes|recurs-in|decided-in|related-to}. src_ref/dst_ref MUST be entity refs already defined in this JSON.
+  ⚠️ src_ref and dst_ref **may only be entity refs (e1/e2/e3…), NEVER event refs (ev1/ev2…)** — a relation connects two entities, not events. Referencing a ref not defined in entities = error.
+  **Whenever two entities have any real connection in this window, you MUST output a relation** — don't list entities without wiring them. Common mappings:
+  • file/project uses a library → uses; bug fixed by a file/change → fixed-by; a cause entity leads to a bug/result → caused; A depends on B → depends-on; a new decision/value replaces an old one → supersedes; a bug recurs in a file/project → recurs-in; a decision happened in a project/session → decided-in.
+  • If the connection is real but fits none of the above, use the generic **related-to** (never drop the edge just because no precise type fits).
+  Examples: file "auto-recall.ts" --uses--> library "sqlite-vec"; bug "booking-loop" --fixed-by--> file "booking.ts"; bug "error 42703" --caused--> concept "PostgREST schema cache"; project "Sofia" --related-to--> concept "IBAN cliente".
 
-输出格式（严格）：只输出一个合法 JSON 对象，无 markdown 代码块，无解释文字：
-{ "language":"<BCP-47 主语言 it/en/zh>",
+OUTPUT FORMAT (strict): output ONLY one valid JSON object, no markdown code block, no explanatory text:
+{ "language":"<BCP-47 primary language it/en/zh>",
   "entities":[{"ref":"e1","type":"project","name":"...","aliases":["..."],"language":"it|en|zh|und"}],
-  "facts":[{"entity_ref":"e1","attribute":"<snake_case>","value":"<源语言>","valid_from":"<ISO 可选>","confidence":0.0-1.0,"source_event_ref":"ev1 可选"}],
-  "events":[{"ref":"ev1","type":"decision","ts":"<ISO>","text":"<原子,源语言>","entity_refs":["e1"],"source_message_ids":["msg_..."]}],
+  "facts":[{"entity_ref":"e1","attribute":"<snake_case>","value":"<source language>","valid_from":"<ISO optional>","confidence":0.0-1.0,"source_event_ref":"ev1 optional"}],
+  "events":[{"ref":"ev1","type":"decision","ts":"<ISO>","text":"<atomic, source language>","entity_refs":["e1"],"source_message_ids":["msg_..."]}],
   "relations":[{"src_ref":"e1","type":"uses","dst_ref":"e2"}] }
-窗口无可抽取记忆时输出：{"language":"<窗口语言>","entities":[],"facts":[],"events":[],"relations":[]}
+When the window has nothing to extract, output: {"language":"<window language>","entities":[],"facts":[],"events":[],"relations":[]}
 
-FEW-SHOT（输出文本=窗口语言；ref 仅内部；source_message_ids 原样照抄）
+FEW-SHOT (output text = window language; ref is internal only; source_message_ids copied verbatim)
 
-范例 1 — EN 窗口：决定→fact+event；用户偏好→fact；助手检索自述不抽取：
-窗口：
+Example 1 — EN window: decision → fact+event; user preference → fact; assistant search self-narration NOT extracted:
+window:
 [msg_a1] [user] [2026-06-05T10:00:00Z]: For the Sofia call flow, let's defer collecting the IBAN to after the call instead of mid-call.
 [msg_a2] [assistant] [2026-06-05T10:00:30Z]: Agreed. I searched the codebase and didn't find an existing IBAN step, so we'll add a post-call WhatsApp template.
 [msg_a3] [user] [2026-06-05T10:01:00Z]: Also, from now on always answer me in Italian.
-输出：
+output:
 {"language":"en",
  "entities":[{"ref":"e1","type":"project","name":"Sofia","aliases":["sofia ai","progetto sofia"],"language":"en"},{"ref":"e2","type":"person","name":"Lorenzo","aliases":[],"language":"en"}],
  "facts":[{"entity_ref":"e1","attribute":"iban_delivery","value":"post-call WhatsApp template","valid_from":"2026-06-05T10:00:00Z","confidence":0.9,"source_event_ref":"ev1"},{"entity_ref":"e2","attribute":"preferred_language","value":"Italian","valid_from":"2026-06-05T10:01:00Z","confidence":0.95,"source_event_ref":"ev2"}],
  "events":[{"ref":"ev1","type":"decision","ts":"2026-06-05T10:00:00Z","text":"Decided to defer collecting the IBAN to after the Sofia call, delivered via a post-call WhatsApp template.","entity_refs":["e1"],"source_message_ids":["msg_a1","msg_a2"]},{"ref":"ev2","type":"preference_stated","ts":"2026-06-05T10:01:00Z","text":"Lorenzo asked to always be answered in Italian from now on.","entity_refs":["e2"],"source_message_ids":["msg_a3"]}],
  "relations":[]}
-（msg_a2 的 "I searched ... didn't find" 是助手检索自述——不单独成记忆，只作 ev1 来源之一）
+(msg_a2's "I searched ... didn't find" is assistant search self-narration — not a standalone memory, only a source of ev1)
 
-范例 2 — EN 窗口：bug→entity+event+status fact+fixed-by 关系：
-窗口：
+Example 2 — EN window: bug → entity+event+status fact+fixed-by relation:
+window:
 [msg_b1] [user] [2026-06-06T09:00:00Z]: There's a booking loop bug: bookSlot() in booking.ts recurses forever when the slot is already taken.
 [msg_b2] [assistant] [2026-06-06T09:05:00Z]: Fixed it — added a taken-slot guard in booking.ts that returns early.
-输出：
+output:
 {"language":"en",
  "entities":[{"ref":"e1","type":"bug","name":"booking-loop","aliases":["booking loop bug"],"language":"en"},{"ref":"e2","type":"file","name":"booking.ts","aliases":[],"language":"en"}],
  "facts":[{"entity_ref":"e1","attribute":"status","value":"fixed","valid_from":"2026-06-06T09:05:00Z","confidence":0.9,"source_event_ref":"ev2"}],
  "events":[{"ref":"ev1","type":"bug","ts":"2026-06-06T09:00:00Z","text":"Bug: bookSlot() in booking.ts recurses forever when the slot is already taken (booking loop).","entity_refs":["e1","e2"],"source_message_ids":["msg_b1"]},{"ref":"ev2","type":"fix","ts":"2026-06-06T09:05:00Z","text":"Fix: added a taken-slot guard in booking.ts so bookSlot() returns early instead of recursing.","entity_refs":["e1","e2"],"source_message_ids":["msg_b2"]}],
  "relations":[{"src_ref":"e1","type":"fixed-by","dst_ref":"e2"}]}
 
-范例 3 — IT 窗口：库/文件依赖 + 配置事实（输出必须意大利文）：
-窗口：
+Example 3 — IT window: library/file dependency + config fact (output MUST be Italian):
+window:
 [msg_c1] [user] [2026-06-07T14:00:00Z]: In auto-recall.ts ora usiamo sqlite-vec per la ricerca vettoriale. Ho impostato il branch di default su main.
-输出：
+output:
 {"language":"it",
  "entities":[{"ref":"e1","type":"file","name":"auto-recall.ts","aliases":[],"language":"it"},{"ref":"e2","type":"library","name":"sqlite-vec","aliases":[],"language":"it"},{"ref":"e3","type":"project","name":"repo","aliases":[],"language":"it"}],
  "facts":[{"entity_ref":"e3","attribute":"default_branch","value":"main","valid_from":"2026-06-07T14:00:00Z","confidence":0.9,"source_event_ref":"ev1"}],
  "events":[{"ref":"ev1","type":"config_change","ts":"2026-06-07T14:00:00Z","text":"Impostato il branch di default su main; auto-recall.ts ora usa sqlite-vec per la ricerca vettoriale.","entity_refs":["e1","e2","e3"],"source_message_ids":["msg_c1"]}],
  "relations":[{"src_ref":"e1","type":"uses","dst_ref":"e2"}]}
 
-范例 4 — IT 窗口："记住这个值/代码"模式（字面值进 fact.value，不是 name；type=concept；输出意大利文）：
-窗口：
+Example 4 — IT window: "remember this value/code" pattern (literal value goes in fact.value, not name; type=concept; output Italian):
+window:
 [msg_d1] [user] [2026-06-16T21:00:00Z]: Importante, memorizza: il codice segreto è MANGO-STELLARE-99.
 [msg_d2] [assistant] [2026-06-16T21:00:10Z]: Ok, codice segreto MANGO-STELLARE-99 memorizzato.
-输出：
+output:
 {"language":"it",
  "entities":[{"ref":"e1","type":"concept","name":"codice segreto","aliases":[],"language":"it"}],
  "facts":[{"entity_ref":"e1","attribute":"value","value":"MANGO-STELLARE-99","valid_from":"2026-06-16T21:00:00Z","confidence":0.95,"source_event_ref":"ev1"}],
  "events":[{"ref":"ev1","type":"observation","ts":"2026-06-16T21:00:00Z","text":"Lorenzo ha comunicato che il codice segreto è MANGO-STELLARE-99.","entity_refs":["e1"],"source_message_ids":["msg_d1","msg_d2"]}],
  "relations":[]}
-（"Importante"/"memorizza" 只是强调语，绝不当成 value；真正的值是 MANGO-STELLARE-99 → 进 fact.value）
+("Importante"/"memorizza" are just emphasis — never treat them as the value; the real value is MANGO-STELLARE-99 → goes into fact.value)
 
-范例 5 — EN 窗口：繁忙混合窗口——忽略任务外壳，但把埋藏的 bug+错误码+根因+失败尝试**全部**抽出（多条 events）：
-窗口：
+Example 5 — EN window: busy mixed window — ignore the task shell but extract **all** the buried bug+error-code+root-cause+failed-attempt (multiple events):
+window:
 [msg_e1] [user] [2026-06-17T12:00:00Z]: T3 INVESTIGATION: you already proved NOTIFY pgrst + Render restart = INEFFECTIVE. Error 42703 "column postcall_state does not exist" still fires on the booking endpoint. Also set ENABLE_LEADDOC_BACKFILL=true in prod.
 [msg_e2] [assistant] [2026-06-17T12:10:00Z]: Root cause: the PostgREST schema cache is stale after the migration; the fix is to reload it via the schema-reload RPC, not a Render restart.
-输出：
+output:
 {"language":"en",
  "entities":[{"ref":"e1","type":"bug","name":"error 42703 postcall_state","aliases":["42703","column postcall_state does not exist"],"language":"en"},{"ref":"e2","type":"project","name":"Sofia","aliases":[],"language":"en"}],
  "facts":[{"entity_ref":"e1","attribute":"root_cause","value":"PostgREST schema cache stale after migration","valid_from":"2026-06-17T12:10:00Z","confidence":0.85,"source_event_ref":"ev2"},{"entity_ref":"e1","attribute":"status","value":"open","valid_from":"2026-06-17T12:00:00Z","confidence":0.8,"source_event_ref":"ev1"},{"entity_ref":"e2","attribute":"enable_leaddoc_backfill","value":"true","valid_from":"2026-06-17T12:00:00Z","confidence":0.8,"source_event_ref":"ev1"}],
  "events":[{"ref":"ev1","type":"bug","ts":"2026-06-17T12:00:00Z","text":"Error 42703 'column postcall_state does not exist' fires on the booking endpoint; NOTIFY pgrst + Render restart proved INEFFECTIVE. ENABLE_LEADDOC_BACKFILL set to true in prod.","entity_refs":["e1","e2"],"source_message_ids":["msg_e1"]},{"ref":"ev2","type":"observation","ts":"2026-06-17T12:10:00Z","text":"Root cause of 42703: PostgREST schema cache is stale after the migration; fix is to reload it via the schema-reload RPC, not a Render restart.","entity_refs":["e1"],"source_message_ids":["msg_e2"]}],
  "relations":[]}
-（任务外壳 "T3 INVESTIGATION" 忽略；但错误码 42703、根因、失败尝试 INEFFECTIVE、配置值 ENABLE_LEADDOC_BACKFILL 都是真实技术事实 → 全部抽取，产生多条 events/facts）
+(the task shell "T3 INVESTIGATION" is ignored; but error code 42703, root cause, failed attempt INEFFECTIVE, config value ENABLE_LEADDOC_BACKFILL are all real technical facts → extract them all, producing multiple events/facts)
 
-现在处理下面给你的窗口。只输出 KbDelta JSON 对象。`;
+Now process the window given below. Output ONLY the KbDelta JSON object.`;
 
 // ============================
 // Prompt Builder
@@ -152,9 +152,9 @@ function renderMessageLine(m: ConversationMessage): string {
  * Format the user prompt for KB single-stage extraction.
  *
  * Sections:
- *  - 【已知实体】(known entities — names only; reuse the identical name to merge)
- *  - 【背景对话】(context only — do NOT extract from here)
- *  - 【待抽取的窗口消息】(extract ONLY here; echo source_message_ids verbatim)
+ *  - [KNOWN ENTITIES] (names only; reuse the identical name to merge)
+ *  - [BACKGROUND CONVERSATION] (context only — do NOT extract from here)
+ *  - [WINDOW MESSAGES TO EXTRACT] (extract ONLY here; echo source_message_ids verbatim)
  *
  * Note: previousSceneName is intentionally dropped — scenes are projections now
  * (computed deterministically in P5), not part of the extraction contract.
@@ -174,24 +174,24 @@ export function formatKbExtractionPrompt(params: {
 
   const knownText = knownEntities.length > 0
     ? knownEntities.map((n) => `- ${n}`).join("\n")
-    : "无";
+    : "(none)";
 
   const bgText = backgroundMessages.length > 0
     ? backgroundMessages.map(renderMessageLine).join("\n\n")
-    : "无";
+    : "(none)";
 
   const newText = newMessages.map(renderMessageLine).join("\n\n");
 
-  return `【已知实体】（如本窗口提到同一实体，请复用完全相同的 name 以便确定性归并）：
+  return `[KNOWN ENTITIES] (if this window mentions the same entity, reuse the EXACT same name so the deterministic resolver merges it):
 ${knownText}
 
-【背景对话】（仅供理解上下文推断关系/时间，严禁从中抽取）：
+[BACKGROUND CONVERSATION] (for context only — to infer relations/time; NEVER extract from here):
 ${bgText}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-【待抽取的窗口消息】（务必结合 timestamp 推算时间，只从这里抽取；source_message_ids 必须原样照抄这里出现的消息 id）：
+[WINDOW MESSAGES TO EXTRACT] (always use the timestamp to infer time; extract ONLY from here; source_message_ids MUST be copied verbatim from the message ids appearing here):
 ${newText}
 
-请输出 KbDelta JSON 对象（无 markdown 包裹、无解释）。`;
+Output the KbDelta JSON object (no markdown wrapper, no explanation).`;
 }

@@ -29,27 +29,23 @@ import {
   buildCornerstones,
   type CornerstoneInjectionTracker,
 } from "../distinctiveness/cornerstone-runner.js";
+import {
+  MEMORY_TOOLS_GUIDE,
+  RELEVANT_MEMORIES_HEADER,
+  ACTIVITY_TIME_LABEL,
+} from "./recall-display.js";
 
 const TAG = "[memory-tdai] [recall]";
 
 /**
- * Memory tools usage guide — injected at the end of memory context so the
- * main agent knows how to actively retrieve deeper information.
+ * Inverse of formatMemoryLine: parse a formatted memory line back into its
+ * [type|scene] tag and content, stripping the trailing activity-time suffix.
+ * Built from ACTIVITY_TIME_LABEL so the formatter and this parser stay in
+ * lock-step — translating the label must not silently break metric parsing.
  */
-const MEMORY_TOOLS_GUIDE = `<memory-tools-guide>
-## 记忆工具调用指南
-
-当上方注入的记忆片段不足以回答用户问题时，可主动调用以下工具获取更多信息：
-
-- **tdai_memory_search**：搜索结构化记忆（L1），适用于回忆用户偏好、历史事件节点、规则等关键信息。
-- **tdai_conversation_search**：搜索原始对话（L0），适用于查找具体消息原文、时间线、上下文细节；也可用于补充或校验 memory_search 的结果。
-- **read_file**（Scene Navigation 中的路径）：当已定位到相关情境，且需要该场景的完整画像、事件经过或阶段结论时使用。
-
-### ⚠️ 调用次数限制
-每轮对话中，tdai_memory_search 和 tdai_conversation_search **合计最多调用 3 次**。
-- 首次搜索无结果时，可换关键词或换工具重试，但总调用次数不要超过 3 次。
-- 若 3 次搜索后仍无结果，说明该信息不在记忆中，请直接根据已有信息回复用户，不要继续搜索。
-</memory-tools-guide>`
+const MEMORY_LINE_RE = new RegExp(
+  `^-\\s+\\[([^\\]]+)\\]\\s+(.+?)(?:\\s*\\(${ACTIVITY_TIME_LABEL}:.*\\))?$`,
+);
 
 interface Logger {
   debug?: (message: string) => void;
@@ -239,7 +235,7 @@ async function performAutoRecallInner(params: {
 
     // Extract structured RecalledMemory from formatted lines for metric reporting
     recalledL1Memories = memoryLines.map((line) => {
-      const match = line.match(/^-\s+\[([^\]]+)\]\s+(.+?)(?:\s*\(活动时间:.*\))?$/);
+      const match = line.match(MEMORY_LINE_RE);
       if (match) {
         const tag = match[1];
         const content = match[2].trim();
@@ -356,7 +352,7 @@ async function performAutoRecallInner(params: {
     // inject attacker-controlled instructions into a future session.
     const safeMemoryLines = memoryLines.map((line) => escapeXmlTags(line));
     prependContext =
-      `<relevant-memories>\n以下是当前对话召回的相关记忆，不代表当前任务进程，仅作为参考：\n\n${safeMemoryLines.join("\n")}\n</relevant-memories>`;
+      `<relevant-memories>\n${RELEVANT_MEMORIES_HEADER}\n\n${safeMemoryLines.join("\n")}\n</relevant-memories>`;
   }
 
   // Session-open banner: inject instruction on FIRST turn of each SESSION.
@@ -498,7 +494,7 @@ async function runKbRecall(
 function formatKbRecallLine(r: KbRecallResult): string {
   let line = `- [${r.owner_kind}] ${r.text} (relevance: ${r.score.toFixed(2)})`;
   const point = formatTimestamp(r.ts);
-  if (point) line += ` (活动时间: ${point})`;
+  if (point) line += ` (${ACTIVITY_TIME_LABEL}: ${point})`;
   return line;
 }
 
@@ -991,17 +987,17 @@ function formatMemoryLine(m: FormatableMemory): string {
   const point = formatTimestamp(m.timestamp);
 
   if (start && end) {
-    // 段时间: both start and end
-    line += ` (活动时间: ${start} ~ ${end})`;
+    // range: both start and end
+    line += ` (${ACTIVITY_TIME_LABEL}: ${start} ~ ${end})`;
   } else if (start) {
-    // 段时间: only start
-    line += ` (活动时间: ${start}起)`;
+    // range: only start
+    line += ` (${ACTIVITY_TIME_LABEL}: from ${start})`;
   } else if (end) {
-    // 段时间: only end
-    line += ` (活动时间: 至${end})`;
+    // range: only end
+    line += ` (${ACTIVITY_TIME_LABEL}: until ${end})`;
   } else if (point) {
-    // 点时间: single timestamp
-    line += ` (活动时间: ${point})`;
+    // point-in-time: single timestamp
+    line += ` (${ACTIVITY_TIME_LABEL}: ${point})`;
   }
   // If all three are empty → no time info appended (graceful)
 

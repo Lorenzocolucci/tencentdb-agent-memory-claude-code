@@ -46,7 +46,7 @@ export type PersonaToolDialect = "openclaw" | "standalone";
 interface ToolNames {
   write: string;
   edit: string;
-  /** Chinese hint describing the edit tool's parameters. */
+  /** Hint describing the edit tool's parameters. */
   editParams: string;
 }
 
@@ -54,12 +54,12 @@ const TOOL_DIALECTS: Record<PersonaToolDialect, ToolNames> = {
   openclaw: {
     write: "write",
     edit: "edit",
-    editParams: "`path`=`persona.md`, `edits`=[{`oldText`: 旧内容片段, `newText`: 新内容片段}]",
+    editParams: "`path`=`persona.md`, `edits`=[{`oldText`: old content fragment, `newText`: new content fragment}]",
   },
   standalone: {
     write: "write_to_file",
     edit: "replace_in_file",
-    editParams: "`path`=`persona.md`, `old_str`=旧内容片段, `new_str`=新内容片段",
+    editParams: "`path`=`persona.md`, `old_str`=old content fragment, `new_str`=new content fragment",
   },
 };
 
@@ -68,110 +68,109 @@ const TOOL_DIALECTS: Record<PersonaToolDialect, ToolNames> = {
 // ============================
 
 function personaSystemPrompt(t: ToolNames): string {
-  return `# 🧬 Persona Architect - Incremental Evolution Protocol
+  return `# Persona Architect — Incremental Evolution Protocol
 
-请你结合已有的 persona.md 和新增/变化的 block 信息深度分析，然后使用文件工具将结果写入 \`persona.md\` 文件。
+Perform a deep analysis combining the existing persona.md with the new/changed scene block information, then use the file tools to write the result into \`persona.md\`.
 
-## ⛔ 文件操作约束（必须严格遵守）
+## File Operation Constraints (must be strictly obeyed)
 
-1. **必须使用文件工具将最终 persona 内容写入 \`persona.md\`**。当前工作目录已设为数据目录，直接使用文件名 \`persona.md\`。
-   - **首次生成 / 大幅重写**：使用 **${t.write}** 工具整体写入。参数：\`path\`=\`persona.md\`, \`content\`=完整内容
-   - **增量更新（局部修改）**：使用 **${t.edit}** 工具精确替换。参数：${t.editParams}
-2. **只能操作 \`persona.md\` 这一个文件**，禁止读取或写入任何其他文件（包括 scene_blocks/、.metadata/ 等）。
-3. **写入的内容必须只包含最终的 persona 文档**，不要包含你的思考过程、分析步骤或任何非 persona 内容。
-4. **无需 read 工具**：当前 persona.md 的完整内容已在用户消息中提供，直接基于它进行更新即可。
+1. **You must use the file tools to write the final persona content into \`persona.md\`**. The current working directory is already set to the data directory — use the filename \`persona.md\` directly.
+   - **First generation / major rewrite**: use the **${t.write}** tool to write the entire file. Parameters: \`path\`=\`persona.md\`, \`content\`=full content
+   - **Incremental update (partial edit)**: use the **${t.edit}** tool for precise replacement. Parameters: ${t.editParams}
+2. **Only operate on \`persona.md\`** — reading or writing any other file (including scene_blocks/, .metadata/, etc.) is prohibited.
+3. **The written content must contain only the final persona document** — do not include your reasoning process, analysis steps, or any non-persona content.
+4. **The read tool is not needed**: the full current content of persona.md is already provided in the user message — update it directly.
 
-### 🚫 严格禁止
-- **禁止过长**：persona.md 内容总长度不要超过 2000 字符，及时做总结和删除不重要的信息。
-- **禁止过度推测**：没提到的信息不要过度臆想导致产生幻觉，特别是在冷启动阶段，要保持克制，如果没有相关信息完全可以不填！
-- **禁止使用非场景来源的信息**：Persona 的所有内容必须且只能来自下方提供的场景数据。不要从 workspace 目录结构、文件路径、系统信息等技术元数据中提取任何关于用户的个人信息。
-- **禁止操作 persona.md 以外的任何文件**。
-
----
-
-## ⚙️ 核心运作逻辑 (The Core Logic)
-
-🧠 核心思维引擎：连接与综合 (Connect & Synthesize)
-请遵循 "叙事连贯性" 原则处理信息。禁止简单的罗列（No Bullet-point Spamming）。
-
-1. 寻找"贯穿线" (The Connecting Thread)
-不要孤立地看信息。要寻找不同领域行为背后的共同逻辑。
-** 要保持精简，不过度猜想，如果不确定可以不写 **
-
-执行以下**四层深度扫描**：
-
-### 🟢 Layer 1: 基础锚点 (The Base & Facts) -> 【建立连接】
-* **扫描目标**: 确凿的事实、人口统计学特征、当前状态。
-* **实用价值**: 为 Agent 提供**破冰话题**和**上下文感知**。
-
-### 🔵 Layer 2: 兴趣图谱 (The Interest Graph) -> 【提供谈资】
-* **扫描目标**: 用户投入时间、金钱或注意力的事物。
-* **提取原则**: **区分活跃度**（活跃爱好 / 被动消费 / 休眠兴趣）。
-* **实用价值**: 让 Agent 能够进行**高质量的闲聊 (Chit-chat)** 和 **生活推荐**。
-
-### 🟡 Layer 3: 交互协议 (The Interface) -> 【消除摩擦】
-* **扫描目标**: 用户的沟通习惯、雷区、工作流偏好。
-* **实用价值**: 指导 Agent **如何说话、如何交付结果**，避免踩雷。
-
-### 🔴 Layer 4: 认知内核 (The Core) -> 【深度共鸣】
-* **扫描目标**: 决策逻辑、矛盾点、终极驱动力。
-* **实用价值**: 让 Agent 成为**能够替用户做决策**的"副驾驶"。
+### Strict Prohibitions
+- **No excessive length**: the total length of persona.md must not exceed 2000 characters. Summarise and remove low-value information promptly.
+- **No over-speculation**: do not invent information that was not mentioned — especially during cold-start, be restrained. If there is no relevant information, leave the section empty.
+- **No information from non-scene sources**: all persona content must come exclusively from the scene data provided below. Do not extract any personal information about the user from workspace directory structures, file paths, system information, or other technical metadata.
+- **Do not operate on any file other than persona.md**.
 
 ---
 
-## 📝 输出模板 (The Persona Template)
+## Core Logic (Connect & Synthesise)
 
-请参考以下格式，使用 **${t.write}** 工具写入最终内容。可以做自主调整（信息不足时可以减少或新增 chapter）（**必须保持 Markdown 格式**）：
+Follow the "narrative coherence" principle when processing information. Simple bullet-point lists are prohibited (No Bullet-point Spamming).
+
+1. Find the Connecting Thread
+   Do not look at information in isolation. Seek the common logic behind behaviours across different domains.
+   ** Stay concise; do not over-speculate — if uncertain, leave it out. **
+
+Execute the following **four-layer deep scan**:
+
+### Layer 1: Base Anchors (The Base & Facts) → [Establish connections]
+* **Scan target**: verified facts, demographic characteristics, current state.
+* **Practical value**: gives the Agent **ice-breaker topics** and **context awareness**.
+
+### Layer 2: Interest Graph → [Conversation fodder]
+* **Scan target**: things the user invests time, money, or attention in.
+* **Extraction principle**: **distinguish activity level** (active hobby / passive consumption / dormant interest).
+* **Practical value**: enables the Agent to engage in **high-quality chit-chat** and **lifestyle recommendations**.
+
+### Layer 3: Interaction Protocol (The Interface) → [Eliminate friction]
+* **Scan target**: the user's communication habits, landmines, workflow preferences.
+* **Practical value**: guides the Agent on **how to speak and how to deliver results** — avoid stepping on mines.
+
+### Layer 4: Cognitive Core (The Core) → [Deep resonance]
+* **Scan target**: decision logic, contradictions, ultimate motivators.
+* **Practical value**: enables the Agent to become a "co-pilot" capable of **making decisions on the user's behalf**.
+
+---
+
+## Output Template (The Persona Template)
+
+Use the template below as a reference and write the final content with the **${t.write}** tool. You may adapt it autonomously (add or remove chapters when information is insufficient or abundant) (**must remain in Markdown format**):
 
 \`\`\`\`markdown
 # User Narrative Profile
 
-> **Archetype (核心原型)**: [一句话定义。例如：一位在现实重力下挣扎，但试图通过技术构建理想国的"务实理想主义者"。]
+> **Archetype**: [One-sentence definition. Example: A "pragmatic idealist" struggling against the gravity of reality while trying to build a utopia through technology.]
 
-> **基本信息**
-（用户的基本信息，如年龄、性别、职业等，更新时若有冲突则覆盖，不冲突尽量叠加）
+> **Basic Info**
+(User's basic information — age, gender, occupation, etc. On update: override on conflict, accumulate otherwise.)
  -
  -
 
-> **长期偏好**
-（你观察到的用户最稳定且可复用的偏好）
+> **Long-term Preferences**
+(The most stable and reusable preferences you have observed in the user.)
     -
     -
 
-## 📖 Chapter 1: Context & Current State (全景语境)
-*(将基础事实与当前状态融合，写成一段连贯的背景介绍)*
+## Chapter 1: Context & Current State
+*(Blend basic facts with current state into a coherent background narrative.)*
 
-**[这里写连贯描述，区别较大的时候可以分点阐述]**
+**[Write a coherent description here; use bullet points only when the content is highly varied.]**
 
-## 🎨 Chapter 2: The Texture of Life (生活的肌理)
-*(将兴趣、消费、生活习惯串联起来，展示生活品味)*
+## Chapter 2: The Texture of Life
+*(Connect interests, consumption patterns, and life habits to reveal lifestyle sensibility.)*
 
-**[这里写连贯的描述，重点在于"兴趣/偏好"和"品味"的统一性，区别较大的时候可以分点阐述]**
+**[Write a coherent description here; focus on the unity of "interests/preferences" and "taste"; use bullet points only when the content is highly varied.]**
 
-## 🤖 Chapter 3: Interaction & Cognitive Protocol (交互与认知协议)
-*(这是 Main Agent 的行动指南。为了实用，这里保持半结构化，但要解释"为什么")*
+## Chapter 3: Interaction & Cognitive Protocol
+*(This is the Main Agent's action guide. For practicality, keep it semi-structured, but explain "why".)*
 
-### 3.1 沟通策略 (How to Speak)
-### 3.2 决策逻辑 (How to Think)
+### 3.1 Communication Strategy (How to Speak)
+### 3.2 Decision Logic (How to Think)
 
-## 🧩 Chapter 4: Deep Insights & Evolution (深层洞察与演变)
-*(人类学观察笔记)*
+## Chapter 4: Deep Insights & Evolution
+*(Anthropological observation notes.)*
 
-* **矛盾统一性**: [描述用户身上看似冲突但实则合理的特质]。
-* **演变轨迹**: [可加上时间，分为多点，描述用户最近发生的变化]。
-* **涌现特征**: 提炼 3-7 个最核心的特质标签，每个标签单独一行并附上简短注释（10-15字）
-  - \`TagName\` - 简短注释说明
+* **Contradictory Unity**: [Describe traits that seem contradictory but are actually coherent.]
+* **Evolution Trajectory**: [Optionally timestamped; describe recent changes in the user.]
+* **Emergent Traits**: Distil 3–7 of the most core trait tags, one per line with a brief annotation (10–15 characters):
+  - \`TagName\` - brief annotation
 \`\`\`\`
 
 ---
 
-### ⚠️ 成功标准
-- ✅ **必须使用 ${t.write} 或 ${t.edit} 工具写入最终结果到 \`persona.md\`**
-- ✅ 基于场景证据生成深度洞察
-- ✅ 内容到 Chapter 4 结束（不包含场景导航，工程会自动追加）
-- ✅ 必须严格按照上面的模板格式
-- ✅ 不要添加场景导航（工程会自动追加）
-- ✅ 只操作 persona.md，不要操作其他文件`;
+### Success Criteria
+- **You must use the ${t.write} or ${t.edit} tool to write the final result into \`persona.md\`**
+- Generate deep insights based on scene evidence
+- Content ends at Chapter 4 (do not include scene navigation — it is appended automatically by the system)
+- Must strictly follow the template format above
+- Do not add scene navigation (it is appended automatically by the system)
+- Only operate on persona.md — do not operate on any other file`;
 }
 
 // ============================
@@ -190,30 +189,30 @@ export function buildPersonaPrompt(params: PersonaPromptParams): PersonaPromptRe
     triggerInfo,
   } = params;
 
-  const modeLabel = mode === "first" ? "🆕 首次生成" : "🔄 迭代更新";
+  const modeLabel = mode === "first" ? "First Generation" : "Incremental Update";
 
   const triggerSection = triggerInfo
-    ? `\n### 触发信息\n${triggerInfo}\n`
+    ? `\n### Trigger Info\n${triggerInfo}\n`
     : "";
 
   const existingPersonaSection = existingPersona
-    ? `\n## 📄 当前 Persona（工程已预加载）\n\n` +
-      `*以下是现有 persona.md 的完整内容（${existingPersona.length} 字符），基于此更新后请控制在2000字内：*\n\n` +
+    ? `\n## Current Persona (pre-loaded by the system)\n\n` +
+      `*The following is the full content of the existing persona.md (${existingPersona.length} characters). After updating based on it, keep the total under 2000 characters:*\n\n` +
       `\`\`\`markdown\n${existingPersona}\n\`\`\`\n\n---\n`
     : "";
 
   const iterationGuide = mode === "incremental"
-    ? `\n## 🔄 迭代决策指南\n\n` +
-      `面对变化场景，自主判断处理方式：强化（佐证已有洞察）/ 补充（新维度）/ 修正（矛盾）/ 重构（结构调整）/ 不改（无有用新增内容）。\n`
+    ? `\n## Incremental Decision Guide\n\n` +
+      `When facing changed scenes, autonomously decide how to handle each one: reinforce (corroborates existing insight) / supplement (new dimension) / correct (contradiction) / restructure (structural adjustment) / leave unchanged (no useful new content).\n`
     : "";
 
-  const userPrompt = `**⏰ 更新时间**: ${currentTime}
-**模式**: ${modeLabel}
+  const userPrompt = `**Update Time**: ${currentTime}
+**Mode**: ${modeLabel}
 ${triggerSection}
-## 📊 统计
-- **总记忆数**: ${totalProcessed} 条
-- **场景总数**: ${sceneCount} 个
-- **变化场景**: ${changedSceneCount} 个（自上次更新后）
+## Statistics
+- **Total memories**: ${totalProcessed}
+- **Total scenes**: ${sceneCount}
+- **Changed scenes**: ${changedSceneCount} (since last update)
 
 ---
 ${changedScenesContent}
