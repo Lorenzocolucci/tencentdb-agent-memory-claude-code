@@ -1,6 +1,10 @@
 # Grounded Trust — Phase 1: Provenance & Trust foundation
 
-> Design, 2026-06-29 (Lorenzo & Socio). Status: APPROVED for implementation.
+> Design, 2026-06-29 (Lorenzo & Socio). Status: IMPLEMENTED 2026-06-30 — built TDD
+> per the plan (`docs/superpowers/plans/2026-06-29-grounded-trust-phase1-provenance.md`),
+> commits b805f60 / e036912 / afb0c27 / 75a497d on `feat/memory-excellence` (NOT pushed).
+> All Phase-1 tests green; build green; suite 7 pre-existing failures (daemon/hook,
+> Windows). See memory card `sinapsys-grounded-trust-phase1-done`.
 > Parent pillar: [the child and the fire](./2026-06-29-grounded-trust-child-and-fire-design.md).
 > This is **Phase 1 of 4** (foundation). Phases 2-4 (stakes policy, grounding,
 > ask-Lorenzo loop, learning) rest on this and are explicitly OUT of scope here.
