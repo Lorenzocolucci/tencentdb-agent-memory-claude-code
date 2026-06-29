@@ -51,6 +51,8 @@ import type {
 } from "./types.js";
 import { queryHeadLessonsByFile as kbQueryHeadLessonsByFile } from "../kb/lessons-writer.js";
 import { distillLessons as kbDistillLessons } from "../kb/lessons-runner.js";
+import { ensureLifecycle, confirmProvenance } from "../kb/lifecycle-writer.js";
+import { serializeProvenance, type ProvenanceStamp } from "../kb/provenance.js";
 import type { LLMRunner } from "../types.js";
 import {
   resolveOrCreateEntity as kbResolveOrCreateEntity,
@@ -2015,6 +2017,83 @@ export class VectorStore implements IMemoryStore {
    *   IDEMPOTENT.
    * @param onProgress  Optional callback for progress reporting.
    */
+  /**
+   * Stamp a memory unit's provenance at write time by creating its
+   * memory_lifecycle row WITH the stamp (idempotent: if the row already exists it
+   * is left untouched, so consolidation's later ensureLifecycle never clobbers it).
+   * Off the critical path: failures are swallowed + logged, never thrown.
+   */
+  stampProvenance(
+    ownerId: string,
+    ownerKind: "fact" | "event",
+    provenance: ProvenanceStamp,
+    now: string,
+    namespace = "default",
+  ): void {
+    try {
+      ensureLifecycle(this.db, {
+        ownerId,
+        ownerKind,
+        now,
+        namespace,
+        provenance: JSON.parse(serializeProvenance(provenance)),
+      });
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][provenance] stamp failed for ${ownerKind} ${ownerId} (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Confirm a memory as ground truth (Lorenzo said so). Flips its provenance to
+   * trusted + writes the audit trail. When a `factId` is given, raises that fact's
+   * confidence; when a `supersededFactId` is given, closes that older uncertain
+   * fact (sets superseded_by + valid_to so it leaves the HEAD set). One transaction
+   * (BEGIN/COMMIT/ROLLBACK via prepared statements — same effect as reindexAll).
+   */
+  confirmMemory(params: {
+    ownerId: string;
+    ownerKind: "fact" | "event";
+    now: string;
+    factId?: string;
+    confidence?: number;
+    supersededFactId?: string;
+  }): void {
+    try {
+      this.db.prepare("BEGIN").run();
+      try {
+        confirmProvenance(this.db, {
+          ownerId: params.ownerId,
+          ownerKind: params.ownerKind,
+          now: params.now,
+        });
+        if (params.factId) {
+          this.db
+            .prepare("UPDATE facts SET confidence = ?, updated_time = ? WHERE id = ?")
+            .run(params.confidence ?? 0.99, params.now, params.factId);
+        }
+        if (params.supersededFactId) {
+          this.db
+            .prepare(
+              "UPDATE facts SET superseded_by = ?, superseded_at = ?, valid_to = ? WHERE id = ?",
+            )
+            .run(params.factId ?? params.ownerId, params.now, params.now, params.supersededFactId);
+        }
+        this.db.prepare("COMMIT").run();
+      } catch (txErr) {
+        try { this.db.prepare("ROLLBACK").run(); } catch { /* ignore */ }
+        throw txErr;
+      }
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][provenance] confirmMemory failed for ${params.ownerKind} ${params.ownerId} ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   async reindexAll(
     embedFn: (text: string) => Promise<Float32Array | Float32Array[]>,
     onProgress?: (done: number, total: number, layer: "L1" | "L0") => void,
