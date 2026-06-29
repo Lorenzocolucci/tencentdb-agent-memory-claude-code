@@ -1014,6 +1014,38 @@ export function listRecentEvents(
 }
 
 /**
+ * All events for a session, chronological (oldest world-time first). Used by the
+ * session-continuity recap capture to reconstruct the session's thread.
+ */
+export function listEventsBySession(db: DatabaseSync, sessionKey: string): KbEvent[] {
+  const key = sessionKey?.trim();
+  if (!key) return [];
+  const rows = db
+    .prepare("SELECT * FROM events WHERE session_key = ? ORDER BY ts ASC, id ASC")
+    .all(key) as Array<Record<string, unknown>>;
+  return rows.map(rowToEvent);
+}
+
+/**
+ * Most recent event of a given type for a project (newest world-time first),
+ * or undefined. Used by the session-continuity recap injection to fetch the
+ * latest `session_recap` for the current project. Deterministic — no embeddings.
+ */
+export function latestEventByProjectType(
+  db: DatabaseSync,
+  project: string,
+  type: string,
+): KbEvent | undefined {
+  const p = project?.trim();
+  const t = type?.trim();
+  if (!p || !t) return undefined;
+  const row = db
+    .prepare("SELECT * FROM events WHERE project = ? AND type = ? ORDER BY ts DESC, id DESC LIMIT 1")
+    .get(p, t) as Record<string, unknown> | undefined;
+  return row ? rowToEvent(row) : undefined;
+}
+
+/**
  * Events referencing a given entity (its `entities_json` contains the id),
  * within the namespace, newest world-time first. Used by the entity-page
  * projection to render the per-entity "Timeline". Matching is done in JS on the

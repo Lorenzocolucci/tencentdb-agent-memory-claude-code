@@ -596,6 +596,12 @@ export interface IMemoryStore {
    * those with `ts` strictly after `sinceTs`. `limit` bounds the result.
    */
   listRecentEvents?(namespace?: string, opts?: { sinceTs?: string; limit?: number }): KbEvent[];
+
+  /** All events for a session (chronological). Optional — backends may omit. */
+  listEventsBySession?(sessionKey: string): KbEvent[];
+
+  /** Most recent event of a given type for a project, or undefined. Optional. */
+  latestEventByProjectType?(project: string, type: string): KbEvent | undefined;
   /**
    * All relation edges touching an entity (as src OR dst), within its namespace.
    * Powers the entity-page "Related [[entity]]" links.
