@@ -25,10 +25,7 @@ import { kbRecall, type KbRecallResult } from "../kb/retrieval.js";
 import { loadPrinciples, formatPrinciplesBlock } from "./principles.js";
 import { buildSessionBanner, type SessionBannerTracker } from "./session-banner.js";
 import { latestRecapBlock } from "../continuity/recap-retrieval.js";
-import {
-  buildCornerstones,
-  type CornerstoneInjectionTracker,
-} from "../distinctiveness/cornerstone-runner.js";
+import type { CornerstoneInjectionTracker } from "../distinctiveness/cornerstone-runner.js";
 import { CornerstoneSessionCache } from "../distinctiveness/cornerstone-cache.js";
 import {
   MEMORY_TOOLS_GUIDE,
@@ -141,13 +138,13 @@ export interface RecallResult {
   /** True when this result includes the session-open banner (caller commits the tracker slot). */
   bannerEmitted?: boolean;
   /**
-   * Set when the cornerstone block was computed THIS turn (a cache miss). The
-   * caller commits it to the CornerstoneSessionCache ONLY after a real
-   * (non-timed-out) result, so a timed-out first turn recomputes next turn
-   * instead of caching a discarded block (mirrors the banner deferred commit).
-   * `block` is "" when there was nothing to inject (still a valid commit → no recompute).
+   * Set on a cornerstone cache MISS. Signals the caller to build the cornerstone
+   * block OFF the recall critical path and commit it to the CornerstoneSessionCache,
+   * so the block appears from the NEXT turn. The corpus embed is NOT awaited here:
+   * inline it cost ~5s on the first turn of a session and blew the cc hook's
+   * RECALL_TIMEOUT, silently dropping the entire session-open injection.
    */
-  cornerstonePending?: { key: string; block: string };
+  cornerstoneMiss?: { key: string };
 }
 
 export async function performAutoRecall(params: {
@@ -352,7 +349,7 @@ async function performAutoRecallInner(params: {
   // (cache MISS). Subsequent turns reuse the cached block string — zero embedding
   // calls on the per-turn critical path. The cache is committed by the caller after
   // a real (non-timed-out) result, so a timed-out first turn recomputes next turn.
-  let cornerstonePending: { key: string; block: string } | undefined;
+  let cornerstoneMiss: { key: string } | undefined;
   if (cornerstoneTracker && cornerstoneCache && vectorStore) {
     const csKey = params.sessionId ?? params.sessionKey;
     const cached = cornerstoneCache.get(csKey);
@@ -360,15 +357,14 @@ async function performAutoRecallInner(params: {
       // HIT (including ""=computed-empty) → reuse, NO embedding work this turn.
       if (cached) stableParts.push(cached);
     } else {
-      // MISS → compute once for this session (off the critical path: returns "").
-      const cornerstoneBlock = await buildCornerstones({
-        vectorStore,
-        embeddingService,
-        injectionTracker: cornerstoneTracker,
-        logger,
-      });
-      if (cornerstoneBlock) stableParts.push(cornerstoneBlock);
-      cornerstonePending = { key: csKey, block: cornerstoneBlock };
+      // MISS → DEFER. Do NOT await buildCornerstones here: it batch-embeds the
+      // event corpus (~5s on a cold/contended connection), and on the FIRST turn
+      // of a session that blew the cc hook's RECALL_TIMEOUT_MS, silently dropping
+      // the ENTIRE session-open injection (persona + principles + scene + banner
+      // + relevant memories). Signal the caller to build the block off the
+      // critical path and commit it to the cache, so cornerstones appear from the
+      // NEXT turn while this turn ships everything else instantly.
+      cornerstoneMiss = { key: csKey };
     }
   }
 
@@ -450,7 +446,7 @@ async function performAutoRecallInner(params: {
     recalledL3Persona: personaContent ?? null,
     recallStrategy: effectiveStrategy,
     bannerEmitted,
-    cornerstonePending,
+    cornerstoneMiss,
   };
 }
 

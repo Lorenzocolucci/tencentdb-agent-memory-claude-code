@@ -46,7 +46,7 @@ import { buildSituationInjection } from "./hooks/fingerprint-injection.js";
 import { canonicalKey } from "./kb/kb-queries.js";
 import { performAutoRecall } from "./hooks/auto-recall.js";
 import { SessionBannerTracker } from "./hooks/session-banner.js";
-import { CornerstoneInjectionTracker } from "./distinctiveness/cornerstone-runner.js";
+import { CornerstoneInjectionTracker, buildCornerstones } from "./distinctiveness/cornerstone-runner.js";
 import { CornerstoneSessionCache } from "./distinctiveness/cornerstone-cache.js";
 import { performAutoCapture } from "./hooks/auto-capture.js";
 import { executeMemorySearch, formatSearchResponse } from "./tools/memory-search.js";
@@ -172,6 +172,9 @@ export class TdaiCore {
   // cache so the corpus-embedding cost runs once per session, not per turn.
   private readonly cornerstoneTracker = new CornerstoneInjectionTracker();
   private readonly cornerstoneCache = new CornerstoneSessionCache();
+  /** Session keys whose cornerstone block is being built off-path — dedupes the
+   *  concurrent turns that arrive before the first background build commits. */
+  private readonly cornerstoneInFlight = new Set<string>();
 
   constructor(opts: TdaiCoreOptions) {
     this.hostAdapter = opts.hostAdapter;
@@ -324,14 +327,50 @@ export class TdaiCore {
       this.bannerTracker.markEmitted(sessionId ?? sessionKey);
     }
 
-    // Commit the cornerstone block to the per-session cache ONLY after a real
-    // (non-timed-out) result, so the expensive corpus-embed runs once per session
-    // and a timed-out first turn recomputes next turn instead of caching nothing.
-    if (result?.cornerstonePending) {
-      this.cornerstoneCache.commit(result.cornerstonePending.key, result.cornerstonePending.block);
+    // Cornerstone cache MISS → build the block OFF the recall critical path and
+    // commit it to the per-session cache so the NEXT turn injects it. The corpus
+    // embed (~5s on a cold connection) is NEVER awaited on the recall path: inline
+    // it blew the cc hook's RECALL_TIMEOUT and silently dropped the whole
+    // session-open injection on the first turn.
+    if (result?.cornerstoneMiss) {
+      this.buildCornerstoneInBackground(result.cornerstoneMiss.key);
     }
 
     return result ?? {};
+  }
+
+  /**
+   * Build the cornerstone block for a session OFF the recall critical path and
+   * commit it to the per-session cache, so the NEXT turn injects it. Fire-and-forget:
+   * the corpus embed (~5s on a cold/contended connection) must never delay — let
+   * alone drop — the session-open injection. All errors are swallowed (memory must
+   * never break a turn). The in-flight guard dedupes concurrent first-turn requests.
+   */
+  private buildCornerstoneInBackground(key: string): void {
+    if (!this.vectorStore) return;
+    if (this.cornerstoneInFlight.has(key)) return;
+    if (this.cornerstoneCache.get(key) !== undefined) return; // already committed
+    const store = this.vectorStore;
+    this.cornerstoneInFlight.add(key);
+    void (async () => {
+      try {
+        const block = await buildCornerstones({
+          vectorStore: store,
+          embeddingService: this.embeddingService,
+          injectionTracker: this.cornerstoneTracker,
+          logger: this.logger,
+        });
+        // Commit even when "" (computed-empty) — a valid result that prevents
+        // recomputing the corpus embed every turn for a corpus with no cornerstones.
+        this.cornerstoneCache.commit(key, block);
+      } catch (err) {
+        this.logger.warn(
+          `[memory-tdai] cornerstone background build failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      } finally {
+        this.cornerstoneInFlight.delete(key);
+      }
+    })();
   }
 
   /**
