@@ -50,6 +50,8 @@ import type {
   KbLessonHit,
 } from "./types.js";
 import { queryHeadLessonsByFile as kbQueryHeadLessonsByFile } from "../kb/lessons-writer.js";
+import { distillLessons as kbDistillLessons } from "../kb/lessons-runner.js";
+import type { LLMRunner } from "../types.js";
 import {
   resolveOrCreateEntity as kbResolveOrCreateEntity,
   insertEvent as kbInsertEvent,
@@ -2914,6 +2916,29 @@ export class VectorStore implements IMemoryStore {
       confidence: r.confidence,
       evidenceCount: r.evidence_count,
     }));
+  }
+
+  /** @see IMemoryStore.runLessonDistillation */
+  async runLessonDistillation(
+    llmRunner: LLMRunner,
+    opts: { now: string; namespace?: string; maxClusters?: number },
+  ): Promise<{ candidates: number; inserted: number; superseded: number; skippedDuplicate: number }> {
+    if (this.degraded || !this.kbReady || !this.kbVecReady) {
+      return { candidates: 0, inserted: 0, superseded: 0, skippedDuplicate: 0 };
+    }
+    // distillLessons reads kb_vec (bug clustering) via this.db (sqlite-vec loaded)
+    // and writes the `lessons` table on the SAME connection — no extra writer.
+    const stats = await kbDistillLessons(this.db, llmRunner, {
+      now: opts.now,
+      namespace: opts.namespace,
+      maxClusters: opts.maxClusters,
+    });
+    return {
+      candidates: stats.candidates,
+      inserted: stats.inserted,
+      superseded: stats.superseded,
+      skippedDuplicate: stats.skippedDuplicate,
+    };
   }
 
   /**

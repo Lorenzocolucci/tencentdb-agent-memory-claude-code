@@ -486,6 +486,41 @@ export class TdaiCore {
       void recapTask.then(() => this.bgTasks.delete(recapTask));
     }
 
+    // Track B (Mistake Notebook): auto-distill recurring-failure clusters into
+    // `lessons` after the flush, so a recurring failure becomes a reusable lesson
+    // WITHOUT a manual run. Fire-and-forget, off the critical path, errors
+    // swallowed. CHEAP by design: the clustering read gates the LLM — no cluster
+    // → no LLM call (the common case); already-distilled clusters are skipped
+    // (idempotent). maxClusters caps per-pass cost when real clusters do appear.
+    if (this.vectorStore?.runLessonDistillation) {
+      const store = this.vectorStore;
+      const runnerFactory = this.runnerFactory;
+      const logger = this.logger;
+      const distillTask = (async () => {
+        try {
+          const runner = runnerFactory.createRunner({ enableTools: false });
+          const stats = await store.runLessonDistillation!(runner, {
+            now: new Date().toISOString(),
+            maxClusters: 3,
+          });
+          if (stats.inserted > 0 || stats.superseded > 0) {
+            logger.info(
+              `${TAG} [lessons] distilled: inserted=${stats.inserted}, superseded=${stats.superseded} ` +
+                `(candidates=${stats.candidates}, skippedDuplicate=${stats.skippedDuplicate})`,
+            );
+          } else {
+            logger.debug?.(`${TAG} [lessons] no new lessons (candidates=${stats.candidates})`);
+          }
+        } catch (err) {
+          logger.warn(
+            `${TAG} [lessons] distillation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      })();
+      this.bgTasks.add(distillTask);
+      void distillTask.then(() => this.bgTasks.delete(distillTask));
+    }
+
     // Drop the per-session proactive-injection state (bounded memory).
     this.injectedFilesBySession.delete(sessionKey);
     this.sessionSituationByKey.delete(sessionKey);

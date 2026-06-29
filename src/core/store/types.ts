@@ -637,6 +637,17 @@ export interface IMemoryStore {
    */
   queryHeadLessonsByFile?(fileEntityId: string, namespace?: string, limit?: number): KbLessonHit[];
 
+  /**
+   * Track B write side: distill recurring-failure clusters into `lessons` (LLM).
+   * Idempotent (clusters already turned into a lesson are skipped). Off the
+   * critical path; callers fire-and-forget it on session end. Returns run stats.
+   * Absent on backends without KB write + clustering support → caller no-ops.
+   */
+  runLessonDistillation?(
+    llmRunner: import("../types.js").LLMRunner,
+    opts: { now: string; namespace?: string; maxClusters?: number },
+  ): Promise<{ candidates: number; inserted: number; superseded: number; skippedDuplicate: number }>;
+
   /** kb_vec / kb_fts recall primitives (mirror searchL1Vector / searchL1Fts). */
   searchKbVector?(queryEmbedding: Float32Array, topK?: number, ownerKindFilter?: string): KbVectorSearchResult[];
   searchKbFts?(ftsQuery: string, limit?: number): KbFtsSearchResult[];
