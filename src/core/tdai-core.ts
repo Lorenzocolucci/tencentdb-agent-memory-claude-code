@@ -33,6 +33,7 @@ import type { MemoryTdaiConfig } from "../config.js";
 import type { IMemoryStore } from "./store/types.js";
 import type { EmbeddingService } from "./store/embedding.js";
 import { scheduleConsolidation } from "./kb/consolidation-scheduler.js";
+import { captureSessionRecap } from "./continuity/recap-capture.js";
 import { extractSituation } from "./hooks/situation.js";
 import { buildFileInjection, resolveFileOwnerId } from "./hooks/situation-injection.js";
 import {
@@ -444,6 +445,31 @@ export class TdaiCore {
       unregister: (t) => this.bgTasks.delete(t),
       logger: this.logger,
     });
+
+    // "Dove eravamo" — capture this session into a first-class session_recap
+    // event (Sinapsys session-continuity). Deferred to a macrotask so the
+    // /session/end response flushes first; tracked in bgTasks so destroy()
+    // drains it before the DB closes. Errors are swallowed inside.
+    // Runs AFTER the flush above so this session's events are queryable.
+    if (this.vectorStore) {
+      const store = this.vectorStore;
+      const recapTask = new Promise<void>((resolve) => {
+        setImmediate(() => {
+          try {
+            captureSessionRecap({
+              store,
+              sessionKey,
+              now: new Date().toISOString(),
+              logger: this.logger,
+            });
+          } finally {
+            resolve();
+          }
+        });
+      });
+      this.bgTasks.add(recapTask);
+      void recapTask.then(() => this.bgTasks.delete(recapTask));
+    }
 
     // Drop the per-session proactive-injection state (bounded memory).
     this.injectedFilesBySession.delete(sessionKey);

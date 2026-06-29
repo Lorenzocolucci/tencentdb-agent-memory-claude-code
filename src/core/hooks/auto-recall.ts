@@ -24,6 +24,7 @@ import { redactSecrets } from "../../utils/redact-secrets.js";
 import { kbRecall, type KbRecallResult } from "../kb/retrieval.js";
 import { loadPrinciples, formatPrinciplesBlock } from "./principles.js";
 import { buildSessionBanner, type SessionBannerTracker } from "./session-banner.js";
+import { latestRecapBlock } from "../continuity/recap-retrieval.js";
 import {
   buildCornerstones,
   type CornerstoneInjectionTracker,
@@ -378,6 +379,16 @@ async function performAutoRecallInner(params: {
       });
       prependContext = prependContext ? `${banner}\n\n${prependContext}` : banner;
       bannerEmitted = true;
+
+      // "Dove eravamo" — on the first turn, prepend the previous session's
+      // anchored recap for THIS project (reconstruction, not a doc dump).
+      // Off the critical path: latestRecapBlock returns "" on any failure.
+      if (projectName && vectorStore) {
+        const recapBlock = latestRecapBlock({ store: vectorStore, project: projectName, logger });
+        if (recapBlock) {
+          prependContext = prependContext ? `${recapBlock}\n\n${prependContext}` : recapBlock;
+        }
+      }
     } catch {
       // Banner errors are silently swallowed — memory must never block the turn.
     }
