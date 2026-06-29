@@ -90,16 +90,25 @@ describe("TdaiCore.handleSessionEnd → consolidation wiring", () => {
     await core.handleSessionEnd(SESSION);
 
     // Registration is synchronous: by the time handleSessionEnd resolves the
-    // task is already tracked (the sweep itself is still deferred).
+    // tasks are already tracked (the sweeps themselves are still deferred).
+    // handleSessionEnd registers THREE deferred bg tasks, each added when its
+    // feature landed — all synchronously so a shutdown drain can await them:
+    //   1. consolidation (reinforce/decay this session),
+    //   2. session-recap "Dove eravamo" (continuity, commit 38b1cc9),
+    //   3. lessons distillation (Mistake Notebook, commit af13fa5).
     const tasks = [...internals(core).bgTasks];
-    expect(tasks).toHaveLength(1);
-    // Not reinforced yet — the sweep runs on a later macrotask.
+    expect(tasks).toHaveLength(3);
+    // The consolidation sweep is deferred to a later macrotask — not run yet.
+    // (This event was inserted via insertEvent, not applyKbDelta, so no
+    // provenance stamp created its lifecycle row early — it is null until the
+    // sweep reinforces it.)
     expect(getLifecycle(rawDb(store), evt.id, "event")).toBeNull();
 
-    await tasks[0]; // let the deferred sweep run
+    await Promise.all(tasks); // let all deferred sweeps run
 
+    // Consolidation reinforced THIS session's event exactly once.
     expect(getLifecycle(rawDb(store), evt.id, "event")?.reinforcement_count).toBe(1);
-    // Task removed itself once done.
+    // Every task removed itself once done.
     expect(internals(core).bgTasks.size).toBe(0);
   });
 
