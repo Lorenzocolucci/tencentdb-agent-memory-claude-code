@@ -177,19 +177,37 @@ async function main(): Promise<void> {
   const all = JSON.parse(fs.readFileSync(datasetPath, "utf-8")) as LmeQuestion[];
   const subset = selectSubset(all, args.types, args.perType);
 
+  // Incremental persistence + resume: each result is appended to a JSONL as soon
+  // as it completes, so a process-level crash (e.g. a native sqlite crash on a
+  // large haystack) only loses the in-flight question. Re-launching skips the
+  // question_ids already recorded — a driver loop can re-run until all are done.
+  const runsDir = path.join(__dirname, "..", "runs");
+  fs.mkdirSync(runsDir, { recursive: true });
+  const base = `${path.basename(datasetPath, ".json")}-${subset.length}q`;
+  const jsonlPath = path.join(runsDir, `subset-${base}.jsonl`);
+
+  const doneById = new Map<string, Result>();
+  if (fs.existsSync(jsonlPath)) {
+    for (const line of fs.readFileSync(jsonlPath, "utf-8").split("\n")) {
+      if (!line.trim()) continue;
+      try { const r = JSON.parse(line) as Result; doneById.set(r.question_id, r); } catch { /* skip */ }
+    }
+  }
+
   console.error(`\n=== LongMemEval subset run ===`);
   console.error(`dataset: ${path.basename(datasetPath)} | questions: ${subset.length} ` +
-    `(${args.perType}/type × ${args.types.length} types)\n`);
+    `(${args.perType}/type × ${args.types.length} types) | already done: ${doneById.size}\n`);
 
-  const results: Result[] = [];
-  for (let i = 0; i < subset.length; i++) {
-    const q = subset[i]!;
+  const remaining = subset.filter((q) => !doneById.has(q.question_id));
+  for (let i = 0; i < remaining.length; i++) {
+    const q = remaining[i]!;
     const t0 = Date.now();
     const r = await runQuestion(q);
-    results.push(r);
+    fs.appendFileSync(jsonlPath, JSON.stringify(r) + "\n"); // persist immediately
+    doneById.set(r.question_id, r);
     const mark = r.error ? "ERR" : r.correct ? "✓" : "✗";
     console.error(
-      `[${i + 1}/${subset.length}] ${mark} ${r.question_type} ${r.question_id} ` +
+      `[${doneById.size}/${subset.length}] ${mark} ${r.question_type} ${r.question_id} ` +
       `(${((Date.now() - t0) / 1000).toFixed(0)}s, retrieved=${r.retrieved})` +
       (r.error ? ` ERROR: ${r.error}` : ""),
     );
@@ -199,7 +217,8 @@ async function main(): Promise<void> {
     }
   }
 
-  // Aggregate
+  // Aggregate over ALL recorded results (resumed + new).
+  const results: Result[] = subset.map((q) => doneById.get(q.question_id)).filter(Boolean) as Result[];
   const byType: Record<string, { n: number; correct: number }> = {};
   let totalCorrect = 0, totalErr = 0;
   for (const r of results) {
@@ -220,12 +239,10 @@ async function main(): Promise<void> {
   console.error(`  NOTE: dataset=${path.basename(datasetPath)} ` +
     `${datasetPath.includes("oracle") ? "(ORACLE = easy mode, no distractors — upper bound, NOT leaderboard-comparable)" : ""}`);
 
-  // Persist
-  const runsDir = path.join(__dirname, "..", "runs");
-  fs.mkdirSync(runsDir, { recursive: true });
-  const outPath = path.join(runsDir, `subset-${path.basename(datasetPath, ".json")}-${subset.length}q.json`);
+  // Persist the aggregate summary (runsDir/jsonlPath already defined above).
+  const outPath = path.join(runsDir, `subset-${base}.json`);
   fs.writeFileSync(outPath, JSON.stringify({ dataset: path.basename(datasetPath), results, byType }, null, 2));
-  console.error(`\nresults written: ${outPath}`);
+  console.error(`\nresults written: ${outPath} (per-question: ${jsonlPath})`);
 }
 
 main().catch((err) => {
