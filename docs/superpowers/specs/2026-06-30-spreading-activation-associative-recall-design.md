@@ -1,6 +1,12 @@
 # Spreading Activation — the associative recall (the beating heart)
 
-> Design, 2026-06-30 (Lorenzo & Socio). Status: IN PROGRESS (TDD).
+> Design, 2026-06-30 (Lorenzo & Socio). **Status: IMPLEMENTED + DEPLOYED LIVE
+> 2026-06-30.** Commits 39558b0 (heart) + 8ac4b5e (salience fix) on
+> `feat/memory-excellence`. Verified live on the real KB: `/recall "Sofia pagamenti e
+> clienti"` surfaced connected-but-unmatched memories (a badge-issue event, a
+> security-verification fact) under the `↳ ·associato` marker. Live verification also
+> caught a real defect — weak associations surfaced noise metrics (line_count,
+> action_phase); fixed with `isNoiseAttribute` + most-confident-fact selection.
 > The north-star feature: *"Sinapsys NON è un database di ricerca. È memoria
 > ASSOCIATIVA — un grafo dove un ricordo ne innesca un altro, e i ricordi vengono
 > all'agente senza cercarli."* Today recall is vector+FTS+RRF (lookup). This adds
