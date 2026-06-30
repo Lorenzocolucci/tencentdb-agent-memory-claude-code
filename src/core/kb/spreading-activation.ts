@@ -57,6 +57,13 @@ export interface SpreadParams {
   maxNodes?: number;
   /** Expand only the strongest K neighbors per node — caps hub fan-out (default 8). */
   topKPerNode?: number;
+  /**
+   * When true, seeds are NOT excluded from the result: each seed's value is the
+   * activation it RECEIVED from the network (its initial activation is never added).
+   * Used by Implicit Priming, where every candidate is a seed and the boost is the
+   * activation that flowed into it from co-recalled neighbors. Default false.
+   */
+  includeSeeds?: boolean;
 }
 
 const DEFAULTS: Required<SpreadParams> = {
@@ -65,6 +72,7 @@ const DEFAULTS: Required<SpreadParams> = {
   threshold: 0.05,
   maxNodes: 50,
   topKPerNode: 8,
+  includeSeeds: false,
 };
 
 /**
@@ -119,7 +127,7 @@ export function spreadActivation(
     }
     // Land this hop's contributions into the running total (summing = convergence).
     for (const [id, c] of next) {
-      if (seedIds.has(id)) continue; // seeds never appear in the result
+      if (!p.includeSeeds && seedIds.has(id)) continue; // seeds normally excluded
       total.set(id, (total.get(id) ?? 0) + c);
     }
     frontier = next;

@@ -74,4 +74,26 @@ describe("spreadActivation — weighted, decaying, converging", () => {
     expect(spreadActivation([], graph({}), {}).size).toBe(0);
     expect(spreadActivation([{ id: "A", activation: 1 }], graph({}), {}).size).toBe(0);
   });
+
+  it("includeSeeds: a seed collects activation RECEIVED from the network (priming boost)", () => {
+    // A↔B both seeds. With includeSeeds, each receives the other's spread = its boost.
+    const g = graph({ A: [["B", 1]], B: [["A", 1]] });
+    const out = spreadActivation(
+      [{ id: "A", activation: 1 }, { id: "B", activation: 1 }],
+      g,
+      { hops: 1, decay: 0.5, includeSeeds: true },
+    );
+    expect(out.get("A")!).toBeGreaterThan(0); // received from B
+    expect(out.get("B")!).toBeGreaterThan(0); // received from A
+  });
+
+  it("includeSeeds: an isolated seed receives nothing (boost 0 / absent)", () => {
+    const g = graph({ A: [["B", 1]], B: [["A", 1]], LONE: [] });
+    const out = spreadActivation(
+      [{ id: "A", activation: 1 }, { id: "B", activation: 1 }, { id: "LONE", activation: 1 }],
+      g,
+      { hops: 1, decay: 0.5, includeSeeds: true },
+    );
+    expect(out.get("LONE") ?? 0).toBe(0);
+  });
 });

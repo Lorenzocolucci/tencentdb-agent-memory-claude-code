@@ -2390,6 +2390,73 @@ export class VectorStore implements IMemoryStore {
     }
   }
 
+  /**
+   * The dense associative edge layer (for Implicit Priming + spreading activation),
+   * restricted to a candidate entity set: co-occurrence edges (entities sharing an
+   * event — Hebbian "fire together, wire together", from `events.entities_json`)
+   * UNIONED with explicit `relations`. Co-occurrence densifies a sparse explicit
+   * graph (measured 0.35 rel/entity) so priming actually fires. Edge weight = shared
+   * events (+ relation support). Bounded to the candidate set; best-effort → {} on error.
+   */
+  candidateAdjacency(
+    entityIds: string[],
+    namespace = "default",
+  ): Map<string, WeightedNeighbor[]> {
+    try {
+      const cand = new Set((entityIds ?? []).filter(Boolean));
+      if (cand.size === 0) return new Map();
+      const adj = new Map<string, Map<string, number>>();
+      const addEdge = (a: string, b: string, w: number): void => {
+        if (a === b || !cand.has(a) || !cand.has(b)) return;
+        let m = adj.get(a);
+        if (!m) { m = new Map(); adj.set(a, m); }
+        m.set(b, (m.get(b) ?? 0) + w);
+      };
+
+      // 1. Co-occurrence from events that mention a candidate entity.
+      const ids = [...cand];
+      const likeClauses = ids.map(() => "entities_json LIKE ?").join(" OR ");
+      const rows = this.db
+        .prepare(`SELECT entities_json FROM events WHERE namespace = ? AND (${likeClauses})`)
+        .all(namespace, ...ids.map((id) => `%${id}%`)) as Array<{ entities_json: string }>;
+      for (const r of rows) {
+        let ents: string[] = [];
+        try {
+          const parsed = JSON.parse(r.entities_json);
+          if (Array.isArray(parsed)) ents = parsed.filter((e): e is string => typeof e === "string");
+        } catch { /* skip malformed */ }
+        const inCand = ents.filter((e) => cand.has(e));
+        for (let i = 0; i < inCand.length; i++) {
+          for (let j = i + 1; j < inCand.length; j++) {
+            addEdge(inCand[i]!, inCand[j]!, 1);
+            addEdge(inCand[j]!, inCand[i]!, 1);
+          }
+        }
+      }
+
+      // 2. Explicit live relations (union).
+      for (const id of cand) {
+        for (const rel of kbQueryRelationsForEntity(this.db, id)) {
+          if (rel.valid_to != null || rel.namespace !== namespace) continue;
+          const other = rel.src_entity_id === id ? rel.dst_entity_id : rel.src_entity_id;
+          const w = rel.support > 0 ? rel.support : 1;
+          addEdge(id, other, w);
+          addEdge(other, id, w);
+        }
+      }
+
+      const out = new Map<string, WeightedNeighbor[]>();
+      for (const [id, m] of adj) out.set(id, [...m].map(([nid, w]) => ({ id: nid, weight: w })));
+      return out;
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][assoc] candidateAdjacency failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return new Map();
+    }
+  }
+
   async reindexAll(
     embedFn: (text: string) => Promise<Float32Array | Float32Array[]>,
     onProgress?: (done: number, total: number, layer: "L1" | "L0") => void,
