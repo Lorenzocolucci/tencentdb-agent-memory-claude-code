@@ -295,6 +295,8 @@ export interface KbFtsSearchResult {
  * Lean projection of a `lessons` HEAD row — only what Proactive Injection needs.
  */
 export interface KbLessonHit {
+  /** Lesson id — lets the caller credit exposure/avoidance (B3). */
+  id: string;
   domain: string;
   lessonText: string;
   /** 0–1; higher = better-attested across recurrences. */
@@ -636,6 +638,25 @@ export interface IMemoryStore {
    * when the agent touches a file in its trigger. Returns [] when KB/lessons off.
    */
   queryHeadLessonsByFile?(fileEntityId: string, namespace?: string, limit?: number): KbLessonHit[];
+
+  /**
+   * B3: record that a lesson resurfaced into a matching situation this session.
+   * Best-effort, off the critical path. Absent on non-KB backends → caller no-ops.
+   */
+  recordLessonExposure?(lessonId: string, sessionId: string, now: string): void;
+
+  /**
+   * B3: explicit (Phase B) avoidance credit — the agent confirmed it followed a
+   * lesson. Returns whether a row was updated. Best-effort. Absent → caller no-ops.
+   */
+  creditLessonAvoidance?(lessonId: string, now: string): boolean;
+
+  /**
+   * B3: credit successful avoidances for lessons exposed this session that did not
+   * relapse (implicit, Phase A), and temper those that did. Returns counts.
+   * Off the critical path; caller fires it on session end. Absent → caller no-ops.
+   */
+  creditSessionAvoidances?(sessionId: string, now: string): { credited: number; tempered: number };
 
   /**
    * Track B write side: distill recurring-failure clusters into `lessons` (LLM).

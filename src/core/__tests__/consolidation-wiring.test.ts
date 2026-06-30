@@ -91,13 +91,14 @@ describe("TdaiCore.handleSessionEnd → consolidation wiring", () => {
 
     // Registration is synchronous: by the time handleSessionEnd resolves the
     // tasks are already tracked (the sweeps themselves are still deferred).
-    // handleSessionEnd registers THREE deferred bg tasks, each added when its
+    // handleSessionEnd registers FOUR deferred bg tasks, each added when its
     // feature landed — all synchronously so a shutdown drain can await them:
     //   1. consolidation (reinforce/decay this session),
     //   2. session-recap "Dove eravamo" (continuity, commit 38b1cc9),
-    //   3. lessons distillation (Mistake Notebook, commit af13fa5).
+    //   3. lessons distillation (Mistake Notebook, commit af13fa5),
+    //   4. lesson avoidance crediting (Mistake Notebook B3).
     const tasks = [...internals(core).bgTasks];
-    expect(tasks).toHaveLength(3);
+    expect(tasks).toHaveLength(4);
     // The consolidation sweep is deferred to a later macrotask — not run yet.
     // (This event was inserted via insertEvent, not applyKbDelta, so no
     // provenance stamp created its lifecycle row early — it is null until the

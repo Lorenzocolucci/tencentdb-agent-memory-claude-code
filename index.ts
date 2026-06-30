@@ -542,6 +542,41 @@ export default function register(api: OpenClawPluginApi) {
     },
     { name: "tdai_reject_memory" },
   );
+
+  // tdai_lesson_helped — Mistake Notebook B3: explicit avoidance confirmation.
+  // Call ONLY after following a resurfaced ⚠️ lesson and the failure did NOT recur.
+  api.registerTool(
+    {
+      name: "tdai_lesson_helped",
+      label: "Lesson Helped",
+      description:
+        "Confirm that a recurring-failure lesson (surfaced earlier as a ⚠️ lesson in a <file-memory> block) was followed AND the failure was avoided. " +
+        "Call this ONLY when you actually applied the lesson and the mistake did not happen — it strengthens the lesson's confidence.",
+      parameters: {
+        type: "object",
+        properties: {
+          lesson_id: { type: "string", description: "The id of the lesson that helped" },
+        },
+        required: ["lesson_id"],
+      },
+      async execute(_toolCallId: string, params: Record<string, unknown>) {
+        const lessonId = String(params.lesson_id ?? "");
+        if (!lessonId) {
+          return { content: [{ type: "text" as const, text: "lesson_id is required" }], details: { error: "missing lesson_id" } };
+        }
+        try {
+          const res = await core.confirmLessonHelped(lessonId);
+          report("tool_call", { tool: "tdai_lesson_helped", lessonId, success: res.ok });
+          return { content: [{ type: "text" as const, text: res.text }], details: { ok: res.ok } };
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          api.logger.error(`${TAG} [tool] tdai_lesson_helped failed: ${errMsg}`);
+          return { content: [{ type: "text" as const, text: `Operation failed: ${errMsg}` }], details: { error: errMsg } };
+        }
+      },
+    },
+    { name: "tdai_lesson_helped" },
+  );
   } else {
     api.logger.debug?.(`${TAG} Memory tools (tdai_memory_search, tdai_conversation_search) not registered — memory features disabled`);
   }

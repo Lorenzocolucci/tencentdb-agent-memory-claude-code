@@ -162,6 +162,27 @@ export function initFoundationsSchema(db: DatabaseSync, logger?: FoundationsLogg
       ddl("ALTER TABLE relations ADD COLUMN weight REAL NOT NULL DEFAULT 1.0");
     }
 
+    // ── Brick 6 — lessons reinforcement (B3) ───────────────────────────────
+    // A lesson's confidence grows on successful AVOIDANCE, not only on recurrence
+    // (the step beyond MNL). exposure_count = times the lesson resurfaced into a
+    // matching situation; avoidance_count = times it was credited as avoided (drives
+    // the explicit→implicit phase switch); last_exposed_session_id/at scope the
+    // implicit "exposed-and-not-relapsed-this-session" inference. Additive + guarded.
+    if (tableExists(db, "lessons")) {
+      if (!columnExists(db, "lessons", "exposure_count")) {
+        ddl("ALTER TABLE lessons ADD COLUMN exposure_count INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!columnExists(db, "lessons", "avoidance_count")) {
+        ddl("ALTER TABLE lessons ADD COLUMN avoidance_count INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!columnExists(db, "lessons", "last_exposed_session_id")) {
+        ddl("ALTER TABLE lessons ADD COLUMN last_exposed_session_id TEXT");
+      }
+      if (!columnExists(db, "lessons", "last_exposed_at")) {
+        ddl("ALTER TABLE lessons ADD COLUMN last_exposed_at TEXT");
+      }
+    }
+
     logger?.debug?.(`${TAG} foundations schema ready`);
     return true;
   } catch (err) {

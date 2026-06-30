@@ -496,6 +496,22 @@ export class TdaiCore {
   }
 
   /**
+   * Mistake Notebook B3 — explicit avoidance confirmation. The agent calls this
+   * when it followed a resurfaced lesson and the failure did NOT happen. Raises the
+   * lesson's confidence + avoidance_count (Phase B path). Off the critical path.
+   * Maps to: tdai_lesson_helped.
+   */
+  async confirmLessonHelped(lessonId: string): Promise<{ ok: boolean; text: string }> {
+    await this.storeReady?.catch(() => {});
+    const store = this.vectorStore;
+    if (!store?.creditLessonAvoidance) return { ok: false, text: "Lessons store unavailable." };
+    const ok = store.creditLessonAvoidance(lessonId, new Date().toISOString());
+    return ok
+      ? { ok: true, text: `Lezione ${lessonId} rinforzata: evitamento confermato.` }
+      : { ok: false, text: `Lezione ${lessonId} non trovata.` };
+  }
+
+  /**
    * Handle end-of-conversation for a single session.
    *
    * ⚠️ Read this if you are editing the method:
@@ -611,6 +627,30 @@ export class TdaiCore {
       void distillTask.then(() => this.bgTasks.delete(distillTask));
     }
 
+    // B3: credit successful AVOIDANCES for lessons that resurfaced this session and
+    // did not relapse (implicit, Phase A) — confidence grows from successes, not only
+    // failures (the step beyond MNL). Fire-and-forget, off the critical path.
+    if (this.vectorStore?.creditSessionAvoidances) {
+      const store = this.vectorStore;
+      const logger = this.logger;
+      const creditTask = new Promise<void>((resolve) => {
+        setImmediate(() => {
+          try {
+            const r = store.creditSessionAvoidances!(sessionKey, new Date().toISOString());
+            if (r.credited > 0 || r.tempered > 0) {
+              logger.info(`${TAG} [lessons] avoidance: credited=${r.credited}, tempered=${r.tempered}`);
+            }
+          } catch (err) {
+            logger.warn(`${TAG} [lessons] avoidance crediting failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+          } finally {
+            resolve();
+          }
+        });
+      });
+      this.bgTasks.add(creditTask);
+      void creditTask.then(() => this.bgTasks.delete(creditTask));
+    }
+
     // Drop the per-session proactive-injection state (bounded memory).
     this.injectedFilesBySession.delete(sessionKey);
     this.sessionSituationByKey.delete(sessionKey);
@@ -674,7 +714,7 @@ export class TdaiCore {
       }
       if (!injectedFiles.has(fileKey)) {
         try {
-          const block = buildFileInjection(store, situation.filePath);
+          const block = buildFileInjection(store, situation.filePath, { sessionId: obs.sessionKey });
           if (block) {
             injectedFiles.add(fileKey);
             blocks.push(block);

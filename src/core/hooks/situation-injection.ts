@@ -46,7 +46,11 @@ function fileKeyCandidates(filePath: string): string[] {
  * Build the proactive memory block for a touched file, or null when there is
  * nothing worth surfacing (the silent-unless-relevant rule).
  */
-export function buildFileInjection(store: IMemoryStore, filePath: string): string | null {
+export function buildFileInjection(
+  store: IMemoryStore,
+  filePath: string,
+  opts?: { sessionId?: string; now?: string },
+): string | null {
   if (!store.queryEntityByKey || !store.queryHeadFacts || !store.queryEventsForEntity) {
     return null; // backend without KB read primitives → silence
   }
@@ -76,6 +80,13 @@ export function buildFileInjection(store: IMemoryStore, filePath: string): strin
   // Lessons FIRST — a "you've failed here before" warning outranks raw facts.
   for (const l of lessons) {
     lines.push(`- ⚠️ lesson [${l.domain}, ${l.evidenceCount}× evidence]: ${clip(l.lessonText)}`);
+    // B3: this lesson just resurfaced into a matching situation — record the
+    // exposure so session-end can credit a successful avoidance. Best-effort.
+    if (opts?.sessionId && store.recordLessonExposure) {
+      try {
+        store.recordLessonExposure(l.id, opts.sessionId, opts.now ?? new Date().toISOString());
+      } catch { /* off the critical path — never break injection */ }
+    }
   }
   for (const f of facts) {
     lines.push(`- ${f.attribute}: ${clip(f.value)}`);

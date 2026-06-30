@@ -49,7 +49,14 @@ import type {
   KbFtsSearchResult,
   KbLessonHit,
 } from "./types.js";
-import { queryHeadLessonsByFile as kbQueryHeadLessonsByFile } from "../kb/lessons-writer.js";
+import {
+  queryHeadLessonsByFile as kbQueryHeadLessonsByFile,
+  recordExposure as kbRecordExposure,
+  creditAvoidance as kbCreditAvoidance,
+  temperOnRecurrence as kbTemperOnRecurrence,
+  queryLessonsExposedInSession as kbQueryLessonsExposedInSession,
+} from "../kb/lessons-writer.js";
+import { phaseFor as lessonPhaseFor } from "../kb/lesson-reinforcement.js";
 import { distillLessons as kbDistillLessons } from "../kb/lessons-runner.js";
 import { ensureLifecycle, confirmProvenance, rejectProvenance, markGatePending, getLifecycle } from "../kb/lifecycle-writer.js";
 import { serializeProvenance, parseProvenance, gateStateOf, type ProvenanceStamp } from "../kb/provenance.js";
@@ -3353,11 +3360,96 @@ export class VectorStore implements IMemoryStore {
   queryHeadLessonsByFile(fileEntityId: string, namespace = "default", limit = 3): KbLessonHit[] {
     if (!this.kbReady) return [];
     return kbQueryHeadLessonsByFile(this.db, fileEntityId, namespace, limit).map((r) => ({
+      id: r.id,
       domain: r.domain,
       lessonText: r.lesson_text,
       confidence: r.confidence,
       evidenceCount: r.evidence_count,
     }));
+  }
+
+  /**
+   * Record that a lesson resurfaced into a matching situation this session (B3
+   * exposure). Best-effort, off the critical path: failures swallowed + logged.
+   */
+  recordLessonExposure(lessonId: string, sessionId: string, now: string): void {
+    if (!this.kbReady) return;
+    try {
+      kbRecordExposure(this.db, lessonId, sessionId, now);
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][lessons] recordLessonExposure failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * @see IMemoryStore.creditSessionAvoidances
+   * Implicit (Phase A) avoidance crediting at session end: for each HEAD lesson
+   * exposed this session whose avoidance_count has crossed τ (so it self-credits),
+   * credit a successful avoidance UNLESS the failure relapsed — a bug event this
+   * session touching the lesson's trigger files — in which case temper its confidence.
+   * Phase-B lessons (still young) are skipped here; they wait for explicit confirmation.
+   * Off the critical path: any failure returns zero counts.
+   */
+  creditLessonAvoidance(lessonId: string, now: string): boolean {
+    if (!this.kbReady) return false;
+    try {
+      return kbCreditAvoidance(this.db, lessonId, now) !== null;
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][lessons] creditLessonAvoidance failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
+  creditSessionAvoidances(sessionId: string, now: string): { credited: number; tempered: number } {
+    if (!this.kbReady) return { credited: 0, tempered: 0 };
+    try {
+      const exposed = kbQueryLessonsExposedInSession(this.db, sessionId);
+      if (exposed.length === 0) return { credited: 0, tempered: 0 };
+
+      // Entity ids touched by this session's bug events (the relapse signal).
+      const bugRows = this.db
+        .prepare("SELECT entities_json FROM events WHERE session_key = ? AND type = 'bug'")
+        .all(sessionId) as Array<{ entities_json: string }>;
+      const bugEntities = new Set<string>();
+      for (const r of bugRows) {
+        try {
+          const arr = JSON.parse(r.entities_json);
+          if (Array.isArray(arr)) for (const e of arr) if (typeof e === "string") bugEntities.add(e);
+        } catch { /* skip malformed */ }
+      }
+
+      let credited = 0;
+      let tempered = 0;
+      for (const l of exposed) {
+        if (lessonPhaseFor(l.avoidance_count) !== "implicit") continue; // Phase B → explicit only
+        let files: string[] = [];
+        try {
+          const t = JSON.parse(l.trigger_pattern);
+          if (t && Array.isArray(t.files)) files = t.files.filter((f: unknown): f is string => typeof f === "string");
+        } catch { /* trigger not JSON → no file relapse signal */ }
+        const relapsed = files.some((f) => bugEntities.has(f));
+        if (relapsed) {
+          kbTemperOnRecurrence(this.db, l.id, now);
+          tempered++;
+        } else {
+          kbCreditAvoidance(this.db, l.id, now);
+          credited++;
+        }
+      }
+      return { credited, tempered };
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][lessons] creditSessionAvoidances failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return { credited: 0, tempered: 0 };
+    }
   }
 
   /** @see IMemoryStore.runLessonDistillation */
