@@ -54,6 +54,7 @@ import { distillLessons as kbDistillLessons } from "../kb/lessons-runner.js";
 import { ensureLifecycle, confirmProvenance, rejectProvenance, markGatePending, getLifecycle } from "../kb/lifecycle-writer.js";
 import { serializeProvenance, parseProvenance, gateStateOf, type ProvenanceStamp } from "../kb/provenance.js";
 import { classifyStakes, shouldGate } from "../kb/stakes.js";
+import { spreadActivation, type WeightedNeighbor } from "../kb/spreading-activation.js";
 import type { LLMRunner } from "../types.js";
 import {
   resolveOrCreateEntity as kbResolveOrCreateEntity,
@@ -2306,6 +2307,82 @@ export class VectorStore implements IMemoryStore {
       );
     }
     return rejected;
+  }
+
+  /**
+   * Associative recall (the beating heart): from the entities a query activated
+   * (the recall seeds), let activation SPREAD over the entity graph (`relations`,
+   * weighted by `support`) so memories the query never named SURFACE because they
+   * are strongly connected to an active one — converging when reached from several
+   * seeds. Returns one representative memory (top HEAD fact, else latest event) per
+   * newly-activated entity, ordered strongest-first. Best-effort, bounded, off the
+   * critical path: any failure returns [] (associative recall is purely additive).
+   */
+  associativeExpand(
+    seedEntityIds: string[],
+    opts?: { hops?: number; maxNodes?: number; namespace?: string },
+  ): Array<{
+    owner_id: string;
+    owner_kind: "fact" | "event";
+    text: string;
+    entity_id: string;
+    activation: number;
+  }> {
+    try {
+      const seeds = (seedEntityIds ?? []).filter(Boolean);
+      if (seeds.length === 0) return [];
+      const namespace = opts?.namespace ?? "default";
+
+      // Lazy, memoized adjacency over LIVE edges (valid_to IS NULL), weighted by support.
+      const memo = new Map<string, WeightedNeighbor[]>();
+      const neighborsOf = (id: string): WeightedNeighbor[] => {
+        let n = memo.get(id);
+        if (!n) {
+          n = kbQueryRelationsForEntity(this.db, id)
+            .filter((r) => r.valid_to == null && r.namespace === namespace)
+            .map((r) => ({
+              id: r.src_entity_id === id ? r.dst_entity_id : r.src_entity_id,
+              weight: r.support > 0 ? r.support : 1,
+            }))
+            .filter((x) => x.id && x.id !== id);
+          memo.set(id, n);
+        }
+        return n;
+      };
+
+      const activated = spreadActivation(
+        seeds.map((id) => ({ id, activation: 1 })),
+        neighborsOf,
+        { hops: opts?.hops ?? 2, maxNodes: opts?.maxNodes ?? 6 },
+      );
+
+      const out: Array<{
+        owner_id: string;
+        owner_kind: "fact" | "event";
+        text: string;
+        entity_id: string;
+        activation: number;
+      }> = [];
+      for (const [entityId, activation] of activated) {
+        const facts = kbQueryHeadFacts(this.db, entityId);
+        if (facts.length > 0) {
+          const f = facts[0]!;
+          out.push({ owner_id: f.id, owner_kind: "fact", text: `${f.attribute}: ${f.value}`, entity_id: entityId, activation });
+          continue;
+        }
+        const events = kbQueryEventsForEntity(this.db, entityId, namespace, 1);
+        if (events.length > 0) {
+          out.push({ owner_id: events[0]!.id, owner_kind: "event", text: events[0]!.text, entity_id: entityId, activation });
+        }
+      }
+      return out;
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][assoc] associativeExpand failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return [];
+    }
   }
 
   async reindexAll(

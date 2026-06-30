@@ -522,6 +522,7 @@ async function runKbRecall(
 
     // Grounded Trust Phase 4: suppress tombstoned (rejected) memories from injection
     // — a memory Lorenzo declared wrong must never drive action again. Best-effort.
+    let visible = results;
     const rejectedKeys = (vectorStore as {
       rejectedOwnerKeys?: (u: Array<{ owner_id: string; owner_kind: string }>) => Set<string>;
     }).rejectedOwnerKeys;
@@ -531,11 +532,41 @@ async function runKbRecall(
         results.map((r) => ({ owner_id: r.owner_id, owner_kind: r.owner_kind })),
       );
       if (rejected.size > 0) {
-        return results.filter((r) => !rejected.has(`${r.owner_kind}:${r.owner_id}`));
+        visible = results.filter((r) => !rejected.has(`${r.owner_kind}:${r.owner_id}`));
       }
     }
 
-    return results;
+    // The beating heart — ASSOCIATIVE recall (spreading activation). From the entities
+    // the query activated (fact seeds), let activation spread over the graph so
+    // connected-but-unmatched memories COME to the agent. Purely additive, best-effort,
+    // off the critical path: any failure leaves `visible` exactly as the query produced.
+    const expand = (vectorStore as {
+      associativeExpand?: (seeds: string[], opts?: { maxNodes?: number }) => Array<{
+        owner_id: string; owner_kind: "fact" | "event"; text: string; entity_id: string; activation: number;
+      }>;
+    }).associativeExpand;
+    if (typeof expand === "function") {
+      const seenKeys = new Set(visible.map((r) => `${r.owner_kind}:${r.owner_id}`));
+      const seedEntityIds = [...new Set(visible.map((r) => r.entity_id).filter((x): x is string => !!x))];
+      if (seedEntityIds.length > 0) {
+        const associated = expand.call(vectorStore, seedEntityIds, { maxNodes: 6 });
+        for (const a of associated) {
+          const key = `${a.owner_kind}:${a.owner_id}`;
+          if (seenKeys.has(key)) continue; // already query-matched — don't duplicate
+          seenKeys.add(key);
+          visible = visible.concat({
+            owner_id: a.owner_id,
+            owner_kind: a.owner_kind,
+            score: a.activation,
+            text: a.text,
+            entity_id: a.entity_id,
+            associative: true,
+          });
+        }
+      }
+    }
+
+    return visible;
   } catch (err) {
     logger?.warn?.(`${TAG} [kb] KB recall failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
     return [];
@@ -549,6 +580,14 @@ async function runKbRecall(
  * the calibrated relevance, never raw RRF.
  */
 function formatKbRecallLine(r: KbRecallResult): string {
+  // Associative memories surfaced by spreading activation (not query-matched) carry
+  // a distinct marker so the agent can tell what it recalled from what came to it.
+  if (r.associative) {
+    let line = `- ↳ [${r.owner_kind}·associato] ${r.text} (associazione: ${r.score.toFixed(2)})`;
+    const point = formatTimestamp(r.ts);
+    if (point) line += ` (${ACTIVITY_TIME_LABEL}: ${point})`;
+    return line;
+  }
   let line = `- [${r.owner_kind}] ${r.text} (relevance: ${r.score.toFixed(2)})`;
   const point = formatTimestamp(r.ts);
   if (point) line += ` (${ACTIVITY_TIME_LABEL}: ${point})`;

@@ -73,6 +73,12 @@ export interface KbRecallResult {
   attribute?: string;
   /** World-time timestamp (event ts, or fact valid_from). */
   ts?: string;
+  /**
+   * True when this memory was NOT matched by the query but SURFACED by association
+   * (spreading activation over the entity graph) — it "came" to the agent. Rendered
+   * with a distinct marker so query-matched and associative recall stay legible.
+   */
+  associative?: boolean;
 }
 
 export interface KbRecallOptions {
