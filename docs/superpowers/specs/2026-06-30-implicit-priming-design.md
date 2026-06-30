@@ -1,6 +1,12 @@
 # Implicit Priming (Idea 2) — sub-threshold memories bias what surfaces
 
-> Design, 2026-06-30 (Lorenzo & Socio). Status: IN PROGRESS (TDD).
+> Design, 2026-06-30 (Lorenzo & Socio). **Status: IMPLEMENTED + DEPLOYED LIVE
+> 2026-06-30.** Commit aa16d10 on `feat/memory-excellence`. Verified: recall still
+> works live (HTTP 200) — priming fail-open didn't break it; and the co-occurrence
+> layer DENSIFIES the real graph 2.8x (240 explicit relations → 662 co-occurrence
+> pairs), proving the deeper fix avoided the no-op the naive version would have been.
+> NOT YET observed flipping a specific result's rank on an organic query (priming is
+> invisible + subtle, λ=0.15) — substrate verified, in-the-wild rank-change pending.
 > Idea 2 of the five. Blueprint §185 ("Attivazione a Cascata"): a weak/sub-threshold
 > match does NOT surface itself, but AMPLIFIES the score of graph-connected memories
 > so one of them crosses the threshold and IS shown — "l'agente trova il contesto
