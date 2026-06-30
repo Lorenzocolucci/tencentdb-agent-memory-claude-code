@@ -54,7 +54,7 @@ import { distillLessons as kbDistillLessons } from "../kb/lessons-runner.js";
 import { ensureLifecycle, confirmProvenance, rejectProvenance, markGatePending, getLifecycle } from "../kb/lifecycle-writer.js";
 import { serializeProvenance, parseProvenance, gateStateOf, type ProvenanceStamp } from "../kb/provenance.js";
 import { classifyStakes, shouldGate } from "../kb/stakes.js";
-import { spreadActivation, type WeightedNeighbor } from "../kb/spreading-activation.js";
+import { spreadActivation, isNoiseAttribute, type WeightedNeighbor } from "../kb/spreading-activation.js";
 import type { LLMRunner } from "../types.js";
 import {
   resolveOrCreateEntity as kbResolveOrCreateEntity,
@@ -2364,7 +2364,12 @@ export class VectorStore implements IMemoryStore {
         activation: number;
       }> = [];
       for (const [entityId, activation] of activated) {
-        const facts = kbQueryHeadFacts(this.db, entityId);
+        // Pick the SALIENT memory, not a noise metric. Internal counters
+        // (line_count, action_phase, char_count, …) pollute injection — skip them and
+        // take the most-confident real fact; else fall back to the latest event.
+        const facts = kbQueryHeadFacts(this.db, entityId)
+          .filter((f) => !isNoiseAttribute(f.attribute))
+          .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
         if (facts.length > 0) {
           const f = facts[0]!;
           out.push({ owner_id: f.id, owner_kind: "fact", text: `${f.attribute}: ${f.value}`, entity_id: entityId, activation });

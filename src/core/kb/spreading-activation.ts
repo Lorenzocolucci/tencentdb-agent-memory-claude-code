@@ -20,6 +20,18 @@
  * never throws. Deterministic. Excludes the seeds from its result (only NEW activation).
  */
 
+/**
+ * Internal-metric attributes that are noise as a surfaced memory (counters, sizes,
+ * offsets) — they pollute associative injection. Used to skip them when choosing an
+ * entity's representative memory. NOT a content filter on the KB, only on what a weak
+ * association is allowed to surface.
+ */
+const NOISE_ATTR_RE = /_(count|phase|size|index|offset)$|^(line|char|byte|token)_|^action_phase$|^rowid$/i;
+
+export function isNoiseAttribute(attribute: string): boolean {
+  return typeof attribute === "string" && NOISE_ATTR_RE.test(attribute);
+}
+
 export interface ActivationSeed {
   id: string;
   activation: number;

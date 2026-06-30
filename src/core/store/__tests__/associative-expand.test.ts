@@ -54,6 +54,32 @@ describe("associativeExpand — a memory surfaces because it is CONNECTED, not m
     expect(assoc.find((a) => a.entity_id === sofiaId)).toBeUndefined();
   });
 
+  it("surfaces the SALIENT fact, not a noise metric (line_count/action_phase)", async () => {
+    // BancaX has a noise metric with HIGH confidence and a real fact with lower
+    // confidence. The association must surface the real fact, not the counter.
+    const res = await applyKbDelta(
+      {
+        language: "it",
+        entities: [
+          { ref: "sofia", type: "project", name: "Sofia" },
+          { ref: "banca", type: "concept", name: "BancaX" },
+        ],
+        facts: [
+          { entity_ref: "banca", attribute: "line_count", value: "1068", confidence: 0.95 },
+          { entity_ref: "banca", attribute: "iban", value: "IT60X0542811101000000123456", confidence: 0.7 },
+        ],
+        events: [],
+        relations: [{ src_ref: "sofia", type: "uses", dst_ref: "banca" }],
+      } as never,
+      { store: store as never, namespace: "default", sessionKey: "s1", now, logger: silent },
+    );
+    const sofiaId = res.entities.find((e: { name: string }) => e.name === "Sofia")!.id;
+    const hit = store.associativeExpand([sofiaId], { hops: 2 }).find((a) => a.text.includes("IT60") || a.text.includes("line_count"));
+    expect(hit, "an association must surface").toBeTruthy();
+    expect(hit!.text).toContain("IT60X0542811101000000123456");
+    expect(hit!.text).not.toContain("line_count");
+  });
+
   it("an isolated seed entity yields no associations", async () => {
     const res = await applyKbDelta(
       {
