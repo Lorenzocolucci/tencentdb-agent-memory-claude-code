@@ -12,6 +12,7 @@
  * verbatim into event.source_message_ids.
  */
 
+import fs from "node:fs";
 import type { ConversationMessage } from "../conversation/l0-recorder.js";
 
 // ============================
@@ -194,4 +195,28 @@ ${bgText}
 ${newText}
 
 Output the KbDelta JSON object (no markdown wrapper, no explanation).`;
+}
+
+/**
+ * Resolve the KB extraction system prompt. Opt-in override: when the env var
+ * TDAI_KB_EXTRACTION_PROMPT_FILE points to a readable file, its contents are
+ * used instead of the built-in prompt. Default (unset/unreadable) → the
+ * built-in KB_EXTRACTION_SYSTEM_PROMPT, so product behavior is unchanged.
+ *
+ * This exists so the LongMemEval benchmark can swap in a domain-generic
+ * extraction prompt WITHOUT changing how the product extracts. (The built-in
+ * prompt is specialized for engineering/work facts and deliberately discards
+ * everyday-life chit-chat, which is exactly what LongMemEval is made of.)
+ */
+export function resolveKbExtractionSystemPrompt(): string {
+  const overridePath = process.env.TDAI_KB_EXTRACTION_PROMPT_FILE;
+  if (overridePath) {
+    try {
+      const custom = fs.readFileSync(overridePath, "utf-8").trim();
+      if (custom.length > 0) return custom;
+    } catch {
+      // Unreadable override → fall back to the built-in prompt (never throw).
+    }
+  }
+  return KB_EXTRACTION_SYSTEM_PROMPT;
 }

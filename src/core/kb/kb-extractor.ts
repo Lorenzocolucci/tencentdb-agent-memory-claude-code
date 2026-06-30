@@ -13,7 +13,7 @@
  */
 
 import type { ConversationMessage } from "../conversation/l0-recorder.js";
-import { KB_EXTRACTION_SYSTEM_PROMPT, formatKbExtractionPrompt } from "../prompts/kb-extraction.js";
+import { resolveKbExtractionSystemPrompt, formatKbExtractionPrompt } from "../prompts/kb-extraction.js";
 import { parseKbDelta, type KbDelta } from "./extraction-schema.js";
 import { applyKbDelta } from "./kb-writer.js";
 import type { KbWriterStore } from "./kb-writer.js";
@@ -121,7 +121,7 @@ export async function extractKbDelta(params: {
     try {
       raw = await llmRunner.run({
         prompt: userPrompt,
-        systemPrompt: KB_EXTRACTION_SYSTEM_PROMPT,
+        systemPrompt: resolveKbExtractionSystemPrompt(),
         taskId: "kb-extraction",
         timeoutMs: extractTimeoutMs,
       });
