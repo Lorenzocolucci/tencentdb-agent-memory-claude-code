@@ -334,8 +334,14 @@ export async function executeSeed(
         }
       }
 
-      // After all rounds for this session, wait for any residual L1 work
-      // (handles the tail when total rounds is not a multiple of everyN)
+      // After all rounds for this session, FORCE a final L1 flush so the tail
+      // conversation IS extracted. The previous code only polled waitForL1Idle,
+      // which strands a final conversation sitting below the warm-up-raised
+      // trigger threshold: it is never extracted by waiting (only by an explicit
+      // flush or the 600s idle timer), so the poll burned its full maxWait and
+      // the last conversation was lost. flushSession() is the same production
+      // path handleSessionEnd uses — it enqueues a final L1 unconditionally and
+      // returns as soon as L1 drains. (Bug surfaced by the LongMemEval harness.)
       if (!interrupted) {
         onProgress?.({
           currentRound: roundsProcessed,
@@ -344,27 +350,20 @@ export async function executeSeed(
           stage: "l1_waiting",
         });
 
-        await waitForL1Idle(
-          pipeline.scheduler,
-          [session.sessionKey],
-          logger,
-          { pollIntervalMs: 1_000, stableRounds: 3, maxWaitMs: 300_000 },
-        );
+        await pipeline.scheduler.flushSession(session.sessionKey);
 
-        logger.info(`${TAG} L1 idle for session="${session.sessionKey}"`);
+        logger.info(`${TAG} L1 flushed for session="${session.sessionKey}"`);
       }
     }
 
-    // Final wait for all sessions
+    // Final flush for all sessions — belt-and-suspenders. Each session was
+    // already flushed above; re-flushing is a cheap no-op when the L1 cursor is
+    // current, and it also drains any cross-session L1 work still in flight.
     if (!interrupted) {
-      const allKeys = input.sessions.map((s) => s.sessionKey);
-      logger.info(`${TAG} Final L1 idle wait for all sessions...`);
-      await waitForL1Idle(
-        pipeline.scheduler,
-        allKeys,
-        logger,
-        { pollIntervalMs: 1_000, stableRounds: 3, maxWaitMs: 300_000 },
-      );
+      logger.info(`${TAG} Final L1 flush for all sessions...`);
+      for (const session of input.sessions) {
+        await pipeline.scheduler.flushSession(session.sessionKey);
+      }
     }
   } finally {
     process.removeListener("SIGINT", onSigint);

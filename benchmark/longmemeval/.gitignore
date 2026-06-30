@@ -1,0 +1,4 @@
+# LongMemEval datasets are large (14MB–2.6GB) — never commit
+data/
+runs/
+*.json.tmp
