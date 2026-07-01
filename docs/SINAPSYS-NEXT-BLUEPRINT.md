@@ -179,12 +179,18 @@ Vincolo reale: claude.ai è il prodotto Anthropic, **non controlliamo il suo mot
 
 ## PARTE 5 — Ordine di lavoro proposto (una sessione = un pezzo verificabile)
 
+> **STATO al 2026-07-01 (fine sessione feat/memory-excellence, tutto pushato su fork):**
+> - ✅ **Pilastro A (Giudizio)** — LIVE (`b9781ad`).
+> - ✅ **Pilastro C Fase 1 (decay) + Fase 2 (distillazione)** — LIVE (`e8056ee`, `e6eb213`).
+> - ✅ **Pilastro B (Crescere dall'errore) — SLICE 1 (cervello willingness)** fatta (`9a881e7`), NON cablata. **SLICE 2 (wiring live) = PROSSIMO** → `docs/superpowers/specs/2026-07-01-pilastro-b-track-record-design.md`.
+> - ✅ **Cross-cutting fixati**: continuità "dove eravamo" (rollover `0cd8233`), trigger distillazione al session-start (`8fd19d6`), **barriera CJK** — nessun cinese salvato (`d365699`+`c0c1035`).
+> - ⏳ **RIMANE**: Pilastro B Slice 2 · #1 ingest chat claude.ai (Gate G3) · #2 PULL(MCP,G4)+PUSH(estensione) · benchmark LongMemEval · residui (fatti-git nel recap, review prompt distiller lo-llm-architect, clustering principi semantico, purga 1 principio cinese pre-barriera).
+
 1. **#1 storico + quotidiano** (valore subito, ingester già pronto): Gate G3, poi
    acquisizione → ingester idempotente → verifica ricordi live.
-2. **Pilastro C (Dimenticare con gusto)**: deterministico, unit-testabile da solo,
-   estende consolidation → base pulita su cui poggiano A e B.
-3. **Pilastro A (Giudizio)**: il cuore. Estende Mistake Notebook + interrupt.
-4. **Pilastro B (Crescere dall'errore)**: track record sopra A.
+2. **Pilastro C (Dimenticare con gusto)**: ✅ Fase 1+2 fatte.
+3. **Pilastro A (Giudizio)**: ✅ LIVE.
+4. **Pilastro B (Crescere dall'errore)**: track record sopra A. ✅ Slice 1 (cervello) — ⏳ Slice 2 (wiring).
 5. **#2 PULL (MCP)**: Gate G4, poi wrapper MCP del gateway.
 6. **#2 PUSH (estensione)**: l'anima proattiva, quando la base regge.
 
