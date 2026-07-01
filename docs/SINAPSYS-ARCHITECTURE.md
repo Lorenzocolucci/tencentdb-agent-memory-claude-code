@@ -106,6 +106,12 @@ hanging off them, linked by **relations**. The six ideas live here.
 | `lessons-runner.ts` · `lessons-runner-db.ts` | Orchestrate clusters → trigger → distill → write (idempotent) |
 | `lessons-writer.ts` 🗄️ | Versioned lessons (supersede-if-improves) + B3 exposure/avoidance |
 | **`lesson-reinforcement.ts`** 🧠🔬 | B3: confidence grows on successful AVOIDANCE (beyond the paper) |
+| **Principle distillation (Pilastro C Fase 2):** | |
+| `principle-clusters.ts` · `principle-distiller.ts` 🤖 · `principle-runner.ts` · `principle-writer.ts` 🗄️ | Recurring cross-session DECISIONS (per shared entity) → `principle` events atom (high-salience, decay-protected) |
+| **Behavioral Notebook (Percorso B — implicit tendencies):** | |
+| `usage-similarity.ts` · `usage-clusters.ts` 🔬 | Recurring cross-session BEHAVIORS clustered SEMANTICALLY (entity-less; the axis principle-clusters misses). Guard ≥2 events / ≥2 `session_id` |
+| `usage-distiller.ts` 🤖 | A3 precision gate: LLM confirms "a real tendency?" / rejects noise (clustering = recall, LLM = precision) |
+| `usage-runner.ts` · `usage-writer.ts` 🗄️ | Orchestrate → gate → write `usage` events atom (high-salience). Deterministic + idempotent |
 | `projections.ts` · `projections-writer.ts` 🔬🗄️ | Deterministic render of the persona/scene docs from the KB |
 | `foundations-schema.ts` 🗄️ | The structural schema (all the tables below) |
 
@@ -171,7 +177,7 @@ stale data. Keeps long agent sessions within the model's context budget.
 | :-- | :-- | :-- |
 | `entities` | Graph nodes (people/projects/files/concepts) | `kb-writer` |
 | `facts` | Versioned attributes of an entity (HEAD = valid_to NULL) | `kb-writer` |
-| `events` | Time-stamped happenings, with `entities_json` (co-occurrence) | `kb-writer` |
+| `events` | Time-stamped happenings, with `entities_json` (co-occurrence). Also holds the distilled high-salience atoms `type='principle'` (Pilastro C Fase 2) and `type='usage'` (Behavioral Notebook) — surfaced via normal recall, decay-protected | `kb-writer` · `principle-writer` · `usage-writer` |
 | `relations` | Weighted edges between entities (`support`, `weight`) | `kb-writer` |
 | `memory_lifecycle` | Living state: reinforcement, tier, **provenance + gate** | `lifecycle-writer` |
 | `lessons` | Mistake Notebook: versioned lessons + **exposure/avoidance** | `lessons-writer` |
@@ -189,7 +195,7 @@ stale data. Keeps long agent sessions within the model's context budget.
 | `POST /capture` 📥 | Record a turn to L0 (+ scheduled L1 extraction) |
 | `POST /recall` 📤 | FTS+vector+RRF → calibrate → **implicit priming** re-rank → cut → **spreading activation** appends associatives → **grounded-trust** gates high-stakes → compose `context` |
 | `POST /observe` 🧠 | PostToolUse: fold the touched file into the session situation; surface file memory + cross-session fingerprint matches; record lesson exposure |
-| `POST /session/end` | Flush + 4 deferred bg tasks: consolidation, recap, lesson distillation, B3 avoidance crediting |
+| `POST /session/end` | Flush + 6 deferred bg tasks: consolidation, recap, lesson distillation, B3 avoidance crediting, **principle distillation** (Pilastro C Fase 2), **usage distillation** (Behavioral Notebook, Percorso B) |
 | `GET /health` | Liveness |
 | `/recall-context`, `/session-filter` | Internal compose/scope helpers |
 

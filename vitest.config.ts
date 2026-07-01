@@ -9,7 +9,9 @@ export default defineConfig({
       "__tests__/**/*.test.ts",
       "claude-code-plugin/tests/**/*.test.ts",
     ],
-    exclude: ["dist/**", "node_modules/**", "**/*.e2e.test.ts"],
+    // `_`-prefixed test files are LOCAL-ONLY live-verification harnesses (they hit
+    // the real LLM / the live vectors.db) — never run in the normal suite or CI.
+    exclude: ["dist/**", "node_modules/**", "**/*.e2e.test.ts", "**/__tests__/_*.test.ts"],
     testTimeout: 120_000,
     hookTimeout: 120_000,
     clearMocks: true,
