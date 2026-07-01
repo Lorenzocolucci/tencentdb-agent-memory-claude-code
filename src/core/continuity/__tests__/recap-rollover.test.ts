@@ -44,6 +44,24 @@ describe("captureRolloverRecap", () => {
     expect(insert).not.toHaveBeenCalled();
   });
 
+  it("RE-CAPTURES when the session accumulated events after its last recap (no freeze)", () => {
+    const inserted: KbEventInput[] = [];
+    const store = {
+      listEventsBySession: () => [
+        // an early recap captured mid-session...
+        evt({ id: "r1", session_id: "A", type: "session_recap", text: "DOVE ERAVAMO (early)", ts: "2026-06-30T13:00:00.000Z" }),
+        // ...but the session kept working AFTER it.
+        evt({ id: "a1", session_id: "A", type: "decision", text: "afternoon decision", source_message_ids: ["ma"], ts: "2026-06-30T14:30:00.000Z" }),
+      ],
+      insertEvent: (e: KbEventInput) => { inserted.push(e); return evt({}); },
+    } as any;
+
+    captureRolloverRecap({ store, sessionKey: "s1", currentSessionId: "B", now: "2026-06-30T20:00:00.000Z" });
+    expect(inserted).toHaveLength(1);
+    expect(inserted[0].sessionId).toBe("A");
+    expect(inserted[0].text).toContain("afternoon decision");
+  });
+
   it("no-ops when only the current session exists (no previous session to capture)", () => {
     const insert = vi.fn();
     const store = {

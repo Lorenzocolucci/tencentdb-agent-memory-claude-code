@@ -62,13 +62,24 @@ export function captureRolloverRecap(params: {
     const prevId = previousSessionId(events, currentSessionId);
     if (!prevId) return; // no prior session to snapshot
 
-    // Idempotent: a recap already describes that session.
-    if (events.some((e) => e.type === RECAP_TYPE && e.session_id === prevId)) {
-      logger?.debug?.(`${TAG} rollover recap already exists for session=${prevId} — skipping`);
+    const scoped = events.filter((e) => e.session_id === prevId && e.type !== RECAP_TYPE);
+    if (scoped.length === 0) return; // nothing to describe
+
+    // Idempotent, BUT refresh when the session accumulated events AFTER its last
+    // recap. A plain "recap exists → skip" freezes a session whose recap was
+    // captured early (e.g. a mid-session rollover), losing later work. Re-capture
+    // only when there is something newer to describe.
+    let latestEventTs = "";
+    for (const e of scoped) if (e.ts > latestEventTs) latestEventTs = e.ts;
+    let latestRecapTs = "";
+    for (const e of events) {
+      if (e.type === RECAP_TYPE && e.session_id === prevId && e.ts > latestRecapTs) latestRecapTs = e.ts;
+    }
+    if (latestRecapTs && latestRecapTs >= latestEventTs) {
+      logger?.debug?.(`${TAG} rollover recap up-to-date for session=${prevId} — skipping`);
       return;
     }
 
-    const scoped = events.filter((e) => e.session_id === prevId);
     const input = selectThread(scoped, now);
     const text = buildRecapText(input);
     if (!text) {
