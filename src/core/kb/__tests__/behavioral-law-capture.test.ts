@@ -9,6 +9,8 @@
 import { describe, it, expect } from "vitest";
 import {
   captureBehavioralLaw,
+  captureLawFromUserTurn,
+  DEFAULT_USER_NAME,
   ruleSlug,
   RULE_ATTR_PREFIX,
   MAX_RULE_LEN,
@@ -105,6 +107,45 @@ describe("captureBehavioralLaw", () => {
     expect(captureBehavioralLaw({ store: {}, userEntityId: USER, userText: "non compiacere mai", now: NOW }).captured).toBe(false);
     const sink: Upsert[] = [];
     expect(captureBehavioralLaw({ store: fakeStore(sink), userEntityId: "", userText: "non compiacere mai", now: NOW }).captured).toBe(false);
+  });
+});
+
+describe("captureLawFromUserTurn (turn hook)", () => {
+  function hookStore(sink: Upsert[], created: string[]) {
+    return {
+      resolveOrCreateEntity(p: { name: string }) { created.push(p.name); return { id: "ent_lorenzo" }; },
+      upsertFact(p: Upsert) { sink.push(p); return p; },
+    };
+  }
+
+  it("resolves the 'Lorenzo' person entity and writes the law", () => {
+    const sink: Upsert[] = []; const created: string[] = [];
+    const res = captureLawFromUserTurn({
+      store: hookStore(sink, created),
+      userText: "non compiacere mai",
+      now: NOW,
+    });
+    expect(res.captured).toBe(true);
+    expect(created).toEqual([DEFAULT_USER_NAME]);
+    expect(sink[0].entityId).toBe("ent_lorenzo");
+  });
+
+  it("does NOT touch the store on a non-law turn (no entity created)", () => {
+    const sink: Upsert[] = []; const created: string[] = [];
+    const res = captureLawFromUserTurn({
+      store: hookStore(sink, created),
+      userText: "Working tree pulito — tutto committato.",
+      now: NOW,
+    });
+    expect(res.captured).toBe(false);
+    expect(created).toHaveLength(0); // never resolved the entity
+    expect(sink).toHaveLength(0);
+  });
+
+  it("no-ops (never throws) when the store lacks resolveOrCreateEntity", () => {
+    expect(() =>
+      captureLawFromUserTurn({ store: { upsertFact() { return {}; } } as never, userText: "non compiacere mai", now: NOW }),
+    ).not.toThrow();
   });
 });
 

@@ -18,6 +18,7 @@ import { recordConversation } from "../conversation/l0-recorder.js";
 import type { ConversationMessage } from "../conversation/l0-recorder.js";
 import type { IMemoryStore, L0Record } from "../store/types.js";
 import type { EmbeddingService } from "../store/embedding.js";
+import { captureLawFromUserTurn, type LawHookStore } from "../kb/behavioral-law-capture.js";
 
 const TAG = "[memory-tdai] [capture]";
 
@@ -145,6 +146,30 @@ export async function performAutoCapture(params: {
     logger?.error(`${TAG} L0 recording failed: ${err instanceof Error ? err.message : String(err)}`);
   }
   const tL0RecordEnd = performance.now();
+
+  // ============================
+  // Step 1.6: behavioral-law capture (Percorso A)
+  // ============================
+  // If THIS user turn stated an explicit behavioral law ("aspetta la mia
+  // risposta", "non compiacere mai"), persist it as a rule_ fact on the Lorenzo
+  // person entity so the persona projection surfaces it EVERY session. Off the
+  // critical path: never throws, never blocks capture; non-law turns don't touch
+  // the store at all.
+  if (originalUserText && vectorStore) {
+    try {
+      const res = captureLawFromUserTurn({
+        store: vectorStore as unknown as LawHookStore,
+        userText: originalUserText,
+        namespace: "default",
+        now: new Date().toISOString(),
+      });
+      if (res.captured) {
+        logger?.debug?.(`${TAG} behavioral law captured: ${res.attribute} (${res.kind}, strength ${res.strength})`);
+      }
+    } catch (err) {
+      logger?.warn?.(`${TAG} behavioral-law capture failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 
   // ============================
   // Step 1.5: L0 vector indexing

@@ -97,3 +97,53 @@ export function captureBehavioralLaw(params: {
 
   return { captured: true, attribute, kind: candidate.kind, strength: candidate.strength };
 }
+
+/** The person-entity name laws are attached to (Lorenzo's choice, 2026-07-01). */
+export const DEFAULT_USER_NAME = "Lorenzo";
+
+/** Store surface for the turn hook: resolve the user entity + write the fact. */
+export interface LawHookStore extends LawCaptureStore {
+  resolveOrCreateEntity?(params: {
+    namespace?: string;
+    type: string;
+    name: string;
+    now: string;
+  }): { id: string };
+}
+
+/**
+ * Turn-level entry point (called from performAutoCapture with the user's message).
+ * Detects a law FIRST — only on a hit does it resolve/create the canonical user
+ * person entity and persist the rule. So non-law turns touch the store not at all.
+ * Never throws.
+ */
+export function captureLawFromUserTurn(params: {
+  store: LawHookStore;
+  userText: string;
+  now: string;
+  namespace?: string;
+  userName?: string;
+  minStrength?: number;
+}): LawCaptureResult {
+  const { store, userText, now } = params;
+  if (!store?.resolveOrCreateEntity || !store?.upsertFact || !userText) return { captured: false };
+
+  const floor = params.minStrength ?? CAPTURE_MIN_STRENGTH;
+  const candidate = detectDirective(userText);
+  if (!candidate || candidate.strength < floor) return { captured: false };
+
+  let entityId: string;
+  try {
+    const entity = store.resolveOrCreateEntity({
+      namespace: params.namespace,
+      type: "person",
+      name: params.userName ?? DEFAULT_USER_NAME,
+      now,
+    });
+    entityId = entity.id;
+  } catch {
+    return { captured: false }; // never break capture
+  }
+
+  return captureBehavioralLaw({ store, userEntityId: entityId, userText, now, minStrength: floor });
+}
