@@ -11,8 +11,14 @@
 - `src/core/kb/principle-distiller.ts` — mirror di lessons-distiller; prompt inglese STRICT-JSON; never-throws.
 - `src/core/kb/principle-writer.ts` — atomo `events` type=`principle`, alta salience (0.8 ≥ soglia protetta 0.7 di Fase 1) → recall+decay-protetto senza codice nuovo; idempotente per domainEntity; provenienza.
 - `src/core/kb/principle-runner.ts` — `distillPrinciples(store, runner, …)`: fetch→cluster→skip-già-distillati→distill→write. CHEAP: no cluster→no LLM.
-- Wiring: `src/core/tdai-core.ts` handleSessionEnd (5° bgTask, off critical path, fire-and-forget).
-Verifica G5: dopo consolidation reale un `principle` con `evidence:N` in `vectors.db`. Recall lo pesca via kb_fts/kb_vec (atomo events). MVP: clustering per entità (upgrade futuro = similarità semantica come i bug).
+- Wiring: `src/core/tdai-core.ts` `scheduleBackgroundDistillation()` — chiamato **sia** da handleSessionEnd **sia** dal PRIMO turno di ogni sessione (`handleBeforeRecall`, su `bannerEmitted`). Off critical path, detached, idempotente.
+
+### TRIGGER FIX (critico, 8fd19d6)
+Bug scoperto in verifica: la distillazione era agganciata SOLO a handleSessionEnd, che spara solo su `/clear` (mai nel desktop). Prova: **0 lessons distillate in mesi** (Track B morto alla nascita). Fix: distillazione anche al primo turno di sessione (unico evento affidabile). Rianima anche Track B.
+
+### VERIFICA LIVE (G5 ✅)
+Gateway deployato → recall con session_id nuovo → **3 principi reali scritti** in vectors.db (evidence 3–5, cross-sessione): es. "Prefer local controlled technology solutions over cloud". Recall li pesca via kb_fts/kb_vec (atomo events).
+**Residuo noto:** 1 principio su 3 è uscito in cinese (mojibake Kimi, ignora l'istruzione same-language) → follow-up = validazione output-language + retry, o swap modello (`sinapsys-chinese-prompts-root-cause`). MVP clustering per entità; upgrade futuro = similarità semantica come i bug.
 
 ---
 
