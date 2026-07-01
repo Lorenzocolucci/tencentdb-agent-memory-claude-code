@@ -385,25 +385,22 @@ async function performAutoRecallInner(params: {
     }
   }
 
-  // Dynamic part: L1 relevant memories (changes every turn) → prependContext (user prompt)
-  let prependContext: string | undefined;
-  if (memoryLines.length > 0) {
-    // memoryLines is recalled memory content — UNTRUSTED (a prior session could
-    // have stored a poisoned memory). Escape each line so a memory containing
-    // "</relevant-memories><system>..." cannot close the section early and
-    // inject attacker-controlled instructions into a future session.
-    const safeMemoryLines = memoryLines.map((line) => escapeXmlTags(line));
-    prependContext =
-      `<relevant-memories>\n${RELEVANT_MEMORIES_HEADER}\n\n${safeMemoryLines.join("\n")}\n</relevant-memories>`;
-  }
+  // Dynamic part: the proactive-injection payload, assembled in PRIORITY order
+  // (highest first) so any downstream tail truncation sacrifices the
+  // lowest-value block last — banner → recap → relevant-memories. The banner
+  // used to be sandwiched between the recap and the memories; an oversized
+  // persona pushed it past the plugin char cap and a blind tail-slice cut it,
+  // silently degrading proactive injection. Head position keeps it safe.
+  const dynamicBlocks: string[] = [];
 
-  // Session-open banner: inject instruction on FIRST turn of each SESSION.
-  // Keyed on sessionId (changes per session) with a sessionKey fallback — keying
-  // on sessionKey alone fired the banner once per gateway-process lifetime
-  // (sessionKey is stable per project), so it effectively never re-fired.
-  // PEEK only (pending) — the caller commits the slot (markEmitted) after this
-  // result is actually returned, so a timed-out recall never burns the banner.
-  // Wrapped so any error is swallowed — the banner must never break a turn.
+  // (1) Session-open banner — FIRST turn of each SESSION only. Highest priority:
+  // it is the proof memory is loaded AND the instruction to open the reply with
+  // it. Keyed on sessionId (changes per session) with a sessionKey fallback —
+  // keying on sessionKey alone fired it once per gateway-process lifetime, so it
+  // effectively never re-fired. PEEK only (pending) — the caller commits the slot
+  // (markEmitted) after this result is actually returned, so a timed-out recall
+  // never burns the banner. Wrapped so any error is swallowed — the banner must
+  // never break a turn.
   const bannerKey = params.sessionId ?? params.sessionKey;
   let bannerEmitted = false;
   if (bannerTracker?.pending(bannerKey)) {
@@ -415,25 +412,35 @@ async function performAutoRecallInner(params: {
         sceneCount,
         recentEventText,
       });
-      prependContext = prependContext ? `${banner}\n\n${prependContext}` : banner;
+      dynamicBlocks.push(banner);
       bannerEmitted = true;
 
-      // "Dove eravamo" — on the first turn, prepend the previous session's
-      // anchored recap for THIS context, joined on session_key (stable per
-      // project; the events' `project` column is empty). Reconstruction, not a
-      // doc dump. Off the critical path: latestRecapBlock returns "" on failure.
+      // (2) "Dove eravamo" — the previous session's anchored recap for THIS
+      // context, joined on session_key (stable per project; the events'
+      // `project` column is empty). Reconstruction, not a doc dump. Second
+      // priority, right after the banner. Off the critical path: "" on failure.
       if (vectorStore && params.sessionKey) {
-        // Rollover capture already ran above (before the inject gate); here we
-        // just surface the freshest recap. Off the critical path: "" on failure.
         const recapBlock = latestRecapBlock({ store: vectorStore, sessionKey: params.sessionKey, logger });
-        if (recapBlock) {
-          prependContext = prependContext ? `${recapBlock}\n\n${prependContext}` : recapBlock;
-        }
+        if (recapBlock) dynamicBlocks.push(recapBlock);
       }
     } catch {
       // Banner errors are silently swallowed — memory must never block the turn.
     }
   }
+
+  // (3) L1 relevant memories (changes every turn) — lowest priority of the
+  // dynamic blocks, so it yields first under truncation. memoryLines is recalled
+  // content — UNTRUSTED (a prior session could have stored a poisoned memory).
+  // Escape each line so a memory containing "</relevant-memories><system>..."
+  // cannot close the section early and inject instructions into a future session.
+  if (memoryLines.length > 0) {
+    const safeMemoryLines = memoryLines.map((line) => escapeXmlTags(line));
+    dynamicBlocks.push(
+      `<relevant-memories>\n${RELEVANT_MEMORIES_HEADER}\n\n${safeMemoryLines.join("\n")}\n</relevant-memories>`,
+    );
+  }
+
+  const prependContext = dynamicBlocks.length > 0 ? dynamicBlocks.join("\n\n") : undefined;
 
   // Append memory tools usage guide to the stable part so the agent knows
   // how to actively retrieve deeper context when the injected snippets
