@@ -14,8 +14,10 @@
  * resurfaces unbidden the moment the agent touches a file in its trigger pattern.
  */
 
-import type { IMemoryStore } from "../store/types.js";
+import type { IMemoryStore, KbLessonHit } from "../store/types.js";
 import { canonicalKey } from "../kb/kb-queries.js";
+import { classifyStakes } from "../kb/stakes.js";
+import { selectStanceToSurface } from "../kb/stance-severity.js";
 
 const NAMESPACE = "default";
 const MAX_FACTS = 6;
@@ -26,6 +28,23 @@ const MAX_LINE = 160;
 function clip(s: string): string {
   const t = s.replace(/\s+/g, " ").trim();
   return t.length > MAX_LINE ? `${t.slice(0, MAX_LINE - 1)}…` : t;
+}
+
+/**
+ * Render the block-before-acting interrupt for a single hard stance (Pilastro A):
+ * an attested lesson whose situation is recurring AND the current action crosses
+ * a one-way door. Mirrors the Grounded-Trust interrupt priority — it is a block
+ * directive in the injected context, the only "stop" a memory can assert.
+ */
+function renderStanceInterrupt(lesson: KbLessonHit, stakesDomain: string | null): string {
+  const door = stakesDomain ? ` (${stakesDomain})` : "";
+  return (
+    '<stance-interrupt priority="block-before-acting">\n' +
+    `🛑 You have been burned here before AND this action crosses a one-way door${door}. ` +
+    "Stop and confirm this is intentional before acting.\n" +
+    `lesson [${lesson.domain}, ${lesson.evidenceCount}× evidence]: ${clip(lesson.lessonText)}\n` +
+    "</stance-interrupt>"
+  );
 }
 
 /** Candidate canonical keys for a touched file: full posix path AND basename. */
@@ -49,7 +68,7 @@ function fileKeyCandidates(filePath: string): string[] {
 export function buildFileInjection(
   store: IMemoryStore,
   filePath: string,
-  opts?: { sessionId?: string; now?: string },
+  opts?: { sessionId?: string; now?: string; actionContent?: string },
 ): string | null {
   if (!store.queryEntityByKey || !store.queryHeadFacts || !store.queryEventsForEntity) {
     return null; // backend without KB read primitives → silence
@@ -76,17 +95,30 @@ export function buildFileInjection(
     return null; // nothing tied → silence
   }
 
-  const lines: string[] = [];
-  // Lessons FIRST — a "you've failed here before" warning outranks raw facts.
-  for (const l of lessons) {
-    lines.push(`- ⚠️ lesson [${l.domain}, ${l.evidenceCount}× evidence]: ${clip(l.lessonText)}`);
+  // Graduated stance (Pilastro A): when the CURRENT action crosses a one-way
+  // door AND a matched lesson is well-attested, escalate that single lesson to a
+  // block-before-acting interrupt (one at a time). Purely additive — a benign or
+  // absent action, or an under-attested lesson, leaves the soft notes untouched.
+  const actionStakes = classifyStakes({ content: opts?.actionContent ?? "" });
+  const mappedLessons = lessons.map((l) => ({ ...l, evidence_count: l.evidenceCount }));
+  const { hard } = selectStanceToSurface(mappedLessons, { stakes: actionStakes.stakes });
+
+  const recordExposure = (lessonId: string): void => {
     // B3: this lesson just resurfaced into a matching situation — record the
     // exposure so session-end can credit a successful avoidance. Best-effort.
     if (opts?.sessionId && store.recordLessonExposure) {
       try {
-        store.recordLessonExposure(l.id, opts.sessionId, opts.now ?? new Date().toISOString());
+        store.recordLessonExposure(lessonId, opts.sessionId, opts.now ?? new Date().toISOString());
       } catch { /* off the critical path — never break injection */ }
     }
+  };
+
+  const lines: string[] = [];
+  // Lessons FIRST — a "you've failed here before" warning outranks raw facts.
+  for (const l of lessons) {
+    if (hard && l.id === hard.id) continue; // the hard one becomes an interrupt, not a soft note
+    lines.push(`- ⚠️ lesson [${l.domain}, ${l.evidenceCount}× evidence]: ${clip(l.lessonText)}`);
+    recordExposure(l.id);
   }
   for (const f of facts) {
     lines.push(`- ${f.attribute}: ${clip(f.value)}`);
@@ -95,12 +127,20 @@ export function buildFileInjection(
     lines.push(`- (${e.type}) ${clip(e.text)}`);
   }
 
-  return (
-    "<file-memory>\n" +
-    `📌 What memory already knows about ${entity.name} (proactive — reference, not a task):\n` +
-    lines.join("\n") +
-    "\n</file-memory>"
-  );
+  const parts: string[] = [];
+  if (hard) {
+    recordExposure(hard.id);
+    parts.push(renderStanceInterrupt(hard, actionStakes.stakes_domain));
+  }
+  if (lines.length > 0) {
+    parts.push(
+      "<file-memory>\n" +
+        `📌 What memory already knows about ${entity.name} (proactive — reference, not a task):\n` +
+        lines.join("\n") +
+        "\n</file-memory>",
+    );
+  }
+  return parts.length > 0 ? parts.join("\n") : null;
 }
 
 /**

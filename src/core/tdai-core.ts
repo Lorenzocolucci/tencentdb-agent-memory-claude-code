@@ -714,7 +714,19 @@ export class TdaiCore {
       }
       if (!injectedFiles.has(fileKey)) {
         try {
-          const block = buildFileInjection(store, situation.filePath, { sessionId: obs.sessionKey });
+          // The current action's raw content — feeds the graduated stance gate
+          // (Pilastro A): a one-way-door action can escalate an attested lesson
+          // to a block-before-acting interrupt. Safe-stringify the unknown input.
+          let actionContent = "";
+          if (typeof obs.toolInput === "string") {
+            actionContent = obs.toolInput;
+          } else if (obs.toolInput != null) {
+            try { actionContent = JSON.stringify(obs.toolInput) ?? ""; } catch { actionContent = ""; }
+          }
+          const block = buildFileInjection(store, situation.filePath, {
+            sessionId: obs.sessionKey,
+            actionContent,
+          });
           if (block) {
             injectedFiles.add(fileKey);
             blocks.push(block);
