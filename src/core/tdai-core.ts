@@ -34,6 +34,7 @@ import type { IMemoryStore } from "./store/types.js";
 import type { EmbeddingService } from "./store/embedding.js";
 import { scheduleConsolidation } from "./kb/consolidation-scheduler.js";
 import { captureSessionRecap } from "./continuity/recap-capture.js";
+import { distillPrinciples } from "./kb/principle-runner.js";
 import { extractSituation } from "./hooks/situation.js";
 import { buildFileInjection, resolveFileOwnerId } from "./hooks/situation-injection.js";
 import {
@@ -625,6 +626,40 @@ export class TdaiCore {
       })();
       this.bgTasks.add(distillTask);
       void distillTask.then(() => this.bgTasks.delete(distillTask));
+    }
+
+    // Pilastro C Fase 2 (distillazione): auto-distil recurring cross-session
+    // DECISIONS into `principle` atoms after the flush — "dimenticare con gusto".
+    // CONSERVATIVE: additive only (source events decay via Fase 1, never deleted).
+    // Fire-and-forget, off the critical path, errors swallowed. CHEAP: no cluster
+    // → no LLM (the common case). Idempotent (a domain already distilled is skipped).
+    if (typeof this.vectorStore?.insertEvent === "function" && typeof this.vectorStore?.listRecentEvents === "function") {
+      const store = this.vectorStore;
+      const runnerFactory = this.runnerFactory;
+      const logger = this.logger;
+      const principleTask = (async () => {
+        try {
+          const runner = runnerFactory.createRunner({ enableTools: false });
+          const stats = await distillPrinciples(store, runner, {
+            now: new Date().toISOString(),
+            maxClusters: 3,
+          });
+          if (stats.inserted > 0) {
+            logger.info(
+              `${TAG} [principles] distilled: inserted=${stats.inserted} ` +
+                `(candidates=${stats.candidates}, skippedDuplicate=${stats.skippedDuplicate})`,
+            );
+          } else {
+            logger.debug?.(`${TAG} [principles] no new principles (candidates=${stats.candidates})`);
+          }
+        } catch (err) {
+          logger.warn(
+            `${TAG} [principles] distillation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      })();
+      this.bgTasks.add(principleTask);
+      void principleTask.then(() => this.bgTasks.delete(principleTask));
     }
 
     // B3: credit successful AVOIDANCES for lessons that resurfaced this session and

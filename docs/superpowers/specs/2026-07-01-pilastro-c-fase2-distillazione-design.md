@@ -1,9 +1,18 @@
 # Design — Pilastro C Fase 2: Distillazione ("dimenticare con gusto")
 
 **Date:** 2026-07-01
-**Status:** Design approvato (filosofia), pending build in sessione dedicata
+**Status:** ✅ COSTRUITO + DEPLOYATO 2026-07-01 (gateway PID 51356). 21 test verdi, 0 regressioni. Prova su dati vivi: 7 cluster qualificanti reali.
 **Decisione di visione (Lorenzo, 2026-07-01):** **CONSERVATIVO — distilla, non cancella.**
 **Blueprint:** `docs/SINAPSYS-NEXT-BLUEPRINT.md` Parte 2 Pilastro C + Parte 5 punto 2.
+
+## ESITO BUILD (2026-07-01)
+4 file nuovi + wiring, tutti a livello `IMemoryStore` (testabili su store reale):
+- `src/core/kb/principle-clusters.ts` — clustering deterministico per entità; guard cross-sessione su **session_id** (NON session_key: stabile per progetto — stessa trappola del rollover). Soglia evidence≥2 / sessioni≥2.
+- `src/core/kb/principle-distiller.ts` — mirror di lessons-distiller; prompt inglese STRICT-JSON; never-throws.
+- `src/core/kb/principle-writer.ts` — atomo `events` type=`principle`, alta salience (0.8 ≥ soglia protetta 0.7 di Fase 1) → recall+decay-protetto senza codice nuovo; idempotente per domainEntity; provenienza.
+- `src/core/kb/principle-runner.ts` — `distillPrinciples(store, runner, …)`: fetch→cluster→skip-già-distillati→distill→write. CHEAP: no cluster→no LLM.
+- Wiring: `src/core/tdai-core.ts` handleSessionEnd (5° bgTask, off critical path, fire-and-forget).
+Verifica G5: dopo consolidation reale un `principle` con `evidence:N` in `vectors.db`. Recall lo pesca via kb_fts/kb_vec (atomo events). MVP: clustering per entità (upgrade futuro = similarità semantica come i bug).
 
 ---
 

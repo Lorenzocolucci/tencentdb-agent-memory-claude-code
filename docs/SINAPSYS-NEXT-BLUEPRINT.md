@@ -104,6 +104,7 @@ estendono codice che esiste già** — verificato in `src/core/kb/`.
   una volta ma poi giusta deve poter risalire). Decadimento simmetrico.
 
 ### Pilastro C — DIMENTICARE CON GUSTO (distillazione, non accumulo)
+> ✅ **Fase 1 (decay consapevole) DEPLOYATA** (`e8056ee`). ✅ **Fase 2 (distillazione) COSTRUITA + DEPLOYATA 2026-07-01** (gateway PID 51356, 21 test verdi, 7 cluster reali sui dati vivi). Scelta di Lorenzo: **conservativo — distilla, non cancella** (le sorgenti decadono via Fase 1, mai rimosse). Principio = atomo `events` type=`principle` alta-salience; clustering per entità con guard cross-sessione su session_id. Design+esito: `docs/superpowers/specs/2026-07-01-pilastro-c-fase2-distillazione-design.md`.
 - **Estende** (verificato): `consolidation-runner.ts` (reinforce + decay,
   deterministico, no-LLM), `lifecycle-writer.ts`, `lifecycle-decay.ts` (staleness
   14gg), il sistema a tier.
