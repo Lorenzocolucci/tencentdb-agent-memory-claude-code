@@ -182,6 +182,10 @@ const PERSONA_SECTION_ORDER: PersonaSectionDef[] = [
 interface PersonaLine {
   section: PersonaSection;
   text: string;
+  /** Fact confidence — used ONLY to order the "process" (behavioral-law) section
+   *  by strength, so a reinforced law surfaces first and survives truncation.
+   *  Other sections ignore it and stay alphabetical. */
+  weight: number;
 }
 
 /**
@@ -210,6 +214,7 @@ export function projectPersonaBody(store: ProjectionStore, opts: ProjectionOptio
       lines.push({
         section,
         text: `- **${entity.name}** — ${humanizeAttr(fact.attribute)}: ${fact.value}`,
+        weight: fact.confidence,
       });
     }
   }
@@ -222,13 +227,19 @@ export function projectPersonaBody(store: ProjectionStore, opts: ProjectionOptio
   );
 
   for (const def of PERSONA_SECTION_ORDER) {
-    const sectionLines = lines
-      .filter((l) => l.section === def.key)
-      .map((l) => l.text)
-      .sort((a, b) => a.localeCompare(b));
-    if (sectionLines.length === 0) continue;
+    const inSection = lines.filter((l) => l.section === def.key);
+    if (inSection.length === 0) continue;
+    // The behavioral-law ("process") section is ordered by STRENGTH (confidence
+    // desc) so a reinforced law surfaces first and is the LAST to be dropped under
+    // truncation; ties and every other section fall back to stable alphabetical.
+    const sorted =
+      def.key === "process"
+        ? inSection.slice().sort((a, b) => b.weight - a.weight || a.text.localeCompare(b.text))
+        : inSection.slice().sort((a, b) => a.text.localeCompare(b.text));
+    const sectionLines: string[] = [];
+    for (const l of sorted) if (!sectionLines.includes(l.text)) sectionLines.push(l.text);
     bodyParts.push(`## ${def.heading}`);
-    bodyParts.push([...new Set(sectionLines)].join("\n"));
+    bodyParts.push(sectionLines.join("\n"));
   }
 
   // Active projects: the project entities themselves (name + any HEAD facts that

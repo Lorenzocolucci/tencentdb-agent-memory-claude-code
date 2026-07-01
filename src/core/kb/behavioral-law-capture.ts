@@ -19,6 +19,7 @@
  */
 
 import { detectDirective, type DirectiveKind } from "./behavioral-law-detector.js";
+import { confidenceAfterAvoidance } from "./lesson-reinforcement.js";
 
 /** Minimum detector strength to persist a law. The detector's status-note
  *  rejection is the main precision guard; this only drops the very weakest hits. */
@@ -38,6 +39,10 @@ export interface LawCaptureStore {
     confidence?: number;
     now: string;
   }): unknown;
+  /** Optional: current HEAD facts of the entity, so a re-stated law can be
+   *  reinforced (its confidence raised) rather than overwritten. Absent on the
+   *  minimal fakes → capture degrades gracefully to the detector strength. */
+  queryHeadFacts?(entityId: string): Array<{ attribute: string; confidence: number }>;
 }
 
 export interface LawCaptureResult {
@@ -45,6 +50,9 @@ export interface LawCaptureResult {
   attribute?: string;
   kind?: DirectiveKind;
   strength?: number;
+  /** True when this law already existed and its confidence was RAISED (the
+   *  willingness bridge: reiteration strengthens; see {@link confidenceAfterAvoidance}). */
+  reinforced?: boolean;
 }
 
 /**
@@ -89,13 +97,23 @@ export function captureBehavioralLaw(params: {
   const value =
     candidate.text.length > MAX_RULE_LEN ? candidate.text.slice(0, MAX_RULE_LEN) : candidate.text;
 
+  // Willingness bridge: if this exact law already exists, RAISE its confidence
+  // (reiteration = reinforcement, diminishing returns toward the cap) instead of
+  // overwriting it with the fresh single-shot detector strength. A first-time law
+  // keeps the detector strength. Reused, tested dynamics from lesson-reinforcement.
+  const prior = store.queryHeadFacts?.(userEntityId)?.find((f) => f.attribute === attribute);
+  const reinforced = prior !== undefined;
+  const confidence = reinforced
+    ? confidenceAfterAvoidance(Math.max(prior.confidence, candidate.strength))
+    : candidate.strength;
+
   try {
-    store.upsertFact({ entityId: userEntityId, attribute, value, confidence: candidate.strength, now });
+    store.upsertFact({ entityId: userEntityId, attribute, value, confidence, now });
   } catch {
     return { captured: false }; // off the critical path — never break capture
   }
 
-  return { captured: true, attribute, kind: candidate.kind, strength: candidate.strength };
+  return { captured: true, attribute, kind: candidate.kind, strength: candidate.strength, reinforced };
 }
 
 /** The person-entity name laws are attached to (Lorenzo's choice, 2026-07-01). */

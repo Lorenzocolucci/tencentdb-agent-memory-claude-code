@@ -96,6 +96,40 @@ describe("captureBehavioralLaw", () => {
     ).not.toThrow();
   });
 
+  it("REINFORCES: restating an existing law RAISES its written confidence (willingness bridge)", () => {
+    // A store that exposes the current HEAD facts, so capture can read the prior
+    // confidence and reinforce it (mirrors the real VectorStore.queryHeadFacts).
+    const calls: Upsert[] = [];
+    const heads = new Map<string, { attribute: string; confidence: number }>();
+    const store = {
+      queryHeadFacts(_entityId: string) { return [...heads.values()]; },
+      upsertFact(p: Upsert) {
+        calls.push(p);
+        heads.set(p.attribute, { attribute: p.attribute, confidence: p.confidence ?? 0 });
+        return p;
+      },
+    };
+    const first = captureBehavioralLaw({ store, userEntityId: USER, userText: "non compiacere mai", now: NOW });
+    const second = captureBehavioralLaw({ store, userEntityId: USER, userText: "non compiacere mai", now: NOW });
+    expect(first.captured).toBe(true);
+    expect(second.captured).toBe(true);
+    expect(second.reinforced).toBe(true);
+    // The re-statement is written with a STRICTLY higher confidence, capped < 1.
+    expect(calls[1].confidence!).toBeGreaterThan(calls[0].confidence!);
+    expect(calls[1].confidence!).toBeLessThanOrEqual(0.99);
+  });
+
+  it("does NOT reinforce a FIRST-time law (no prior head → detector strength)", () => {
+    const calls: Upsert[] = [];
+    const store = {
+      queryHeadFacts(_entityId: string) { return []; }, // nothing prior
+      upsertFact(p: Upsert) { calls.push(p); return p; },
+    };
+    const res = captureBehavioralLaw({ store, userEntityId: USER, userText: "non compiacere mai", now: NOW });
+    expect(res.captured).toBe(true);
+    expect(res.reinforced).toBe(false);
+  });
+
   it("caps a very long rule value", () => {
     const sink: Upsert[] = [];
     const long = "d'ora in poi " + "verifica sempre tutto ".repeat(40);

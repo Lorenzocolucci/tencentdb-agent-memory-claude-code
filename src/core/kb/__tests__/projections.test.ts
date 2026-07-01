@@ -157,6 +157,22 @@ describe("KB projections (temp DB)", () => {
       expect(persona).toContain("Non compiacere mai, sfida quando ho torto");
     });
 
+    it("orders behavioral laws by STRENGTH (a reinforced law surfaces first, survives truncation)", () => {
+      // Alphabetically "Aaa…" precedes "Zzz…"; confidence-desc must OVERRIDE alpha
+      // so the stronger (reinforced) law comes first regardless of its text.
+      // Attribute slugs are chosen so ALPHABETICAL order (aaa < zzz) would put the
+      // WEAK law first; only confidence-desc ordering flips the strong one ahead.
+      store.upsertFact({ entityId: lorenzoId, attribute: "rule_aaa", value: "Legge poco ribadita", confidence: 0.3, validFrom: "2026-07-01T00:00:00Z", now: "2026-07-01T00:00:00.000Z" });
+      store.upsertFact({ entityId: lorenzoId, attribute: "rule_zzz", value: "Legge molto ribadita", confidence: 0.95, validFrom: "2026-07-01T00:00:00Z", now: "2026-07-01T00:00:00.000Z" });
+
+      const persona = projectPersonaBody(store as unknown as ProjectionStore, { namespace: NS });
+      const iStrong = persona.indexOf("Legge molto ribadita");
+      const iWeak = persona.indexOf("Legge poco ribadita");
+      expect(iStrong).toBeGreaterThan(-1);
+      expect(iWeak).toBeGreaterThan(-1);
+      expect(iStrong).toBeLessThan(iWeak); // strength beats alphabetical
+    });
+
     it("still drops a behavioral-law fact whose VALUE looks like a secret", () => {
       store.upsertFact({ entityId: lorenzoId, attribute: "rule_leak", value: SECRET_VALUE, validFrom: "2026-07-01T00:00:00Z", now: "2026-07-01T00:00:00.000Z" });
       const persona = projectPersonaBody(store as unknown as ProjectionStore, { namespace: NS });
