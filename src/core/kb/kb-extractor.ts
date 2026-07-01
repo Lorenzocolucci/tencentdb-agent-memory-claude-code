@@ -18,7 +18,7 @@ import { parseKbDelta, type KbDelta } from "./extraction-schema.js";
 import { applyKbDelta } from "./kb-writer.js";
 import type { KbWriterStore } from "./kb-writer.js";
 import { sanitizeJsonForParse } from "../../utils/sanitize.js";
-import { runWithoutCjk } from "../../utils/language-guard.js";
+import { runWithoutCjk, hasCjk } from "../../utils/language-guard.js";
 import type { EmbeddingService } from "../store/embedding.js";
 import type { Logger, LLMRunner } from "../types.js";
 
@@ -133,6 +133,16 @@ export async function extractKbDelta(params: {
       lastError = `LLM call failed: ${err instanceof Error ? err.message : String(err)}`;
       logger?.warn?.(`${TAG} attempt ${attempt}/${MAX_ATTEMPTS}: ${lastError}`);
       continue; // fresh retry of the LLM call
+    }
+
+    // Hard CJK barrier: runWithoutCjk already tried to force a rewrite; if the
+    // output STILL contains CJK, fail this attempt (fresh retry, then fail-closed
+    // = cursor holds). Never store CJK — the reject is deterministic, so the
+    // "no Chinese gets stored" guarantee does not depend on the model complying.
+    if (hasCjk(raw)) {
+      lastError = `output still contains CJK after language guard (rawLen=${raw.length})`;
+      logger?.warn?.(`${TAG} attempt ${attempt}/${MAX_ATTEMPTS}: ${lastError}`);
+      continue;
     }
 
     let parsed: unknown;

@@ -194,6 +194,32 @@ describe("extractKbDelta (mock LLM, temp DB)", () => {
     expect((handle.prepare("SELECT count(*) AS c FROM entities").all()[0] as { c: number }).c).toBe(0);
   });
 
+  it("CJK output → success:false, nothing stored (language barrier, fail-closed)", async () => {
+    // Model insists on Chinese every attempt (worst case). The barrier's rewrite
+    // cannot force it, so the extractor must REJECT rather than store CJK.
+    const cjkDelta = JSON.stringify({
+      language: "zh",
+      entities: [{ ref: "e1", type: "concept", name: "关联记忆", aliases: [], language: "zh" }],
+      facts: [],
+      events: [{ ref: "ev1", type: "observation", ts: "2026-06-06T09:00:00Z", text: "关联记忆是一种记忆方法。", entity_refs: ["e1"], source_message_ids: ["msg_b1"] }],
+      relations: [],
+    });
+    const runner = new MockLLMRunner(cjkDelta);
+    const res = await extractKbDelta({
+      messages: WINDOW,
+      sessionKey: "sess-1",
+      store,
+      embeddingService: embedding,
+      llmRunner: runner,
+      now: "2026-06-06T09:01:00.000Z",
+    });
+    expect(res.success).toBe(false);
+    const handle = (store as unknown as {
+      db: { prepare: (q: string) => { all: () => Record<string, unknown>[] } };
+    }).db;
+    expect((handle.prepare("SELECT count(*) AS c FROM events").all()[0] as { c: number }).c).toBe(0);
+  });
+
   it("schema-invalid JSON (dangling ref) → success:false (cursor holds)", async () => {
     const bad = JSON.stringify({
       language: "en",
