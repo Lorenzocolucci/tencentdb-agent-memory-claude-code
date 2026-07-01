@@ -18,6 +18,7 @@ import { parseKbDelta, type KbDelta } from "./extraction-schema.js";
 import { applyKbDelta } from "./kb-writer.js";
 import type { KbWriterStore } from "./kb-writer.js";
 import { sanitizeJsonForParse } from "../../utils/sanitize.js";
+import { runWithoutCjk } from "../../utils/language-guard.js";
 import type { EmbeddingService } from "../store/embedding.js";
 import type { Logger, LLMRunner } from "../types.js";
 
@@ -119,7 +120,10 @@ export async function extractKbDelta(params: {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     let raw: string;
     try {
-      raw = await llmRunner.run({
+      // Language barrier: the extractor is the SOURCE of every stored event, so
+      // forcing a no-CJK rewrite here keeps recall/recap/principles clean at the
+      // root. Falls through to the existing parse/validate/retry loop.
+      raw = await runWithoutCjk(llmRunner, {
         prompt: userPrompt,
         systemPrompt: resolveKbExtractionSystemPrompt(),
         taskId: "kb-extraction",

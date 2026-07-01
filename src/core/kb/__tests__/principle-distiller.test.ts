@@ -48,4 +48,10 @@ describe("distillPrinciple", () => {
     const runner = { run: vi.fn().mockRejectedValue(new Error("timeout")) } as unknown as LLMRunner;
     await expect(distillPrinciple(cluster, runner)).resolves.toBeNull();
   });
+
+  it("REJECTS a principle still in Chinese after the guard's rewrites (skip, no garbage)", async () => {
+    // Model insists on CJK across every attempt → distiller returns null.
+    const runner = { run: vi.fn().mockResolvedValue('{"domain":"项目","principle_text":"优先考虑灵活方案","confidence":0.9}') } as unknown as LLMRunner;
+    await expect(distillPrinciple(cluster, runner)).resolves.toBeNull();
+  });
 });

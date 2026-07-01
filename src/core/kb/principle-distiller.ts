@@ -15,6 +15,7 @@
  * NOTE: prompt is a first cut; have lo-llm-architect review before auto cadence.
  */
 import type { LLMRunner } from "../types.js";
+import { runWithoutCjk, hasCjk } from "../../utils/language-guard.js";
 
 // ── Public types ───────────────────────────────────────────────────────────────
 
@@ -123,13 +124,17 @@ export async function distillPrinciple(
   opts: DistillPrincipleOptions = {},
 ): Promise<DistilledPrinciple | null> {
   try {
-    const raw = await llmRunner.run({
+    // Language barrier: force a rewrite if the model slips into CJK.
+    const raw = await runWithoutCjk(llmRunner, {
       systemPrompt: PRINCIPLE_DISTILL_SYSTEM_PROMPT,
       prompt: buildPrinciplePrompt(cluster),
       taskId: "principle-distill",
       timeoutMs: opts.timeoutMs ?? 120_000,
     });
-    return parseDistilledPrinciple(raw);
+    const parsed = parseDistilledPrinciple(raw);
+    // Reject a residual-CJK principle rather than store garbage (skip the cluster).
+    if (parsed && hasCjk(parsed.principleText)) return null;
+    return parsed;
   } catch {
     return null;
   }
