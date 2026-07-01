@@ -3554,16 +3554,19 @@ export class VectorStore implements IMemoryStore {
 
   /** @see IMemoryStore.runUsageDistillation */
   async runUsageDistillation(
+    llmRunner: LLMRunner,
     opts: { now: string; namespace?: string; maxClusters?: number },
-  ): Promise<{ candidates: number; inserted: number; skippedDuplicate: number }> {
+  ): Promise<{ candidates: number; confirmed: number; inserted: number; skippedDuplicate: number; skippedRejected: number }> {
     if (this.degraded || !this.kbReady || !this.kbVecReady) {
-      return { candidates: 0, inserted: 0, skippedDuplicate: 0 };
+      return { candidates: 0, confirmed: 0, inserted: 0, skippedDuplicate: 0, skippedRejected: 0 };
     }
     // Usage clustering is SEMANTIC → it needs vectors (unlike per-entity
     // principles). The reader reads this.db's kb_vec; events are read and the
-    // usage atom is written on the SAME store/connection — no LLM (B2 is wiring).
+    // usage atom is written on the SAME store/connection. The LLM is the A3
+    // precision gate that rejects noise clusters (recall from clustering,
+    // precision from the judge).
     const reader = createKbVecEmbeddingReader(this.db, this.dimensions);
-    return kbDistillUsage(this, reader, {
+    return kbDistillUsage(this, reader, llmRunner, {
       now: opts.now,
       namespace: opts.namespace,
       maxClusters: opts.maxClusters,

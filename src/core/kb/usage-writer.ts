@@ -27,6 +27,10 @@ export function writeUsage(params: {
   cluster: UsageCluster;
   now: string;
   salience?: number;
+  /** A3: the LLM-cleaned tendency statement. Falls back to the raw theme. */
+  text?: string;
+  /** A3: model confidence, stamped as an entity marker for later reinforcement. */
+  confidence?: number;
 }): KbEvent | null {
   const { store, cluster, now } = params;
   try {
@@ -35,13 +39,16 @@ export function writeUsage(params: {
     // Member ids are recorded as entity markers so a later pass can skip a
     // cluster whose events are already covered by a usage atom (idempotency).
     const srcMarkers = cluster.eventIds.map((id) => `${USAGE_SRC_PREFIX}${id}`);
+    const confMarkers =
+      typeof params.confidence === "number" ? [`usage-confidence:${params.confidence.toFixed(2)}`] : [];
+    const body = (params.text && params.text.trim()) || cluster.theme;
     const event = store.insertEvent({
       ts: now,
       sessionKey: cluster.sessionKey,
       project: cluster.project,
       type: USAGE_TYPE,
-      text: `[modo d'uso ricorrente] ${cluster.theme}`,
-      entities: [`evidence:${evidence}`, ...srcMarkers],
+      text: `[modo d'uso ricorrente] ${body}`,
+      entities: [`evidence:${evidence}`, ...confMarkers, ...srcMarkers],
       sourceMessageIds: cluster.sourceMessageIds,
     });
     // Protect from staleness decay (Fase 1 bridge). Off critical path.

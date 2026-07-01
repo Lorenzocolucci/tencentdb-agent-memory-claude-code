@@ -661,17 +661,22 @@ export class TdaiCore {
       const store = this.vectorStore;
       const usageTask = (async () => {
         try {
-          const stats = await store.runUsageDistillation!({
+          const runner = runnerFactory.createRunner({ enableTools: false });
+          const stats = await store.runUsageDistillation!(runner, {
             now: new Date().toISOString(),
             maxClusters: 3,
           });
           if (stats.inserted > 0) {
             logger.info(
               `${TAG} [usage] distilled: inserted=${stats.inserted} ` +
-                `(candidates=${stats.candidates}, skippedDuplicate=${stats.skippedDuplicate})`,
+                `(candidates=${stats.candidates}, confirmed=${stats.confirmed}, ` +
+                `skippedRejected=${stats.skippedRejected}, skippedDuplicate=${stats.skippedDuplicate})`,
             );
           } else {
-            logger.debug?.(`${TAG} [usage] no new usage tendencies (candidates=${stats.candidates})`);
+            logger.debug?.(
+              `${TAG} [usage] no new usage tendencies (candidates=${stats.candidates}, ` +
+                `rejected=${stats.skippedRejected})`,
+            );
           }
         } catch (err) {
           logger.warn(

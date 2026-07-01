@@ -4,7 +4,7 @@
  * store shape — the non-circular check that catches a green no-op. Embeddings
  * are injected (test env has no embedding API) so the geometry is controlled.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +14,9 @@ import { distillUsage } from "../usage-runner.js";
 import { fakeEmbeddingReader } from "../bug-embeddings.js";
 
 const DIMS = 4;
+// A3 gate: an LLM that confirms every candidate as a genuine tendency.
+const confirmRunner = () =>
+  ({ run: vi.fn().mockResolvedValue('{"is_tendency": true, "tendency_text": "Tende ad attendere la conferma prima di procedere.", "confidence": 0.8}') }) as any;
 
 describe("distillUsage — real store round-trip", () => {
   let dir: string;
@@ -45,18 +48,19 @@ describe("distillUsage — real store round-trip", () => {
       [e2.id, new Float32Array([0.99, 0.14, 0, 0])],
     ]));
 
-    const s1 = await distillUsage(store, reader, { now: "2026-07-01T14:00:00.000Z" });
+    const s1 = await distillUsage(store, reader, confirmRunner(), { now: "2026-07-01T14:00:00.000Z" });
     expect(s1.candidates).toBe(1);
+    expect(s1.confirmed).toBe(1);
     expect(s1.inserted).toBe(1);
     expect(usageCount()).toBe(1);
 
     const usage = store.listRecentEvents!("default", { limit: 1000 }).find((e) => e.type === "usage")!;
-    expect(usage.text).toContain("modo d'uso ricorrente");
+    expect(usage.text).toContain("attendere la conferma"); // LLM-cleaned tendency
     expect(usage.entities).toContain("evidence:2");
     expect(usage.entities).toContain(`usage-src:${e1.id}`);
 
     // Second pass sees the existing usage atom → no duplicate.
-    const s2 = await distillUsage(store, reader, { now: "2026-07-01T15:00:00.000Z" });
+    const s2 = await distillUsage(store, reader, confirmRunner(), { now: "2026-07-01T15:00:00.000Z" });
     expect(s2.skippedDuplicate).toBeGreaterThanOrEqual(1);
     expect(usageCount()).toBe(1);
   });
@@ -68,7 +72,7 @@ describe("distillUsage — real store round-trip", () => {
       [e1.id, new Float32Array([1, 0, 0, 0])],
       [e2.id, new Float32Array([1, 0, 0, 0])],
     ]));
-    const s = await distillUsage(store, reader, { now: "2026-07-01T14:00:00.000Z" });
+    const s = await distillUsage(store, reader, confirmRunner(), { now: "2026-07-01T14:00:00.000Z" });
     expect(s.candidates).toBe(0);
     expect(usageCount()).toBe(0);
   });

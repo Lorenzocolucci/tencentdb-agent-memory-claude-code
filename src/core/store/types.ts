@@ -715,8 +715,9 @@ export interface IMemoryStore {
    * + vector support → caller no-ops.
    */
   runUsageDistillation?(
+    llmRunner: import("../types.js").LLMRunner,
     opts: { now: string; namespace?: string; maxClusters?: number },
-  ): Promise<{ candidates: number; inserted: number; skippedDuplicate: number }>;
+  ): Promise<{ candidates: number; confirmed: number; inserted: number; skippedDuplicate: number; skippedRejected: number }>;
 
   /** kb_vec / kb_fts recall primitives (mirror searchL1Vector / searchL1Fts). */
   searchKbVector?(queryEmbedding: Float32Array, topK?: number, ownerKindFilter?: string): KbVectorSearchResult[];

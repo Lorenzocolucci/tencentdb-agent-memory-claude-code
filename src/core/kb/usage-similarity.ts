@@ -19,8 +19,15 @@ import { cosineSimilarity, jaccardSimilarity } from "./bug-similarity.js";
 export const USAGE_ALPHA = 0.85;
 /** Structural Jaccard weight — a small nudge when behaviors share an entity. */
 export const USAGE_BETA = 0.15;
-/** Edge threshold: keep an edge iff weight ≥ USAGE_TAU. */
+/** Edge threshold: keep an edge iff weight ≥ USAGE_TAU (the "confident" edge). */
 export const USAGE_TAU = 0.72;
+/**
+ * Looser threshold the runner uses to SURFACE candidates for the A3 LLM gate.
+ * The live dry-run proved 0.72 yields 0 clusters on real embeddings, so recall
+ * happens here (wide net) and precision is enforced by the LLM judge — clustering
+ * gives recall, the distiller gives precision.
+ */
+export const USAGE_CANDIDATE_TAU = 0.6;
 /** Minimum distinct events for a usage cluster to be emitted. */
 export const USAGE_EVIDENCE_MIN = 2;
 /**
