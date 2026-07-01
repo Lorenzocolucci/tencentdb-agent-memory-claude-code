@@ -58,7 +58,7 @@ import {
 } from "../kb/lessons-writer.js";
 import { phaseFor as lessonPhaseFor } from "../kb/lesson-reinforcement.js";
 import { distillLessons as kbDistillLessons } from "../kb/lessons-runner.js";
-import { ensureLifecycle, confirmProvenance, rejectProvenance, markGatePending, getLifecycle } from "../kb/lifecycle-writer.js";
+import { ensureLifecycle, confirmProvenance, rejectProvenance, markGatePending, getLifecycle, stampSalience as kbStampSalience } from "../kb/lifecycle-writer.js";
 import { serializeProvenance, parseProvenance, gateStateOf, type ProvenanceStamp } from "../kb/provenance.js";
 import { classifyStakes, shouldGate } from "../kb/stakes.js";
 import { spreadActivation, isNoiseAttribute, type WeightedNeighbor } from "../kb/spreading-activation.js";
@@ -2098,6 +2098,33 @@ export class VectorStore implements IMemoryStore {
     } catch (err) {
       this.logger?.warn?.(
         `[memory-tdai][provenance] confirmMemory failed for ${params.ownerKind} ${params.ownerId} ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Carry Idea 5's distinctiveness verdict onto a memory's lifecycle `salience`
+   * (Pilastro C bridge), so distinctiveness-aware decay protects the peak.
+   * Delegates to the monotonic stampSalience primitive. Off the critical path:
+   * failures are logged, never thrown.
+   */
+  stampSalience(params: {
+    ownerId: string;
+    ownerKind: "fact" | "event";
+    salience: number;
+    now: string;
+  }): void {
+    try {
+      kbStampSalience(this.db, {
+        ownerId: params.ownerId,
+        ownerKind: params.ownerKind,
+        salience: params.salience,
+        now: params.now,
+      });
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][cornerstones] stampSalience failed for ${params.ownerKind} ${params.ownerId} ` +
           `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
       );
     }

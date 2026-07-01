@@ -31,6 +31,7 @@ import {
   type InjectionCornerstone,
 } from "./cornerstone-injection.js";
 import { DEFAULT_WEIGHTS } from "./distinctiveness-scorer.js";
+import { PROTECTED_MIN_SALIENCE } from "../kb/lifecycle-decay.js";
 
 const TAG = "[memory-tdai] [cornerstones]";
 
@@ -154,8 +155,20 @@ export async function buildCornerstones(params: {
 
     // Record injection timestamps AFTER the block is successfully built,
     // so decay is only applied when memories are actually injected.
+    // At the same time, carry the distinctiveness verdict onto the lifecycle
+    // salience (Pilastro C bridge) for peaks that clear the protection
+    // threshold — this is what lets distinctiveness-aware decay protect them.
+    // stampSalience is optional + never throws, so this is off the critical path.
     for (const cs of selected) {
       injectionTracker.recordInjection(cs.id, nowIso);
+      if (cs.score >= PROTECTED_MIN_SALIENCE) {
+        vectorStore.stampSalience?.({
+          ownerId: cs.id,
+          ownerKind: "event",
+          salience: cs.score,
+          now: nowIso,
+        });
+      }
     }
 
     logger?.debug?.(`${TAG} Cornerstone block built: ${selected.length} memory/ies`);

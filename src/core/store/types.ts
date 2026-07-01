@@ -519,6 +519,19 @@ export interface IMemoryStore {
   insertEvent?(event: KbEventInput): KbEvent;
 
   /**
+   * Carry Idea 5's distinctiveness verdict onto a memory's lifecycle `salience`
+   * (Pilastro C bridge), so distinctiveness-aware decay protects the peak.
+   * Monotonic (only raises). Off the critical path: never throws. Optional so
+   * non-sqlite backends (TCVDB) can omit it and the cornerstone runner no-ops.
+   */
+  stampSalience?(params: {
+    ownerId: string;
+    ownerKind: "fact" | "event";
+    salience: number;
+    now: string;
+  }): void;
+
+  /**
    * Run one deterministic consolidation pass for a finished session: reinforce
    * the session's events + derived facts, then decay stale memories. Sync, NO
    * LLM. Returns zeroed stats when KB is not ready; never throws (it runs on

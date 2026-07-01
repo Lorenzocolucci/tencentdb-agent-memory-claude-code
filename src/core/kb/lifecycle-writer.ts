@@ -155,6 +155,51 @@ export function reinforce(db: DatabaseSync, params: ReinforceParams): LifecycleR
   return getLifecycle(db, ownerId, ownerKind) as LifecycleRow;
 }
 
+export interface StampSalienceParams {
+  ownerId: string;
+  ownerKind: string;
+  /** Distinctiveness score in [0,1] from Idea 5. */
+  salience: number;
+  now: string;
+}
+
+/**
+ * Carry Idea 5's distinctiveness verdict onto the lifecycle `salience` (Pilastro
+ * C bridge). This is what lets distinctiveness-aware decay protect the peak.
+ *
+ * MONOTONIC — only ever RAISES salience: corpus-relative distinctiveness wobbles
+ * session to session, and a recognized peak must not flap back down and get
+ * decayed like noise. A new value <= the current one is a no-op (no write, no
+ * audit). Recomputes permanence (repetition + salience) and writes one audit row
+ * (operation="salience"). Creates the lifecycle row first if missing.
+ */
+export function stampSalience(db: DatabaseSync, p: StampSalienceParams): LifecycleRow | null {
+  const cur = ensureLifecycle(db, { ownerId: p.ownerId, ownerKind: p.ownerKind, now: p.now });
+  if (p.salience <= cur.salience) return cur; // monotonic: never lower a peak
+
+  const newPerm = computePermanence(cur.reinforcement_count, p.salience);
+  db.prepare(
+    `UPDATE memory_lifecycle SET salience = ?, permanence_score = ?, updated_time = ?
+       WHERE owner_id = ? AND owner_kind = ?`,
+  ).run(p.salience, newPerm, p.now, p.ownerId, p.ownerKind);
+
+  recordAudit(
+    db,
+    {
+      ownerId: p.ownerId,
+      ownerKind: p.ownerKind,
+      operation: "salience",
+      actor: "system",
+      before: { salience: cur.salience, permanence_score: cur.permanence_score },
+      after: { salience: p.salience, permanence_score: newPerm },
+      reason: "distinctiveness stamp (cornerstone)",
+      namespace: cur.namespace,
+    },
+    p.now,
+  );
+  return getLifecycle(db, p.ownerId, p.ownerKind);
+}
+
 export interface ConfirmProvenanceParams {
   ownerId: string;
   ownerKind: string;
