@@ -12,6 +12,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { ulidLike } from "./kb-queries.js";
 import { confidenceAfterAvoidance, confidenceAfterRecurrence } from "./lesson-reinforcement.js";
+import { willingnessAfterConfirm, willingnessAfterReject } from "./stance-track-record.js";
 
 /** A row in the `lessons` table. */
 export interface LessonRow {
@@ -34,6 +35,11 @@ export interface LessonRow {
   avoidance_count: number;
   last_exposed_session_id: string | null;
   last_exposed_at: string | null;
+  // Pilastro B stance track record (additive; default 0/WILLINGNESS_DEFAULT on legacy rows).
+  stance_fire_count: number;
+  stance_confirmed_count: number;
+  stance_rejected_count: number;
+  stance_willingness: number;
   created_time: string;
   updated_time: string;
 }
@@ -195,6 +201,60 @@ export function temperOnRecurrence(db: DatabaseSync, lessonId: string, now: stri
   db.prepare("UPDATE lessons SET confidence = ?, updated_time = ? WHERE id = ?").run(
     confidence, now, lessonId,
   );
+  return getLessonById(db, lessonId);
+}
+
+// ── Pilastro B stance track-record primitives ────────────────────────────────
+
+/**
+ * Record that a stance FIRED a hard interrupt (it spoke). Bumps stance_fire_count.
+ * This is the denominator the confirm/reject signal hangs on — "of the times this
+ * stance interrupted, how often was it right?". Willingness itself moves only on
+ * confirm/reject, not on the bare fire.
+ */
+export function recordStanceFire(db: DatabaseSync, lessonId: string, now: string): LessonRow | null {
+  const cur = getLessonById(db, lessonId);
+  if (!cur) return null;
+  db.prepare(
+    `UPDATE lessons SET stance_fire_count = stance_fire_count + 1, updated_time = ? WHERE id = ?`,
+  ).run(now, lessonId);
+  return getLessonById(db, lessonId);
+}
+
+/**
+ * Credit a CONFIRMED stance fire (Lorenzo said the interrupt mattered): bump
+ * stance_confirmed_count and raise willingness with diminishing returns
+ * (willingnessAfterConfirm). Returns the updated row.
+ */
+export function creditStanceConfirmed(db: DatabaseSync, lessonId: string, now: string): LessonRow | null {
+  const cur = getLessonById(db, lessonId);
+  if (!cur) return null;
+  const willingness = willingnessAfterConfirm(cur.stance_willingness);
+  db.prepare(
+    `UPDATE lessons
+        SET stance_confirmed_count = stance_confirmed_count + 1,
+            stance_willingness = ?, updated_time = ?
+      WHERE id = ?`,
+  ).run(willingness, now, lessonId);
+  return getLessonById(db, lessonId);
+}
+
+/**
+ * Credit a REJECTED stance fire (Lorenzo said it was a false alarm): bump
+ * stance_rejected_count and shed willingness (willingnessAfterReject — stronger
+ * than the confirm gain, so crying wolf silences fast). Floored, never erased.
+ * Returns the updated row.
+ */
+export function creditStanceRejected(db: DatabaseSync, lessonId: string, now: string): LessonRow | null {
+  const cur = getLessonById(db, lessonId);
+  if (!cur) return null;
+  const willingness = willingnessAfterReject(cur.stance_willingness);
+  db.prepare(
+    `UPDATE lessons
+        SET stance_rejected_count = stance_rejected_count + 1,
+            stance_willingness = ?, updated_time = ?
+      WHERE id = ?`,
+  ).run(willingness, now, lessonId);
   return getLessonById(db, lessonId);
 }
 

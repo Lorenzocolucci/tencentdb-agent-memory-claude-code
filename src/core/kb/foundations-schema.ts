@@ -21,6 +21,7 @@
  */
 
 import type { DatabaseSync } from "node:sqlite";
+import { WILLINGNESS_DEFAULT } from "./stance-track-record.js";
 
 /** Minimal logger shape (decoupled from the host logger type). */
 export interface FoundationsLogger {
@@ -180,6 +181,32 @@ export function initFoundationsSchema(db: DatabaseSync, logger?: FoundationsLogg
       }
       if (!columnExists(db, "lessons", "last_exposed_at")) {
         ddl("ALTER TABLE lessons ADD COLUMN last_exposed_at TEXT");
+      }
+    }
+
+    // ── Brick 7 — stance track record (Pilastro B) ─────────────────────────
+    // Distinct from B3 (which tracks whether the FAILURE recurred). This tracks
+    // whether the STANCE itself was right to fire an interrupt: when a hard
+    // interrupt fires and Lorenzo CONFIRMS it mattered → willingness rises; when
+    // he REJECTS it as a false alarm → willingness falls, and a stance that
+    // repeatedly cries wolf suppresses itself. stance_willingness drives
+    // classifyStanceSeverity's suppress/demote/trusted tiers. Legacy rows default
+    // to WILLINGNESS_DEFAULT (trusted) → no behaviour change until signals arrive.
+    // Additive + guarded, exactly like Brick 6.
+    if (tableExists(db, "lessons")) {
+      if (!columnExists(db, "lessons", "stance_fire_count")) {
+        ddl("ALTER TABLE lessons ADD COLUMN stance_fire_count INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!columnExists(db, "lessons", "stance_confirmed_count")) {
+        ddl("ALTER TABLE lessons ADD COLUMN stance_confirmed_count INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!columnExists(db, "lessons", "stance_rejected_count")) {
+        ddl("ALTER TABLE lessons ADD COLUMN stance_rejected_count INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!columnExists(db, "lessons", "stance_willingness")) {
+        ddl(
+          `ALTER TABLE lessons ADD COLUMN stance_willingness REAL NOT NULL DEFAULT ${WILLINGNESS_DEFAULT}`,
+        );
       }
     }
 

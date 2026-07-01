@@ -303,6 +303,13 @@ export interface KbLessonHit {
   confidence: number;
   /** How many failure events back this lesson. */
   evidenceCount: number;
+  /**
+   * Pilastro B willingness-to-fire ∈ [0,1] from the stance's own hit/miss record.
+   * The live sqlite mapping always populates it (legacy rows default to
+   * WILLINGNESS_DEFAULT); optional so non-KB backends / older fixtures omitting it
+   * are treated as trusted by classifyStanceSeverity (undefined → trusted).
+   */
+  willingness?: number;
 }
 
 /** Input payload for inserting an event (append-only). */
@@ -663,6 +670,24 @@ export interface IMemoryStore {
    * lesson. Returns whether a row was updated. Best-effort. Absent → caller no-ops.
    */
   creditLessonAvoidance?(lessonId: string, now: string): boolean;
+
+  /**
+   * Pilastro B: record that a stance FIRED a hard interrupt (bumps its fire count).
+   * Best-effort, off the critical path. Absent on non-KB backends → caller no-ops.
+   */
+  recordStanceFire?(lessonId: string, now: string): void;
+
+  /**
+   * Pilastro B: Lorenzo CONFIRMED a stance interrupt mattered → willingness rises.
+   * Returns whether a row was updated. Best-effort. Absent → caller no-ops.
+   */
+  creditStanceConfirmed?(lessonId: string, now: string): boolean;
+
+  /**
+   * Pilastro B: Lorenzo REJECTED a stance interrupt as a false alarm → willingness
+   * falls (cry-wolf). Returns whether a row was updated. Best-effort. Absent → no-op.
+   */
+  creditStanceRejected?(lessonId: string, now: string): boolean;
 
   /**
    * B3: credit successful avoidances for lessons exposed this session that did not

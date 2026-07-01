@@ -84,3 +84,53 @@ describe("buildFileInjection — graduated stance (Pilastro A slice 2)", () => {
     expect(block).toContain("⚠️ lesson [deploy, 3× evidence]:");
   });
 });
+
+// ── Pilastro B (Strada A) — willingness feedback wiring ──────────────────────
+describe("buildFileInjection — stance track record (Pilastro B)", () => {
+  it("renders the confirm/reject buttons carrying the lesson id in the interrupt", () => {
+    const block = buildFileInjection(fakeStore([ATTESTED]), "/repo/src/deploy.ts", {
+      actionContent: ONE_WAY_DOOR,
+    });
+    expect(block).toContain('tdai_stance_confirmed(lesson_id:"les_1")');
+    expect(block).toContain('tdai_stance_rejected(lesson_id:"les_1")');
+  });
+
+  it("records the stance fire (best-effort) when a hard interrupt fires", () => {
+    const fired: string[] = [];
+    const store = {
+      queryEntityByKey: () => ({ id: "ent_file_1", name: "deploy.ts" }),
+      queryHeadFacts: () => [],
+      queryEventsForEntity: () => [],
+      queryHeadLessonsByFile: () => [ATTESTED],
+      recordStanceFire: (lessonId: string) => fired.push(lessonId),
+    } as unknown as IMemoryStore;
+    buildFileInjection(store, "/repo/src/deploy.ts", { actionContent: ONE_WAY_DOOR });
+    expect(fired).toEqual(["les_1"]);
+  });
+
+  it("a SUPPRESSED stance (willingness < 0.25) does not surface at all — cry-wolf tombstone", () => {
+    const suppressed: KbLessonHit = { ...ATTESTED, willingness: 0.1 };
+    const block = buildFileInjection(fakeStore([suppressed]), "/repo/src/deploy.ts", {
+      actionContent: ONE_WAY_DOOR,
+    });
+    // Only lesson is suppressed and no facts/events → whole block is null (silent).
+    expect(block).toBeNull();
+  });
+
+  it("a DEMOTED stance (0.25 ≤ willingness < 0.45) may NOT fire hard — soft only", () => {
+    const demoted: KbLessonHit = { ...ATTESTED, willingness: 0.35 };
+    const block = buildFileInjection(fakeStore([demoted]), "/repo/src/deploy.ts", {
+      actionContent: ONE_WAY_DOOR,
+    });
+    expect(block).not.toContain("block-before-acting"); // demoted → no hard
+    expect(block).toContain(ATTESTED.lessonText); // but still a soft note
+  });
+
+  it("a TRUSTED willingness still fires hard on a one-way door (backward compatible)", () => {
+    const trusted: KbLessonHit = { ...ATTESTED, willingness: 0.8 };
+    const block = buildFileInjection(fakeStore([trusted]), "/repo/src/deploy.ts", {
+      actionContent: ONE_WAY_DOOR,
+    });
+    expect(block).toContain("block-before-acting");
+  });
+});

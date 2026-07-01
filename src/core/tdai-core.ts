@@ -517,6 +517,37 @@ export class TdaiCore {
   }
 
   /**
+   * Pilastro B (Strada A) — the agent calls this when Lorenzo CONFIRMED that a
+   * stance interrupt was right to fire. Raises the stance's willingness (it earns
+   * more room to interrupt). Off the critical path. Maps to: tdai_stance_confirmed.
+   */
+  async confirmStanceFire(lessonId: string): Promise<{ ok: boolean; text: string }> {
+    await this.storeReady?.catch(() => {});
+    const store = this.vectorStore;
+    if (!store?.creditStanceConfirmed) return { ok: false, text: "Lessons store unavailable." };
+    const ok = store.creditStanceConfirmed(lessonId, new Date().toISOString());
+    return ok
+      ? { ok: true, text: `Stance ${lessonId} confermata: era giusto fermarsi — willingness in salita.` }
+      : { ok: false, text: `Stance ${lessonId} non trovata.` };
+  }
+
+  /**
+   * Pilastro B (Strada A) — the agent calls this when Lorenzo said a stance
+   * interrupt was a FALSE ALARM. Lowers the stance's willingness (cry-wolf); a
+   * stance rejected enough times suppresses itself. Off the critical path.
+   * Maps to: tdai_stance_rejected.
+   */
+  async rejectStanceFire(lessonId: string): Promise<{ ok: boolean; text: string }> {
+    await this.storeReady?.catch(() => {});
+    const store = this.vectorStore;
+    if (!store?.creditStanceRejected) return { ok: false, text: "Lessons store unavailable." };
+    const ok = store.creditStanceRejected(lessonId, new Date().toISOString());
+    return ok
+      ? { ok: true, text: `Stance ${lessonId} segnata come falso allarme — willingness in discesa.` }
+      : { ok: false, text: `Stance ${lessonId} non trovata.` };
+  }
+
+  /**
    * Handle end-of-conversation for a single session.
    *
    * ⚠️ Read this if you are editing the method:

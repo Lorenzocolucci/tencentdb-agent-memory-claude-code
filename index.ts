@@ -577,6 +577,64 @@ export default function register(api: OpenClawPluginApi) {
     },
     { name: "tdai_lesson_helped" },
   );
+
+  // tdai_stance_confirmed / tdai_stance_rejected — Pilastro B (Strada A): the
+  // stance track record. Call ONLY after Lorenzo answers a <stance-interrupt>:
+  // confirmed → the stance earns more willingness to fire; rejected (false alarm)
+  // → willingness falls, and a stance that cries wolf silences itself over time.
+  const stanceVerdict = (verdict: "confirmed" | "rejected") =>
+    async (_toolCallId: string, params: Record<string, unknown>) => {
+      const lessonId = String(params.lesson_id ?? "");
+      if (!lessonId) {
+        return { content: [{ type: "text" as const, text: "lesson_id is required" }], details: { error: "missing lesson_id" } };
+      }
+      try {
+        const res =
+          verdict === "confirmed"
+            ? await core.confirmStanceFire(lessonId)
+            : await core.rejectStanceFire(lessonId);
+        report("tool_call", { tool: `tdai_stance_${verdict}`, lessonId, success: res.ok });
+        return { content: [{ type: "text" as const, text: res.text }], details: { ok: res.ok } };
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        api.logger.error(`${TAG} [tool] tdai_stance_${verdict} failed: ${errMsg}`);
+        return { content: [{ type: "text" as const, text: `Operation failed: ${errMsg}` }], details: { error: errMsg } };
+      }
+    };
+
+  const stanceParams = {
+    type: "object" as const,
+    properties: {
+      lesson_id: { type: "string", description: "The lesson id carried in the <stance-interrupt> block" },
+    },
+    required: ["lesson_id"],
+  };
+
+  api.registerTool(
+    {
+      name: "tdai_stance_confirmed",
+      label: "Stance Confirmed",
+      description:
+        "Record that Lorenzo CONFIRMED a <stance-interrupt> was right to fire (a real one-way-door risk). " +
+        "Call this ONLY after Lorenzo agrees the stop mattered — it raises the stance's willingness to interrupt again.",
+      parameters: stanceParams,
+      execute: stanceVerdict("confirmed"),
+    },
+    { name: "tdai_stance_confirmed" },
+  );
+
+  api.registerTool(
+    {
+      name: "tdai_stance_rejected",
+      label: "Stance Rejected",
+      description:
+        "Record that Lorenzo said a <stance-interrupt> was a FALSE ALARM. " +
+        "Call this ONLY after Lorenzo says the stop was unwarranted — it lowers the stance's willingness so it stops crying wolf.",
+      parameters: stanceParams,
+      execute: stanceVerdict("rejected"),
+    },
+    { name: "tdai_stance_rejected" },
+  );
   } else {
     api.logger.debug?.(`${TAG} Memory tools (tdai_memory_search, tdai_conversation_search) not registered — memory features disabled`);
   }

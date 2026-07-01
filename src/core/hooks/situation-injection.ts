@@ -18,6 +18,7 @@ import type { IMemoryStore, KbLessonHit } from "../store/types.js";
 import { canonicalKey } from "../kb/kb-queries.js";
 import { classifyStakes } from "../kb/stakes.js";
 import { selectStanceToSurface } from "../kb/stance-severity.js";
+import { willingnessTier } from "../kb/stance-track-record.js";
 
 const NAMESPACE = "default";
 const MAX_FACTS = 6;
@@ -35,6 +36,12 @@ function clip(s: string): string {
  * an attested lesson whose situation is recurring AND the current action crosses
  * a one-way door. Mirrors the Grounded-Trust interrupt priority — it is a block
  * directive in the injected context, the only "stop" a memory can assert.
+ *
+ * Pilastro B (Strada A): the interrupt now carries the confirm/reject buttons so
+ * the stance can LEARN from this fire. After Lorenzo answers, the agent records
+ * the verdict against THIS lesson's id — a confirmed fire raises the stance's
+ * willingness, a rejected (false-alarm) fire lowers it until a stance that cries
+ * wolf silences itself. That feedback is what makes the interrupts grow rarer.
  */
 function renderStanceInterrupt(lesson: KbLessonHit, stakesDomain: string | null): string {
   const door = stakesDomain ? ` (${stakesDomain})` : "";
@@ -43,6 +50,8 @@ function renderStanceInterrupt(lesson: KbLessonHit, stakesDomain: string | null)
     `🛑 You have been burned here before AND this action crosses a one-way door${door}. ` +
     "Stop and confirm this is intentional before acting.\n" +
     `lesson [${lesson.domain}, ${lesson.evidenceCount}× evidence]: ${clip(lesson.lessonText)}\n` +
+    `   → se Lorenzo CONFERMA che la frenata era giusta: tdai_stance_confirmed(lesson_id:"${lesson.id}")\n` +
+    `   → se Lorenzo dice che era un FALSO ALLARME:        tdai_stance_rejected(lesson_id:"${lesson.id}")\n` +
     "</stance-interrupt>"
   );
 }
@@ -88,11 +97,18 @@ export function buildFileInjection(
   const facts = store.queryHeadFacts(entity.id).slice(0, MAX_FACTS);
   const events = store.queryEventsForEntity(entity.id, NAMESPACE, MAX_EVENTS);
   // Track B (B2b): recurring-failure lessons whose trigger involves this file.
-  const lessons = store.queryHeadLessonsByFile
+  const allLessons = store.queryHeadLessonsByFile
     ? store.queryHeadLessonsByFile(entity.id, NAMESPACE, MAX_LESSONS)
     : [];
+  // Pilastro B tombstone: a stance that cried wolf enough to be SUPPRESSED
+  // (willingness < 0.25) does not surface AT ALL — not even as a soft note.
+  // Under-attested lessons (low confidence/evidence) are NOT suppressed here;
+  // they still resurface softly (B2b), only the willingness tombstone silences.
+  const lessons = allLessons.filter(
+    (l) => l.willingness === undefined || willingnessTier(l.willingness) !== "suppressed",
+  );
   if (facts.length === 0 && events.length === 0 && lessons.length === 0) {
-    return null; // nothing tied → silence
+    return null; // nothing tied (or all tombstoned) → silence
   }
 
   // Graduated stance (Pilastro A): when the CURRENT action crosses a one-way
@@ -100,7 +116,13 @@ export function buildFileInjection(
   // block-before-acting interrupt (one at a time). Purely additive — a benign or
   // absent action, or an under-attested lesson, leaves the soft notes untouched.
   const actionStakes = classifyStakes({ content: opts?.actionContent ?? "" });
-  const mappedLessons = lessons.map((l) => ({ ...l, evidence_count: l.evidenceCount }));
+  // Pilastro B: carry each lesson's willingness into the judgment so a stance that
+  // cried wolf is suppressed/demoted. undefined (legacy/missing) → trusted.
+  const mappedLessons = lessons.map((l) => ({
+    ...l,
+    evidence_count: l.evidenceCount,
+    willingness: l.willingness,
+  }));
   const { hard } = selectStanceToSurface(mappedLessons, { stakes: actionStakes.stakes });
 
   const recordExposure = (lessonId: string): void => {
@@ -110,6 +132,16 @@ export function buildFileInjection(
       try {
         store.recordLessonExposure(lessonId, opts.sessionId, opts.now ?? new Date().toISOString());
       } catch { /* off the critical path — never break injection */ }
+    }
+  };
+
+  const recordStanceFire = (lessonId: string): void => {
+    // Pilastro B: this stance just FIRED a hard interrupt — record the fire so the
+    // confirm/reject verdict has a denominator. Best-effort, off the critical path.
+    if (store.recordStanceFire) {
+      try {
+        store.recordStanceFire(lessonId, opts?.now ?? new Date().toISOString());
+      } catch { /* never break injection */ }
     }
   };
 
@@ -130,6 +162,7 @@ export function buildFileInjection(
   const parts: string[] = [];
   if (hard) {
     recordExposure(hard.id);
+    recordStanceFire(hard.id); // Pilastro B: count this hard fire
     parts.push(renderStanceInterrupt(hard, actionStakes.stakes_domain));
   }
   if (lines.length > 0) {

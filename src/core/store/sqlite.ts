@@ -55,6 +55,9 @@ import {
   creditAvoidance as kbCreditAvoidance,
   temperOnRecurrence as kbTemperOnRecurrence,
   queryLessonsExposedInSession as kbQueryLessonsExposedInSession,
+  recordStanceFire as kbRecordStanceFire,
+  creditStanceConfirmed as kbCreditStanceConfirmed,
+  creditStanceRejected as kbCreditStanceRejected,
 } from "../kb/lessons-writer.js";
 import { phaseFor as lessonPhaseFor } from "../kb/lesson-reinforcement.js";
 import { distillLessons as kbDistillLessons } from "../kb/lessons-runner.js";
@@ -3392,6 +3395,7 @@ export class VectorStore implements IMemoryStore {
       lessonText: r.lesson_text,
       confidence: r.confidence,
       evidenceCount: r.evidence_count,
+      willingness: r.stance_willingness,
     }));
   }
 
@@ -3427,6 +3431,50 @@ export class VectorStore implements IMemoryStore {
     } catch (err) {
       this.logger?.warn?.(
         `[memory-tdai][lessons] creditLessonAvoidance failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Pilastro B — record that a stance fired a hard interrupt (bumps its fire
+   * count). Best-effort, off the critical path: failures swallowed + logged.
+   */
+  recordStanceFire(lessonId: string, now: string): void {
+    if (!this.kbReady) return;
+    try {
+      kbRecordStanceFire(this.db, lessonId, now);
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][lessons] recordStanceFire failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /** Pilastro B — Lorenzo confirmed a stance interrupt mattered (willingness rises). */
+  creditStanceConfirmed(lessonId: string, now: string): boolean {
+    if (!this.kbReady) return false;
+    try {
+      return kbCreditStanceConfirmed(this.db, lessonId, now) !== null;
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][lessons] creditStanceConfirmed failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
+  /** Pilastro B — Lorenzo rejected a stance interrupt as a false alarm (willingness falls). */
+  creditStanceRejected(lessonId: string, now: string): boolean {
+    if (!this.kbReady) return false;
+    try {
+      return kbCreditStanceRejected(this.db, lessonId, now) !== null;
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][lessons] creditStanceRejected failed (non-fatal): ` +
           `${err instanceof Error ? err.message : String(err)}`,
       );
       return false;
