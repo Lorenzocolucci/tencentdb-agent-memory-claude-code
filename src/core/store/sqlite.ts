@@ -61,6 +61,8 @@ import {
 } from "../kb/lessons-writer.js";
 import { phaseFor as lessonPhaseFor } from "../kb/lesson-reinforcement.js";
 import { distillLessons as kbDistillLessons } from "../kb/lessons-runner.js";
+import { distillUsage as kbDistillUsage } from "../kb/usage-runner.js";
+import { createKbVecEmbeddingReader } from "../kb/bug-embeddings.js";
 import { ensureLifecycle, confirmProvenance, rejectProvenance, markGatePending, getLifecycle, stampSalience as kbStampSalience } from "../kb/lifecycle-writer.js";
 import { serializeProvenance, parseProvenance, gateStateOf, type ProvenanceStamp } from "../kb/provenance.js";
 import { classifyStakes, shouldGate } from "../kb/stakes.js";
@@ -3548,6 +3550,24 @@ export class VectorStore implements IMemoryStore {
       superseded: stats.superseded,
       skippedDuplicate: stats.skippedDuplicate,
     };
+  }
+
+  /** @see IMemoryStore.runUsageDistillation */
+  async runUsageDistillation(
+    opts: { now: string; namespace?: string; maxClusters?: number },
+  ): Promise<{ candidates: number; inserted: number; skippedDuplicate: number }> {
+    if (this.degraded || !this.kbReady || !this.kbVecReady) {
+      return { candidates: 0, inserted: 0, skippedDuplicate: 0 };
+    }
+    // Usage clustering is SEMANTIC → it needs vectors (unlike per-entity
+    // principles). The reader reads this.db's kb_vec; events are read and the
+    // usage atom is written on the SAME store/connection — no LLM (B2 is wiring).
+    const reader = createKbVecEmbeddingReader(this.db, this.dimensions);
+    return kbDistillUsage(this, reader, {
+      now: opts.now,
+      namespace: opts.namespace,
+      maxClusters: opts.maxClusters,
+    });
   }
 
   /**

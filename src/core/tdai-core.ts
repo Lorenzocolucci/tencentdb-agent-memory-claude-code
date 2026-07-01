@@ -652,6 +652,36 @@ export class TdaiCore {
       this.bgTasks.add(principleTask);
       void principleTask.then(() => this.bgTasks.delete(principleTask));
     }
+
+    // Percorso B (behavioral notebook) — recurring cross-session BEHAVIORAL
+    // tendencies ("what you do") → `usage` atoms via SEMANTIC clustering. The
+    // second axis principle-clusters (per-entity) misses: entity-less behaviors.
+    // Deterministic, no LLM. CONSERVATIVE: additive only. Fire-and-forget.
+    if (typeof this.vectorStore?.runUsageDistillation === "function") {
+      const store = this.vectorStore;
+      const usageTask = (async () => {
+        try {
+          const stats = await store.runUsageDistillation!({
+            now: new Date().toISOString(),
+            maxClusters: 3,
+          });
+          if (stats.inserted > 0) {
+            logger.info(
+              `${TAG} [usage] distilled: inserted=${stats.inserted} ` +
+                `(candidates=${stats.candidates}, skippedDuplicate=${stats.skippedDuplicate})`,
+            );
+          } else {
+            logger.debug?.(`${TAG} [usage] no new usage tendencies (candidates=${stats.candidates})`);
+          }
+        } catch (err) {
+          logger.warn(
+            `${TAG} [usage] distillation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      })();
+      this.bgTasks.add(usageTask);
+      void usageTask.then(() => this.bgTasks.delete(usageTask));
+    }
   }
 
   async handleSessionEnd(sessionKey: string): Promise<void> {

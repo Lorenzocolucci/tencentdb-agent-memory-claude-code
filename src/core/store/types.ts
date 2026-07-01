@@ -707,6 +707,17 @@ export interface IMemoryStore {
     opts: { now: string; namespace?: string; maxClusters?: number },
   ): Promise<{ candidates: number; inserted: number; superseded: number; skippedDuplicate: number }>;
 
+  /**
+   * Percorso B (behavioral notebook) write side: distill recurring cross-session
+   * BEHAVIORAL tendencies into `usage` atoms via SEMANTIC clustering (no LLM —
+   * deterministic wiring). Idempotent (clusters already covered are skipped).
+   * Off the critical path; fire-and-forget. Absent on backends without KB write
+   * + vector support → caller no-ops.
+   */
+  runUsageDistillation?(
+    opts: { now: string; namespace?: string; maxClusters?: number },
+  ): Promise<{ candidates: number; inserted: number; skippedDuplicate: number }>;
+
   /** kb_vec / kb_fts recall primitives (mirror searchL1Vector / searchL1Fts). */
   searchKbVector?(queryEmbedding: Float32Array, topK?: number, ownerKindFilter?: string): KbVectorSearchResult[];
   searchKbFts?(ftsQuery: string, limit?: number): KbFtsSearchResult[];
