@@ -327,6 +327,10 @@ export class TdaiCore {
     // Key MUST match the one performAutoRecall peeked (sessionId ?? sessionKey).
     if (result?.bannerEmitted) {
       this.bannerTracker.markEmitted(sessionId ?? sessionKey);
+      // First turn of a new session = the one reliably-fired event in the desktop
+      // app. Kick the LLM distillation (lessons + principles) here so it actually
+      // runs (handleSessionEnd/`/clear` rarely fires). Detached, off critical path.
+      this.scheduleBackgroundDistillation();
     }
 
     // Cornerstone cache MISS → build the block OFF the recall critical path and
@@ -543,6 +547,82 @@ export class TdaiCore {
    *                    don't have to pre-check whether the session was
    *                    already evicted or never produced a capture.
    */
+  /**
+   * Schedule the LLM distillation passes (Track B lessons + Pilastro C Fase 2
+   * principles) as DETACHED background tasks — off the critical path, errors
+   * swallowed, tracked in bgTasks so a shutdown drain awaits them.
+   *
+   * Called from BOTH handleSessionEnd AND the first turn of each session
+   * (handleBeforeRecall, gated on bannerEmitted). Reason: handleSessionEnd fires
+   * only on POST /session/end, which the plugin sends only on /clear — an event
+   * the desktop app rarely produces. Wiring distillation there alone left it
+   * effectively dead (verified: 0 lessons distilled in months). The first turn of
+   * a session is the one reliably-fired event, so we also run it there. CHEAP:
+   * no cluster → no LLM; idempotent (already-distilled skipped) → safe on both.
+   */
+  private scheduleBackgroundDistillation(): void {
+    const runnerFactory = this.runnerFactory;
+    const logger = this.logger;
+
+    // Track B (Mistake Notebook): recurring-failure clusters → lessons.
+    if (this.vectorStore?.runLessonDistillation) {
+      const store = this.vectorStore;
+      const distillTask = (async () => {
+        try {
+          const runner = runnerFactory.createRunner({ enableTools: false });
+          const stats = await store.runLessonDistillation!(runner, {
+            now: new Date().toISOString(),
+            maxClusters: 3,
+          });
+          if (stats.inserted > 0 || stats.superseded > 0) {
+            logger.info(
+              `${TAG} [lessons] distilled: inserted=${stats.inserted}, superseded=${stats.superseded} ` +
+                `(candidates=${stats.candidates}, skippedDuplicate=${stats.skippedDuplicate})`,
+            );
+          } else {
+            logger.debug?.(`${TAG} [lessons] no new lessons (candidates=${stats.candidates})`);
+          }
+        } catch (err) {
+          logger.warn(
+            `${TAG} [lessons] distillation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      })();
+      this.bgTasks.add(distillTask);
+      void distillTask.then(() => this.bgTasks.delete(distillTask));
+    }
+
+    // Pilastro C Fase 2 ("dimenticare con gusto"): recurring cross-session
+    // DECISIONS → `principle` atoms. CONSERVATIVE: additive only (sources decay
+    // via Fase 1, never deleted).
+    if (typeof this.vectorStore?.insertEvent === "function" && typeof this.vectorStore?.listRecentEvents === "function") {
+      const store = this.vectorStore;
+      const principleTask = (async () => {
+        try {
+          const runner = runnerFactory.createRunner({ enableTools: false });
+          const stats = await distillPrinciples(store, runner, {
+            now: new Date().toISOString(),
+            maxClusters: 3,
+          });
+          if (stats.inserted > 0) {
+            logger.info(
+              `${TAG} [principles] distilled: inserted=${stats.inserted} ` +
+                `(candidates=${stats.candidates}, skippedDuplicate=${stats.skippedDuplicate})`,
+            );
+          } else {
+            logger.debug?.(`${TAG} [principles] no new principles (candidates=${stats.candidates})`);
+          }
+        } catch (err) {
+          logger.warn(
+            `${TAG} [principles] distillation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      })();
+      this.bgTasks.add(principleTask);
+      void principleTask.then(() => this.bgTasks.delete(principleTask));
+    }
+  }
+
   async handleSessionEnd(sessionKey: string): Promise<void> {
     if (!sessionKey) return;
     await this.storeReady?.catch(() => {});
@@ -593,74 +673,12 @@ export class TdaiCore {
       void recapTask.then(() => this.bgTasks.delete(recapTask));
     }
 
-    // Track B (Mistake Notebook): auto-distill recurring-failure clusters into
-    // `lessons` after the flush, so a recurring failure becomes a reusable lesson
-    // WITHOUT a manual run. Fire-and-forget, off the critical path, errors
-    // swallowed. CHEAP by design: the clustering read gates the LLM — no cluster
-    // → no LLM call (the common case); already-distilled clusters are skipped
-    // (idempotent). maxClusters caps per-pass cost when real clusters do appear.
-    if (this.vectorStore?.runLessonDistillation) {
-      const store = this.vectorStore;
-      const runnerFactory = this.runnerFactory;
-      const logger = this.logger;
-      const distillTask = (async () => {
-        try {
-          const runner = runnerFactory.createRunner({ enableTools: false });
-          const stats = await store.runLessonDistillation!(runner, {
-            now: new Date().toISOString(),
-            maxClusters: 3,
-          });
-          if (stats.inserted > 0 || stats.superseded > 0) {
-            logger.info(
-              `${TAG} [lessons] distilled: inserted=${stats.inserted}, superseded=${stats.superseded} ` +
-                `(candidates=${stats.candidates}, skippedDuplicate=${stats.skippedDuplicate})`,
-            );
-          } else {
-            logger.debug?.(`${TAG} [lessons] no new lessons (candidates=${stats.candidates})`);
-          }
-        } catch (err) {
-          logger.warn(
-            `${TAG} [lessons] distillation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-      })();
-      this.bgTasks.add(distillTask);
-      void distillTask.then(() => this.bgTasks.delete(distillTask));
-    }
-
-    // Pilastro C Fase 2 (distillazione): auto-distil recurring cross-session
-    // DECISIONS into `principle` atoms after the flush — "dimenticare con gusto".
-    // CONSERVATIVE: additive only (source events decay via Fase 1, never deleted).
-    // Fire-and-forget, off the critical path, errors swallowed. CHEAP: no cluster
-    // → no LLM (the common case). Idempotent (a domain already distilled is skipped).
-    if (typeof this.vectorStore?.insertEvent === "function" && typeof this.vectorStore?.listRecentEvents === "function") {
-      const store = this.vectorStore;
-      const runnerFactory = this.runnerFactory;
-      const logger = this.logger;
-      const principleTask = (async () => {
-        try {
-          const runner = runnerFactory.createRunner({ enableTools: false });
-          const stats = await distillPrinciples(store, runner, {
-            now: new Date().toISOString(),
-            maxClusters: 3,
-          });
-          if (stats.inserted > 0) {
-            logger.info(
-              `${TAG} [principles] distilled: inserted=${stats.inserted} ` +
-                `(candidates=${stats.candidates}, skippedDuplicate=${stats.skippedDuplicate})`,
-            );
-          } else {
-            logger.debug?.(`${TAG} [principles] no new principles (candidates=${stats.candidates})`);
-          }
-        } catch (err) {
-          logger.warn(
-            `${TAG} [principles] distillation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-      })();
-      this.bgTasks.add(principleTask);
-      void principleTask.then(() => this.bgTasks.delete(principleTask));
-    }
+    // LLM distillation (Track B lessons + Pilastro C Fase 2 principles).
+    // Scheduled here AND at the first turn of each session (see
+    // scheduleBackgroundDistillation): handleSessionEnd fires only on /clear,
+    // which the desktop app rarely sends, so this path alone left distillation
+    // effectively dead (0 lessons ever distilled in months). Idempotent + cheap.
+    this.scheduleBackgroundDistillation();
 
     // B3: credit successful AVOIDANCES for lessons that resurfaced this session and
     // did not relapse (implicit, Phase A) — confidence grows from successes, not only
