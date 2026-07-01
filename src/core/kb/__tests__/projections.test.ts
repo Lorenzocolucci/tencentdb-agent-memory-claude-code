@@ -144,6 +144,24 @@ describe("KB projections (temp DB)", () => {
       expect(persona).toContain("## Credential Locations");
       expect(persona).toContain("## Active Projects");
     });
+
+    // ── Percorso A (behavioral laws) — rule_* family renders in the process section ──
+    it("projects MANY behavioral-law facts (rule_* family) into Process & Working-Style Rules", () => {
+      store.upsertFact({ entityId: lorenzoId, attribute: "rule_wait_for_answer", value: "Aspetta la mia risposta prima di proseguire", validFrom: "2026-07-01T00:00:00Z", now: "2026-07-01T00:00:00.000Z" });
+      store.upsertFact({ entityId: lorenzoId, attribute: "rule_no_people_pleasing", value: "Non compiacere mai, sfida quando ho torto", validFrom: "2026-07-01T00:00:00Z", now: "2026-07-01T00:00:00.000Z" });
+
+      const persona = projectPersonaBody(store as unknown as ProjectionStore, { namespace: NS });
+      expect(persona).toContain("## Process & Working-Style Rules");
+      // BOTH laws survive (distinct rule_* attributes do not self-supersede).
+      expect(persona).toContain("Aspetta la mia risposta prima di proseguire");
+      expect(persona).toContain("Non compiacere mai, sfida quando ho torto");
+    });
+
+    it("still drops a behavioral-law fact whose VALUE looks like a secret", () => {
+      store.upsertFact({ entityId: lorenzoId, attribute: "rule_leak", value: SECRET_VALUE, validFrom: "2026-07-01T00:00:00Z", now: "2026-07-01T00:00:00.000Z" });
+      const persona = projectPersonaBody(store as unknown as ProjectionStore, { namespace: NS });
+      expect(persona).not.toContain(SECRET_VALUE);
+    });
   });
 
   // ──────────────────────────────────────────────────────────────────────────

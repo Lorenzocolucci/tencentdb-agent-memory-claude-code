@@ -126,6 +126,22 @@ const PERSONA_ATTR_SECTIONS: Record<string, PersonaSection> = {
  */
 const PERSONA_LOCATION_SUFFIXES = ["_location", "_path", "_file", "_dir"] as const;
 
+/**
+ * Attribute PREFIXES for the PROCESS / working-style family (behavioral laws,
+ * Percorso A). A single "rule" attribute self-supersedes (only one HEAD fact per
+ * (entity, attribute)), so many distinct laws are stored as `rule_<slug>` facts;
+ * this prefix set renders them ALL in the "Process & Working-Style Rules" section.
+ * These carry behavioral directives, never secrets (values are still secret-checked).
+ */
+const PERSONA_PROCESS_PREFIXES = [
+  "rule_",
+  "process_",
+  "workflow_",
+  "convention_",
+  "working_style_",
+  "communication_style_",
+] as const;
+
 /** Snake_case-normalize an attribute for allow-list matching. */
 function normAttr(attribute: string): string {
   return attribute.normalize("NFKC").toLowerCase().trim().replace(/\s+/g, "_");
@@ -140,6 +156,7 @@ function personaSectionFor(attribute: string): PersonaSection | null {
   const key = normAttr(attribute);
   const exact = PERSONA_ATTR_SECTIONS[key];
   if (exact) return exact;
+  if (PERSONA_PROCESS_PREFIXES.some((pfx) => key.startsWith(pfx))) return "process";
   if (PERSONA_LOCATION_SUFFIXES.some((sfx) => key.endsWith(sfx))) return "credentials";
   return null;
 }
