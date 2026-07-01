@@ -25,6 +25,7 @@ import { kbRecall, type KbRecallResult } from "../kb/retrieval.js";
 import { loadPrinciples, formatPrinciplesBlock } from "./principles.js";
 import { buildSessionBanner, type SessionBannerTracker } from "./session-banner.js";
 import { latestRecapBlock } from "../continuity/recap-retrieval.js";
+import { captureRolloverRecap } from "../continuity/recap-rollover.js";
 import type { CornerstoneInjectionTracker } from "../distinctiveness/cornerstone-runner.js";
 import { CornerstoneSessionCache } from "../distinctiveness/cornerstone-cache.js";
 import {
@@ -296,6 +297,22 @@ async function performAutoRecallInner(params: {
   // is silently dropped exactly when it matters most (the "forgot the vision" bug).
   const principles = await loadPrinciples(pluginDataDir, projectName);
 
+  // "Cambio della guardia" — capture the PREVIOUS session's recap on the FIRST
+  // turn of a new session, BEFORE the "anything to inject?" gate below. The
+  // capture must NOT depend on the current query returning a hit: it snapshots
+  // the session that just ended (the desktop app fires no reliable session-end).
+  // Local + fast (no LLM/embeddings), idempotent → safe inline. latestRecapBlock
+  // in the banner block surfaces the fresh recap on this same turn.
+  if (vectorStore && params.sessionKey && bannerTracker?.pending(params.sessionId ?? params.sessionKey)) {
+    captureRolloverRecap({
+      store: vectorStore,
+      sessionKey: params.sessionKey,
+      currentSessionId: params.sessionId,
+      now: new Date().toISOString(),
+      logger,
+    });
+  }
+
   if (memoryLines.length === 0 && !personaContent && !sceneNavigation && !principles) {
     const totalMs = performance.now() - tRecallStart;
     logger?.info(
@@ -406,6 +423,8 @@ async function performAutoRecallInner(params: {
       // project; the events' `project` column is empty). Reconstruction, not a
       // doc dump. Off the critical path: latestRecapBlock returns "" on failure.
       if (vectorStore && params.sessionKey) {
+        // Rollover capture already ran above (before the inject gate); here we
+        // just surface the freshest recap. Off the critical path: "" on failure.
         const recapBlock = latestRecapBlock({ store: vectorStore, sessionKey: params.sessionKey, logger });
         if (recapBlock) {
           prependContext = prependContext ? `${recapBlock}\n\n${prependContext}` : recapBlock;
