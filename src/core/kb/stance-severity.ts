@@ -21,6 +21,7 @@
  */
 
 import type { StakesLevel } from "./stakes.js";
+import { willingnessTier } from "./stance-track-record.js";
 
 export type StanceSeverity = "silent" | "soft" | "hard";
 
@@ -33,6 +34,12 @@ export const STANCE_MIN_EVIDENCE = 2;
 export interface StanceAttestation {
   confidence: number;
   evidence_count: number;
+  /**
+   * Pilastro B track record — willingness-to-fire ∈ [0,1] from the stance's own
+   * hit/miss history. Optional: legacy lessons with no record yet are treated as
+   * trusted (a fresh attested lesson is allowed to fire until it cries wolf).
+   */
+  willingness?: number;
 }
 
 /** The current action's stakes, as classified by stakes.ts. */
@@ -51,8 +58,15 @@ export function classifyStanceSeverity(
   if (lesson.confidence < STANCE_MIN_CONFIDENCE || lesson.evidence_count < STANCE_MIN_EVIDENCE) {
     return "silent";
   }
-  // Option C: hard interrupt ONLY when the action crosses a one-way door.
-  if (action.stakes === "high") return "hard";
+  // Pilastro B — track record feedback. A stance that repeatedly cried wolf is
+  // SUPPRESSED (silent, regardless of confidence); a poor-but-not-suppressed
+  // record may not fire HARD (soft only) until it re-earns trust. Legacy lessons
+  // (no record yet) are "trusted".
+  const tier = lesson.willingness === undefined ? "trusted" : willingnessTier(lesson.willingness);
+  if (tier === "suppressed") return "silent";
+  // Option C: hard interrupt ONLY when the action crosses a one-way door AND the
+  // stance's track record still earns it.
+  if (action.stakes === "high" && tier === "trusted") return "hard";
   return "soft";
 }
 

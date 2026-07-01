@@ -82,3 +82,33 @@ describe("stance-severity — selectStanceToSurface (one interrupt at a time)", 
     expect(out.soft).toEqual([]);
   });
 });
+
+describe("stance-severity — Pilastro B track record (willingness feedback)", () => {
+  it("SUPPRESSES a well-attested stance that repeatedly cried wolf (silent)", () => {
+    // High confidence + one-way door would be hard, but a bad track record silences it.
+    expect(classifyStanceSeverity({ ...attested, willingness: 0.1 }, { stakes: "high" })).toBe("silent");
+  });
+
+  it("DEMOTES a poor-but-not-suppressed track record to soft (no hard until re-earned)", () => {
+    expect(classifyStanceSeverity({ ...attested, willingness: 0.35 }, { stakes: "high" })).toBe("soft");
+  });
+
+  it("a trusted track record still fires hard on a one-way door", () => {
+    expect(classifyStanceSeverity({ ...attested, willingness: 0.8 }, { stakes: "high" })).toBe("hard");
+  });
+
+  it("legacy lessons (no willingness) behave as before — trusted", () => {
+    expect(classifyStanceSeverity(attested, { stakes: "high" })).toBe("hard");
+  });
+
+  it("selectStanceToSurface: a suppressed stance is dropped; a demoted one falls to soft", () => {
+    const lessons = [
+      { id: "suppressed", confidence: 0.95, evidence_count: 5, willingness: 0.1 },
+      { id: "demoted", confidence: 0.9, evidence_count: 4, willingness: 0.35 },
+      { id: "trusted", confidence: 0.85, evidence_count: 3, willingness: 0.8 },
+    ];
+    const out = selectStanceToSurface(lessons, { stakes: "high" });
+    expect(out.hard?.id).toBe("trusted"); // only the trusted one earns the interrupt
+    expect(out.soft.map((l) => l.id)).toEqual(["demoted"]); // demoted → soft; suppressed → dropped
+  });
+});
