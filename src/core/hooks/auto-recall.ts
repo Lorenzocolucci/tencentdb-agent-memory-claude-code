@@ -53,6 +53,17 @@ interface Logger {
   error: (message: string) => void;
 }
 
+/**
+ * Budget for the memory SEARCH alone (embedding + vector/FTS lookup). The search
+ * depends on a REMOTE embedding provider (OpenAI); a network/DNS blip makes it
+ * hang or retry. If it exceeds this budget we degrade the search to EMPTY and
+ * still inject the deterministic, LOCAL context (persona/scene/banner). Kept well
+ * under the overall recall timeout (cfg.recall.timeoutMs ?? 5000) so persona/scene
+ * always ship. Root cause: a hung embedding blew the single 5s recall timeout and
+ * silently dropped the WHOLE injection (persona+scene+banner+memories).
+ */
+const DEFAULT_SEARCH_TIMEOUT_MS = 4000;
+
 // ============================
 // RC3 — hybrid recall ranking tuning
 // ============================
@@ -226,38 +237,72 @@ async function performAutoRecallInner(params: {
   let searchTiming: SearchTiming = { ftsMs: 0, embeddingMs: 0, ftsHits: 0, embeddingHits: 0 };
   if (!userText || userText.length === 0) {
     logger?.debug?.(`${TAG} User text empty/undefined, skipping memory search (persona/scene still injected)`);
-  } else if (cfg.recall.source === "kb") {
-    // ── Phase-4 entity-centric KB recall path (recall.source = "kb") ──
-    // Maps KbRecallResult → the same memoryLines / RecalledMemory shape the L1
-    // path produces, so downstream injection is unchanged. The score injected
-    // here is the CALIBRATED 0-1 relevance from kbRecall (never raw RRF).
-    effectiveStrategy = "kb";
-    const tKb = performance.now();
-    const kbResults = await runKbRecall(userText, cfg, logger, vectorStore, embeddingService);
-    memoryLines = kbResults.map((r) => formatKbRecallLine(r));
-    recalledL1Memories = kbResults.map((r) => ({
-      content: r.text,
-      score: r.score,
-      type: r.owner_kind,
-    }));
-    searchTiming = { ftsMs: 0, embeddingMs: performance.now() - tKb, ftsHits: 0, embeddingHits: kbResults.length };
   } else {
-    effectiveStrategy = cfg.recall.strategy ?? "hybrid";
-    const searchResult = await searchMemories(userText, pluginDataDir, cfg, logger, effectiveStrategy as "keyword" | "embedding" | "hybrid", vectorStore, embeddingService);
-    memoryLines = searchResult.lines;
-    searchTiming = searchResult.timing;
-
-    // Extract structured RecalledMemory from formatted lines for metric reporting
-    recalledL1Memories = memoryLines.map((line) => {
-      const match = line.match(MEMORY_LINE_RE);
-      if (match) {
-        const tag = match[1];
-        const content = match[2].trim();
-        const typePart = tag.includes("|") ? tag.split("|")[0] : tag;
-        return { content, score: 0, type: typePart };
+    // The memory search embeds the query via a REMOTE provider (OpenAI). Bound it
+    // with its own budget: if it exceeds the budget (network/DNS blip, provider
+    // slow), DEGRADE the search to empty and continue — persona/scene/banner
+    // (deterministic, local, no network) must still be assembled and injected.
+    interface SearchOutcome {
+      lines: string[];
+      strategy: string;
+      memories: RecalledMemory[];
+      timing: SearchTiming;
+    }
+    const runSearch = async (): Promise<SearchOutcome> => {
+      if (cfg.recall.source === "kb") {
+        // ── Phase-4 entity-centric KB recall path (recall.source = "kb") ──
+        // Score injected here is the CALIBRATED 0-1 relevance (never raw RRF).
+        const tKb = performance.now();
+        const kbResults = await runKbRecall(userText, cfg, logger, vectorStore, embeddingService);
+        return {
+          lines: kbResults.map((r) => formatKbRecallLine(r)),
+          strategy: "kb",
+          memories: kbResults.map((r) => ({ content: r.text, score: r.score, type: r.owner_kind })),
+          timing: { ftsMs: 0, embeddingMs: performance.now() - tKb, ftsHits: 0, embeddingHits: kbResults.length },
+        };
       }
-      return { content: line, score: 0, type: "unknown" };
-    });
+      const strategy = cfg.recall.strategy ?? "hybrid";
+      const searchResult = await searchMemories(userText, pluginDataDir, cfg, logger, strategy as "keyword" | "embedding" | "hybrid", vectorStore, embeddingService);
+      return {
+        lines: searchResult.lines,
+        strategy,
+        // Extract structured RecalledMemory from formatted lines for metrics.
+        memories: searchResult.lines.map((line) => {
+          const match = line.match(MEMORY_LINE_RE);
+          if (match) {
+            const tag = match[1];
+            const content = match[2].trim();
+            const typePart = tag.includes("|") ? tag.split("|")[0] : tag;
+            return { content, score: 0, type: typePart };
+          }
+          return { content: line, score: 0, type: "unknown" };
+        }),
+        timing: searchResult.timing,
+      };
+    };
+
+    const searchBudgetMs = cfg.recall.searchTimeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS;
+    let searchTimer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race<SearchOutcome | null>([
+      runSearch().finally(() => { if (searchTimer) clearTimeout(searchTimer); }),
+      new Promise<null>((resolve) => {
+        searchTimer = setTimeout(() => {
+          logger?.warn?.(
+            `${TAG} ⚠️ memory search exceeded ${searchBudgetMs}ms (embedding/provider slow or unreachable) — ` +
+              `injecting persona/scene/banner WITHOUT vector memories (degraded, not dropped)`,
+          );
+          resolve(null);
+        }, searchBudgetMs);
+      }),
+    ]);
+    if (outcome) {
+      memoryLines = outcome.lines;
+      effectiveStrategy = outcome.strategy;
+      recalledL1Memories = outcome.memories;
+      searchTiming = outcome.timing;
+    } else {
+      effectiveStrategy = "degraded"; // search timed out → empty memories, persona/scene still injected
+    }
   }
   const tSearchEnd = performance.now();
 
