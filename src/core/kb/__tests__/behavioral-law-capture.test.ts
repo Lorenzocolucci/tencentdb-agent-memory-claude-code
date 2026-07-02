@@ -49,6 +49,44 @@ describe("captureBehavioralLaw", () => {
     expect(sink[0].confidence).toBeGreaterThan(0);
   });
 
+  it("does NOT capture SYSTEM/tool-injected text as a law (task-notification)", () => {
+    const sink: Upsert[] = [];
+    const res = captureBehavioralLaw({
+      store: fakeStore(sink),
+      userEntityId: USER,
+      userText:
+        "<task-notification>\n<task-id>a15e3995a3aca5665</task-id>\nAgent finished. Verifica il risultato e procedi.\n</task-notification>",
+      now: NOW,
+    });
+    expect(res.captured).toBe(false);
+    expect(sink).toHaveLength(0);
+  });
+
+  it("does NOT capture a scheduled-task block as a law", () => {
+    const sink: Upsert[] = [];
+    const res = captureBehavioralLaw({
+      store: fakeStore(sink),
+      userEntityId: USER,
+      userText:
+        '<scheduled-task name="sofia-qa-daily" file="C:\\x\\SKILL.md">\nThis is an automated run of a scheduled task. Execute autonomously.',
+      now: NOW,
+    });
+    expect(res.captured).toBe(false);
+    expect(sink).toHaveLength(0);
+  });
+
+  it("does NOT capture injected session context (persona/banner/governing-principles)", () => {
+    const sink: Upsert[] = [];
+    for (const t of [
+      "<session-open-banner>\nFIRST TURN — begin with this banner. Verifica sempre.",
+      "<user-persona>\n## Process & Working-Style Rules\n- rule: non compiacere mai",
+      "<governing-principles>\nDeterminismo assoluto. Verifica sempre prima di dire fatto.",
+    ]) {
+      expect(captureBehavioralLaw({ store: fakeStore(sink), userEntityId: USER, userText: t, now: NOW }).captured).toBe(false);
+    }
+    expect(sink).toHaveLength(0);
+  });
+
   it("does NOT capture a status note (no directive)", () => {
     const sink: Upsert[] = [];
     const res = captureBehavioralLaw({

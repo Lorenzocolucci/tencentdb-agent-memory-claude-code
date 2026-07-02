@@ -30,6 +30,37 @@ export const MAX_RULE_LEN = 240;
 /** Cap the slug so the attribute key stays short and stable. */
 const MAX_SLUG_LEN = 48;
 
+/**
+ * Markers that mean the text is HARNESS/system-injected, not genuine Lorenzo
+ * prose: hook-injected session context (persona, banner, governing principles,
+ * scene/memory blocks), background-agent notifications, scheduled-task headers,
+ * taskmaster signals. Such text routinely contains imperatives ("verifica",
+ * "procedi") that the crude directive detector would mis-capture as LAWS,
+ * polluting the persona with junk rules. Provenance guard, checked FIRST.
+ */
+const SYSTEM_TEXT_MARKERS = [
+  "<task-notification",
+  "<scheduled-task",
+  "<session-open-banner",
+  "<session-recap",
+  "<governing-principles",
+  "<user-persona",
+  "<scene-navigation",
+  "<relevant-memories",
+  "<cornerstone-memories",
+  "<system-reminder",
+  "<local-command",
+  "this is an automated run of a scheduled task",
+  "taskmaster_done",
+] as const;
+
+/** True when the text is harness/system-injected (not a genuine user directive). */
+export function looksLikeSystemText(text: string): boolean {
+  if (typeof text !== "string") return false;
+  const lower = text.toLowerCase();
+  return SYSTEM_TEXT_MARKERS.some((m) => lower.includes(m));
+}
+
 /** The minimal store surface the capture needs (a subset of IMemoryStore). */
 export interface LawCaptureStore {
   upsertFact?(params: {
@@ -86,6 +117,7 @@ export function captureBehavioralLaw(params: {
 }): LawCaptureResult {
   const { store, userEntityId, userText, now } = params;
   if (!store?.upsertFact || !userEntityId) return { captured: false };
+  if (looksLikeSystemText(userText)) return { captured: false }; // harness text is never a law
 
   const candidate = detectDirective(userText);
   if (!candidate) return { captured: false };
@@ -145,6 +177,7 @@ export function captureLawFromUserTurn(params: {
 }): LawCaptureResult {
   const { store, userText, now } = params;
   if (!store?.resolveOrCreateEntity || !store?.upsertFact || !userText) return { captured: false };
+  if (looksLikeSystemText(userText)) return { captured: false }; // harness text is never a law
 
   const floor = params.minStrength ?? CAPTURE_MIN_STRENGTH;
   const candidate = detectDirective(userText);
