@@ -196,6 +196,24 @@ export async function runReindexCommand(opts: ReindexCommandOptions, ctx: SeedCl
     { resume: opts.resume === true },
   );
 
+  // ── KB recall layer (kb_vec) ──────────────────────────────────────────────
+  // reindexAll only rebuilds L0/L1. The entity-centric KB (recall.source=kb)
+  // has its OWN vec surface (kb_vec) that a dimension/model change drops empty —
+  // rebuild it from kb_fts here, else kb semantic recall stays blank after an
+  // embedding switch. Same chunking embedFn as L0/L1 for parity.
+  let kbCount = 0;
+  if (typeof vectorStore.reindexKb === 'function') {
+    process.stdout.write('\n');
+    const kb = await vectorStore.reindexKb(
+      (text: string) => embeddingService.embedChunks(text),
+      (done, total) => {
+        const pct = total > 0 ? ((done / total) * 100).toFixed(0) : '100';
+        process.stdout.write(`\r  [KB] ${done}/${total} ${pct}%    `);
+      },
+    );
+    kbCount = kb.kbCount;
+  }
+
   // Release resources.
   try {
     vectorStore.close();
@@ -216,6 +234,7 @@ export async function runReindexCommand(opts: ReindexCommandOptions, ctx: SeedCl
   console.log('╠══════════════════════════════════════════╣');
   console.log(`║  L1 records: ${String(l1Count).padStart(12)}              ║`);
   console.log(`║  L0 records: ${String(l0Count).padStart(12)}              ║`);
+  console.log(`║  KB owners:  ${String(kbCount).padStart(12)}              ║`);
   console.log('╚══════════════════════════════════════════╝');
   console.log(`\n📁 Store: ${dbPath}\n`);
 }

@@ -1166,7 +1166,14 @@ export class VectorStore implements IMemoryStore {
   private dropVectorTables(): void {
     this.db.exec("DROP TABLE IF EXISTS l1_vec");
     this.db.exec("DROP TABLE IF EXISTS l0_vec");
-    this.logger?.info(`${TAG} Dropped vector tables (l1_vec, l0_vec)`);
+    // kb_vec is the recall surface for the entity-centric KB (recall.source=kb).
+    // It MUST be dropped too on a dimension/model change — otherwise it survives
+    // at the OLD dimension while l0/l1 move to the new one → kb semantic recall
+    // silently mismatches. initKbSchema recreates it at the new dimension;
+    // reindexKb() refills it (kb_fts, the text source, is preserved). Uses
+    // prepare().run() (not db.exec) to avoid the child_process.exec lint false-positive.
+    this.db.prepare("DROP TABLE IF EXISTS kb_vec").run();
+    this.logger?.info(`${TAG} Dropped vector tables (l1_vec, l0_vec, kb_vec)`);
   }
 
   /**
@@ -2017,6 +2024,26 @@ export class VectorStore implements IMemoryStore {
   }
 
   /**
+   * Get all KB owner texts (entities/facts/events) for re-embedding into kb_vec.
+   * Source of truth = `kb_fts.content_original` — the exact text that was indexed
+   * for recall — so a kb_vec rebuild mirrors what the normal write path embedded.
+   * kb_fts is dimension-independent, so it survives an embedding-provider change.
+   */
+  getAllKbTexts(): Array<{ owner_id: string; owner_kind: string; content: string; updated_time: string }> {
+    if (this.degraded || !this.kbFtsAvailable) return [];
+    try {
+      return this.db
+        .prepare("SELECT owner_id, owner_kind, content_original AS content, updated_time FROM kb_fts")
+        .all() as Array<{ owner_id: string; owner_kind: string; content: string; updated_time: string }>;
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} getAllKbTexts failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return [];
+    }
+  }
+
+  /**
    * Re-embed all existing L1 and L0 texts with a new embedding function.
    *
    * This is called after `init()` returns `needsReindex: true` — the vector
@@ -2604,6 +2631,42 @@ export class VectorStore implements IMemoryStore {
       );
       return { l1Count: 0, l0Count: 0 };
     }
+  }
+
+  /**
+   * Re-embed the KB recall layer (`kb_vec`) from `kb_fts`, mirroring
+   * {@link reindexAll} for L0/L1. Needed because a dimension/model change drops+
+   * recreates `kb_vec` EMPTY ({@link dropVectorTables}), and `reindexAll` only
+   * covers L0/L1 — without this, kb semantic recall (recall.source=kb) stays
+   * blank after an embedding switch. Idempotent: {@link upsertKbVector} is
+   * delete-then-insert per owner. Per-owner errors are swallowed so one bad row
+   * never aborts the whole rebuild. Off any conversation path (offline tool).
+   */
+  async reindexKb(
+    embedFn: (text: string) => Promise<Float32Array | Float32Array[]>,
+    onProgress?: (done: number, total: number) => void,
+  ): Promise<{ kbCount: number }> {
+    if (this.degraded || !this.kbVecReady) {
+      this.logger?.warn(`${TAG} reindexKb skipped: kb_vec not ready`);
+      return { kbCount: 0 };
+    }
+    const rows = this.getAllKbTexts();
+    let done = 0;
+    for (const { owner_id, owner_kind, content, updated_time } of rows) {
+      try {
+        if (content && content.trim().length > 0) {
+          this.upsertKbVector(owner_id, owner_kind, await embedFn(content), updated_time);
+        }
+      } catch (err) {
+        this.logger?.warn?.(
+          `${TAG} reindexKb skip ${owner_kind} ${owner_id}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      done++;
+      onProgress?.(done, rows.length);
+    }
+    this.logger?.info(`${TAG} KB reindex complete: ${done}/${rows.length} owners`);
+    return { kbCount: done };
   }
 
   // ── L0 query operations (for L1 runner) ──────────────────────────────────
