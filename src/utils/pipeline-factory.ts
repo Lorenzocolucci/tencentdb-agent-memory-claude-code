@@ -533,6 +533,10 @@ export function createL1Runner(opts: {
               messages: windowMsgs.map((m) => m.msg),
               sessionKey,
               sessionId: group.sessionId,
+              // Resolve project from the sessionKey registry so NEW events are
+              // tagged by project (the extractor runs in the background from L0,
+              // which carries sessionKey but not the project name).
+              project: (kbStore as { getSessionProject?: (sk: string) => string | undefined }).getSessionProject?.(sessionKey),
               store: kbStore,
               embeddingService,
               llmRunner: llmRunner!,

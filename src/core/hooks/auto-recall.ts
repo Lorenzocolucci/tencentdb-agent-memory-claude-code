@@ -253,7 +253,7 @@ async function performAutoRecallInner(params: {
         // ── Phase-4 entity-centric KB recall path (recall.source = "kb") ──
         // Score injected here is the CALIBRATED 0-1 relevance (never raw RRF).
         const tKb = performance.now();
-        const kbResults = await runKbRecall(userText, cfg, logger, vectorStore, embeddingService);
+        const kbResults = await runKbRecall(userText, cfg, logger, vectorStore, embeddingService, projectName);
         return {
           lines: kbResults.map((r) => formatKbRecallLine(r)),
           strategy: "kb",
@@ -562,6 +562,40 @@ export function resolveRecentEventText(
 // KB recall path (recall.source = "kb")
 // ============================
 
+/** Fraction of the score kept by an event that belongs to ANOTHER project. */
+const OTHER_PROJECT_PENALTY = 0.5;
+
+/**
+ * Down-weight recalled EVENTS that belong to a different project than the current
+ * one, then re-sort. Soft, not a hard filter: a strongly-relevant cross-project
+ * event can still surface. Facts/entities/laws (no per-event project) are neutral.
+ * No projectName or no registry → returns results unchanged (never blocks recall).
+ */
+export function applyProjectScope(
+  results: KbRecallResult[],
+  projectName: string | undefined,
+  store: IMemoryStore,
+): KbRecallResult[] {
+  const getEventProjects = (store as {
+    getEventProjects?: (ids: string[]) => Record<string, string>;
+  }).getEventProjects;
+  if (!projectName || typeof getEventProjects !== "function" || results.length === 0) return results;
+  const eventIds = results.filter((r) => r.owner_kind === "event").map((r) => r.owner_id);
+  if (eventIds.length === 0) return results;
+  let projById: Record<string, string>;
+  try {
+    projById = getEventProjects.call(store, eventIds);
+  } catch {
+    return results;
+  }
+  return results
+    .map((r) => {
+      const p = projById[r.owner_id];
+      return p && p !== projectName ? { ...r, score: r.score * OTHER_PROJECT_PENALTY } : r;
+    })
+    .sort((a, b) => b.score - a.score);
+}
+
 /**
  * Run the Phase-4 entity-centric KB recall and return its results. Fault
  * tolerant: any failure degrades to [] so the recall path never blocks the turn
@@ -573,6 +607,7 @@ async function runKbRecall(
   logger: Logger | undefined,
   vectorStore?: IMemoryStore,
   embeddingService?: EmbeddingService,
+  projectName?: string,
 ): Promise<KbRecallResult[]> {
   if (!vectorStore) {
     logger?.debug?.(`${TAG} [kb] vectorStore unavailable — KB recall skipped`);
@@ -582,7 +617,7 @@ async function runKbRecall(
   try {
     // Redact secrets before the KB recall query is embedded (same egress guard
     // as the L1 search path above).
-    const results = await kbRecall(redactSecrets(userText), {
+    let results = await kbRecall(redactSecrets(userText), {
       store: vectorStore,
       embeddingService,
       maxResults: cfg.recall.maxResults ?? 5,
@@ -590,6 +625,12 @@ async function runKbRecall(
       embeddingTimeoutMs: recallEmbeddingTimeoutMs,
       logger,
     });
+
+    // Project scoping: down-weight EVENTS belonging to OTHER projects so the
+    // current project's work surfaces first. Soft (not a hard filter) — a
+    // strongly-relevant cross-project hit can still appear; laws/entities carry
+    // no project tag → neutral. projectName is the current cwd's project.
+    results = applyProjectScope(results, projectName, vectorStore);
 
     // Grounded Trust Phase 2 wiring: mark uncertain, high-stakes recalled units as
     // pending the ask-loop. Best-effort, off the critical path (gateRecalledUnits

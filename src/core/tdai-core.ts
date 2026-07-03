@@ -305,6 +305,11 @@ export class TdaiCore {
   ): Promise<RecallResult> {
     await this.storeReady?.catch(() => {});
 
+    // Maintain the sessionKey → project registry (recall knows BOTH values). The
+    // background extractor reads it to tag new events by project; recall scoping
+    // relies on it. Best-effort, never blocks a turn.
+    if (projectName) this.vectorStore?.setSessionProject?.(sessionKey, projectName);
+
     const result = await performAutoRecall({
       userText,
       actorId: "default_user",

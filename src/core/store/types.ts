@@ -642,6 +642,14 @@ export interface IMemoryStore {
    */
   latestEventBySessionKeyType?(sessionKey: string, type: string): KbEvent | undefined;
   /**
+   * session_key → project-name registry. Recall (which knows both) writes it;
+   * the background extractor reads it to tag new events by project. Best-effort.
+   */
+  setSessionProject?(sessionKey: string, project: string): void;
+  getSessionProject?(sessionKey: string): string | undefined;
+  /** Project tag per event id — lets recall down-weight other-project events. */
+  getEventProjects?(ids: string[]): Record<string, string>;
+  /**
    * All relation edges touching an entity (as src OR dst), within its namespace.
    * Powers the entity-page "Related [[entity]]" links.
    */

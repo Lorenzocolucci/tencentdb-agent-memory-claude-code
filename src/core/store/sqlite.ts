@@ -3200,6 +3200,16 @@ export class VectorStore implements IMemoryStore {
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_rel_src ON relations(src_entity_id, type)");
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_rel_dst ON relations(dst_entity_id, type)");
 
+      // ── session_projects: sessionKey → project-name registry. sessionKey is
+      //    per-project (plugin getSessionKey(cwd)) but events/L0 don't store the
+      //    project NAME. This registry lets the background extractor tag new
+      //    events by project, and lets recall scope to the current project.
+      //    Additive & best-effort. prepare().run() (not db.exec) dodges the
+      //    child_process.exec lint false-positive on node:sqlite.
+      this.db
+        .prepare("CREATE TABLE IF NOT EXISTS session_projects (session_key TEXT PRIMARY KEY, project TEXT NOT NULL, updated_at TEXT)")
+        .run();
+
       // ── Sinapsys foundations (Phases A–E): memory_lifecycle / lessons /
       //    memory_audit / context_fingerprints / relations.weight. Additive &
       //    best-effort; never blocks the base KB from becoming ready.
@@ -3437,6 +3447,50 @@ export class VectorStore implements IMemoryStore {
   latestEventBySessionKeyType(sessionKey: string, type: string): KbEvent | undefined {
     if (!this.kbReady) return undefined;
     return kbLatestEventBySessionKeyType(this.db, sessionKey, type);
+  }
+
+  /** @see IMemoryStore.setSessionProject */
+  setSessionProject(sessionKey: string, project: string): void {
+    if (!this.kbReady || !sessionKey || !project) return;
+    try {
+      this.db
+        .prepare(
+          "INSERT INTO session_projects(session_key, project, updated_at) VALUES(?,?,?) " +
+          "ON CONFLICT(session_key) DO UPDATE SET project=excluded.project, updated_at=excluded.updated_at",
+        )
+        .run(sessionKey, project, new Date().toISOString());
+    } catch {
+      /* best-effort registry — never break recall/capture */
+    }
+  }
+
+  /** @see IMemoryStore.getSessionProject */
+  getSessionProject(sessionKey: string): string | undefined {
+    if (!this.kbReady || !sessionKey) return undefined;
+    try {
+      const row = this.db
+        .prepare("SELECT project FROM session_projects WHERE session_key = ?")
+        .get(sessionKey) as { project?: string } | undefined;
+      return row?.project || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** @see IMemoryStore.getEventProjects — project tag per event id (recall scoping). */
+  getEventProjects(ids: string[]): Record<string, string> {
+    const out: Record<string, string> = {};
+    if (!this.kbReady || ids.length === 0) return out;
+    try {
+      const placeholders = ids.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(`SELECT id, project FROM events WHERE id IN (${placeholders})`)
+        .all(...ids) as Array<{ id: string; project?: string }>;
+      for (const r of rows) if (r.project) out[r.id] = r.project;
+    } catch {
+      /* best-effort — recall must never break */
+    }
+    return out;
   }
 
   /** @see IMemoryStore.queryRelationsForEntity */
