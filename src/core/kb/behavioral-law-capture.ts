@@ -39,7 +39,9 @@ const MAX_SLUG_LEN = 48;
  * polluting the persona with junk rules. Provenance guard, checked FIRST.
  */
 const SYSTEM_TEXT_MARKERS = [
-  "<task-notification",
+  "<task", // covers <task> mission blocks AND <task-notification>
+  "<mission",
+  "<why", // agent/Sofia structured-output tags (e.g. <why>… crash root cause)
   "<scheduled-task",
   "<session-open-banner",
   "<session-recap",
@@ -51,6 +53,8 @@ const SYSTEM_TEXT_MARKERS = [
   "<system-reminder",
   "<local-command",
   "this is an automated run of a scheduled task",
+  "this session is being continued", // Claude Code compaction summary preamble
+  "ran out of context",
   "taskmaster_done",
 ] as const;
 

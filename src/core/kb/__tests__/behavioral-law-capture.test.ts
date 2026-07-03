@@ -62,6 +62,18 @@ describe("captureBehavioralLaw", () => {
     expect(sink).toHaveLength(0);
   });
 
+  it("does NOT capture a bare <task>/<mission> block (Sofia agent prompt) as a law", () => {
+    const sink: Upsert[] = [];
+    for (const t of [
+      "<task>\n  <mission>\n    Fix a runtime crash in the production build of Sofia AI. Verifica prima, poi implementa.\n  </mission>",
+      "<mission>\n Investigate first, implement, verify by building. Do NOT push to main.",
+      "This session is being continued from a previous conversation that ran out of context. Procedi.",
+    ]) {
+      expect(captureBehavioralLaw({ store: fakeStore(sink), userEntityId: USER, userText: t, now: NOW }).captured).toBe(false);
+    }
+    expect(sink).toHaveLength(0);
+  });
+
   it("does NOT capture a scheduled-task block as a law", () => {
     const sink: Upsert[] = [];
     const res = captureBehavioralLaw({
