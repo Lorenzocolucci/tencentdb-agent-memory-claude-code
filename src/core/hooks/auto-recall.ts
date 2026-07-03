@@ -450,7 +450,7 @@ async function performAutoRecallInner(params: {
   let bannerEmitted = false;
   if (bannerTracker?.pending(bannerKey)) {
     try {
-      const recentEventText = resolveRecentEventText(vectorStore);
+      const recentEventText = resolveRecentEventText(vectorStore, params.sessionKey);
       const banner = buildSessionBanner({
         projectName,
         personaLoaded: personaContent !== undefined,
@@ -534,11 +534,25 @@ async function performAutoRecallInner(params: {
  * returning the value directly). If the method is absent or throws, returns
  * undefined without blocking the turn.
  */
-function resolveRecentEventText(vectorStore?: IMemoryStore): string | undefined {
-  if (!vectorStore?.listRecentEvents) return undefined;
+export function resolveRecentEventText(
+  vectorStore?: IMemoryStore,
+  sessionKey?: string,
+): string | undefined {
+  // Scope by sessionKey — which is PER-PROJECT (plugin: getSessionKey(cwd)).
+  // The old global `listRecentEvents("default")` leaked the last work of ANOTHER
+  // project (e.g. TutorAI's recap surfacing when you open Sofia). session_recap
+  // meta-events are skipped: we want the last REAL work, not the recap of it.
+  // Returns undefined when this project has no events yet → the banner drops
+  // "ultimo" rather than showing a different project's work (no cross-project bleed).
+  if (!vectorStore?.listEventsBySession || !sessionKey) return undefined;
   try {
-    const events = vectorStore.listRecentEvents("default", { limit: 1 });
-    return events[0]?.text || undefined;
+    const events = vectorStore.listEventsBySession(sessionKey);
+    let latest: { ts: string; text: string } | undefined;
+    for (const e of events) {
+      if (e.type === "session_recap" || !e.text) continue;
+      if (!latest || e.ts > latest.ts) latest = { ts: e.ts, text: e.text };
+    }
+    return latest?.text || undefined;
   } catch {
     return undefined;
   }
