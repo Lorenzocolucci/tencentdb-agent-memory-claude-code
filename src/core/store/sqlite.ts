@@ -856,10 +856,10 @@ export class VectorStore implements IMemoryStore {
     // ASC returns the oldest un-extracted window first, so paging + per-window
     // cursor advancement walks the whole backlog across triggers without loss.
     this.stmtL0QueryAllAsc = this.db.prepare(`
-      SELECT record_id, session_key, session_id, role, message_text, recorded_at, timestamp
+      SELECT rowid AS _rowid, record_id, session_key, session_id, role, message_text, recorded_at, timestamp
       FROM l0_conversations
       WHERE session_key = ?
-      ORDER BY recorded_at ASC
+      ORDER BY recorded_at ASC, rowid ASC
       LIMIT ?
     `);
 
@@ -876,11 +876,16 @@ export class VectorStore implements IMemoryStore {
     // SKIPS the oldest un-extracted messages permanently (the cursor then jumps
     // past them). ASC returns the oldest un-extracted window first, so paging +
     // cursor advancement processes the whole backlog across successive triggers.
+    // Composite (recorded_at, rowid) cursor: recorded_at is primary (existing
+    // cursors stay valid), rowid breaks ties. Required because the chat backfill
+    // gives EVERY message in a conversation the SAME recorded_at — a strict
+    // `recorded_at > ?` cursor then can't page past the first window (44/94 msgs
+    // lost). rowid is unique, monotonic, and preserves conversation order.
     this.stmtL0QueryAfterAsc = this.db.prepare(`
-      SELECT record_id, session_key, session_id, role, message_text, recorded_at, timestamp
+      SELECT rowid AS _rowid, record_id, session_key, session_id, role, message_text, recorded_at, timestamp
       FROM l0_conversations
-      WHERE session_key = ? AND recorded_at > ?
-      ORDER BY recorded_at ASC
+      WHERE session_key = ? AND (recorded_at > ? OR (recorded_at = ? AND rowid > ?))
+      ORDER BY recorded_at ASC, rowid ASC
       LIMIT ?
     `);
 
@@ -2681,6 +2686,7 @@ export class VectorStore implements IMemoryStore {
     sessionKey: string,
     afterRecordedAtMs?: number,
     limit = 50,
+    afterRowId = 0,
   ): Array<{
     record_id: string;
     session_key: string;
@@ -2689,6 +2695,7 @@ export class VectorStore implements IMemoryStore {
     message_text: string;
     recorded_at: string;
     timestamp: number;
+    rowid: number;
   }> {
     if (this.degraded) {
       this.logger?.warn(`${TAG} [L0-query] SKIPPED (degraded mode)`);
@@ -2706,9 +2713,11 @@ export class VectorStore implements IMemoryStore {
       // per-window cursor advancement walk the whole backlog across triggers.
       const incremental = Boolean(afterRecordedAtMs && afterRecordedAtMs > 0);
       if (incremental) {
-        // Convert epoch ms to ISO string for recorded_at comparison
+        // Convert epoch ms to ISO string for recorded_at comparison. The tie
+        // clause `(recorded_at = iso AND rowid > afterRowId)` pages within a
+        // same-recorded_at block (the chat-backfill case).
         const afterRecordedAtIso = new Date(afterRecordedAtMs!).toISOString();
-        rows = this.stmtL0QueryAfterAsc.all(sessionKey, afterRecordedAtIso, limit) as Array<Record<string, unknown>>;
+        rows = this.stmtL0QueryAfterAsc.all(sessionKey, afterRecordedAtIso, afterRecordedAtIso, afterRowId, limit) as Array<Record<string, unknown>>;
       } else {
         rows = this.stmtL0QueryAllAsc.all(sessionKey, limit) as Array<Record<string, unknown>>;
       }
@@ -2726,6 +2735,7 @@ export class VectorStore implements IMemoryStore {
         message_text: r.message_text as string,
         recorded_at: (r.recorded_at as string) || "",
         timestamp: (r.timestamp as number) || 0,
+        rowid: (r._rowid as number) || 0,
       }));
       // Both paths are already chronological (ASC) — return as-is.
       return mapped;
@@ -2748,16 +2758,17 @@ export class VectorStore implements IMemoryStore {
     sessionKey: string,
     afterRecordedAtMs?: number,
     limit = 50,
-  ): Array<{ sessionId: string; messages: Array<{ id: string; role: string; content: string; timestamp: number; recordedAtMs: number }> }> {
+    afterRowId = 0,
+  ): Array<{ sessionId: string; messages: Array<{ id: string; role: string; content: string; timestamp: number; recordedAtMs: number; rowid: number }> }> {
     if (this.degraded) {
       this.logger?.warn(`${TAG} [L0-query-grouped] SKIPPED (degraded mode)`);
       return [];
     }
     try {
-      const rows = this.queryL0ForL1(sessionKey, afterRecordedAtMs, limit);
+      const rows = this.queryL0ForL1(sessionKey, afterRecordedAtMs, limit, afterRowId);
 
       // Group by session_id
-      const groupMap = new Map<string, Array<{ id: string; role: string; content: string; timestamp: number; recordedAtMs: number }>>();
+      const groupMap = new Map<string, Array<{ id: string; role: string; content: string; timestamp: number; recordedAtMs: number; rowid: number }>>();
       for (const row of rows) {
         const sid = row.session_id || "";
         let group = groupMap.get(sid);
@@ -2771,11 +2782,12 @@ export class VectorStore implements IMemoryStore {
           content: row.message_text,
           timestamp: row.timestamp,
           recordedAtMs: row.recorded_at ? Date.parse(row.recorded_at) || 0 : 0,
+          rowid: row.rowid,
         });
       }
 
       // Convert to array, sorted by earliest message timestamp
-      const groups: Array<{ sessionId: string; messages: Array<{ id: string; role: string; content: string; timestamp: number; recordedAtMs: number }> }> = [];
+      const groups: Array<{ sessionId: string; messages: Array<{ id: string; role: string; content: string; timestamp: number; recordedAtMs: number; rowid: number }> }> = [];
       for (const [sessionId, messages] of groupMap) {
         if (messages.length > 0) {
           groups.push({ sessionId, messages });

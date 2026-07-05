@@ -224,6 +224,41 @@ describe("L1 runner — no fact loss across windows / warmup boundaries", () => 
     }
   });
 
+  it("fully drains a session where EVERY message shares one recorded_at (chat-backfill)", async () => {
+    // The claude.ai chat import gives every message in a conversation the SAME
+    // recorded_at. A strict `recorded_at > cursor` cursor can't page past the
+    // first 50 → the rest is lost forever. The composite (recorded_at, rowid)
+    // cursor must page through the whole same-timestamp block.
+    const N = 60; // > one 50-msg read → forces a second cursor-advanced read
+    const iso = "2024-10-26T21:39:32.000Z";
+    for (let i = 0; i < N; i++) {
+      // ids MUST be m<n> — the fake runner's id parser only matches /m\d+/.
+      const ok = store.upsertL0(
+        { id: `m${i + 1}`, sessionKey, sessionId: "sid-chat", role: i % 2 === 0 ? "user" : "assistant", messageText: `chat message ${i + 1}, decided approach ${i + 1}.`, recordedAt: iso, timestamp: Date.parse(iso) + i },
+        undefined,
+      );
+      expect(ok).toBe(true);
+    }
+
+    // Drive the runner until drained (each call reads up to 50; the composite
+    // cursor must advance by rowid within the identical-timestamp block).
+    const healthy = makeFakeRunner();
+    for (let t = 0; t < 5; t++) {
+      const runner = createL1Runner({
+        pluginDataDir: dir, cfg, openclawConfig: {}, vectorStore: store,
+        embeddingService: undefined, logger: silentLogger, llmRunner: healthy.runner,
+      });
+      await runner({ sessionKey });
+    }
+
+    // EVERY message extracted exactly once — nothing lost past the first window.
+    const counts = countStoredBySourceId(dir);
+    expect(counts.size).toBe(N);
+    for (let i = 1; i <= N; i++) {
+      expect(counts.get(`m${i}`), `m${i} must be stored exactly once`).toBe(1);
+    }
+  });
+
   it("QUARANTINES a persistently-poison window after MAX retries and digests the rest", async () => {
     // The immune-system invariant: a window that fails on EVERY trigger (genuine
     // poison, e.g. malformed LLM output) must NOT freeze the session forever.

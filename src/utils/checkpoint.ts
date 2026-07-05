@@ -47,6 +47,10 @@ export interface RunnerSessionState {
   // ═══ L1 — cursor & continuity ═══
   /** L0 JSONL cursor: epoch ms of last message processed by L1 */
   last_l1_cursor: number;
+  /** Tie-breaker for last_l1_cursor: the rowid of the last processed message AT
+   *  last_l1_cursor. Pages within a same-recorded_at block (the chat backfill
+   *  gives every message in a conversation one timestamp). 0 = start of the tie. */
+  last_l1_rowid: number;
   /** Last scene name from the most recent L1 extraction (for cross-batch continuity) */
   last_scene_name: string;
 
@@ -119,6 +123,7 @@ export interface Checkpoint {
 const DEFAULT_RUNNER_STATE: RunnerSessionState = {
   last_captured_timestamp: 0,
   last_l1_cursor: 0,
+  last_l1_rowid: 0,
   last_scene_name: "",
   l1_stuck_cursor: 0,
   l1_stuck_count: 0,
@@ -423,11 +428,14 @@ export class CheckpointManager {
     cursorRecordedAtMs?: number,
     lastSceneName?: string,
     stuck?: { cursor: number; count: number },
+    cursorRowId = 0,
   ): Promise<void> {
     await this.mutate((cp) => {
       const state = this.getRunnerState(cp, sessionKey);
       if (cursorRecordedAtMs) {
         state.last_l1_cursor = cursorRecordedAtMs;
+        // Composite cursor tie-breaker (see RunnerSessionState.last_l1_rowid).
+        state.last_l1_rowid = cursorRowId;
       }
       if (lastSceneName !== undefined) {
         state.last_scene_name = lastSceneName;

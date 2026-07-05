@@ -148,6 +148,8 @@ export interface L0QueryRow {
   message_text: string;
   recorded_at: string;
   timestamp: number;
+  /** Table rowid — composite-cursor tie-breaker within a same-recorded_at block. */
+  rowid: number;
 }
 
 /** L0 messages grouped by session ID (for L1 runner). */
@@ -160,6 +162,8 @@ export interface L0SessionGroup {
     timestamp: number;
     /** Epoch ms when this message was recorded into L0 (used by L1 cursor). */
     recordedAtMs: number;
+    /** Table rowid — composite-cursor tie-breaker (same-recorded_at paging). */
+    rowid: number;
   }>;
 }
 
@@ -476,8 +480,8 @@ export interface IMemoryStore {
   // ── L0 Read ──────────────────────────────────────────────
 
   countL0(): MaybePromise<number>;
-  queryL0ForL1(sessionKey: string, afterRecordedAtMs?: number, limit?: number): MaybePromise<L0QueryRow[]>;
-  queryL0GroupedBySessionId(sessionKey: string, afterRecordedAtMs?: number, limit?: number): MaybePromise<L0SessionGroup[]>;
+  queryL0ForL1(sessionKey: string, afterRecordedAtMs?: number, limit?: number, afterRowId?: number): MaybePromise<L0QueryRow[]>;
+  queryL0GroupedBySessionId(sessionKey: string, afterRecordedAtMs?: number, limit?: number, afterRowId?: number): MaybePromise<L0SessionGroup[]>;
   getAllL0Texts(): MaybePromise<Array<{ record_id: string; message_text: string; recorded_at: string }>>;
 
   // ── L0 Search ────────────────────────────────────────────

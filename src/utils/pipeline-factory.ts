@@ -394,14 +394,17 @@ export function createL1Runner(opts: {
       // recorded_at, so we MUST keep it attached to every message we read —
       // otherwise we cannot compute a cursor that matches exactly the messages
       // we actually fed to the LLM.
-      type RunnerMsg = { msg: ConversationMessage; recordedAtMs: number };
+      // rowid is the composite-cursor tie-breaker: it pages within a same
+      // recorded_at block (the chat backfill gives one timestamp per conversation).
+      type RunnerMsg = { msg: ConversationMessage; recordedAtMs: number; rowid: number };
       let groups: Array<{ sessionId: string; messages: RunnerMsg[] }>;
 
       if (vectorStore && !vectorStore.isDegraded()) {
         const l1Cursor = runnerState.last_l1_cursor > 0
           ? runnerState.last_l1_cursor
           : undefined;
-        const dbGroups = await vectorStore.queryL0GroupedBySessionId(sessionKey, l1Cursor);
+        const l1Rowid = runnerState.last_l1_rowid ?? 0;
+        const dbGroups = await vectorStore.queryL0GroupedBySessionId(sessionKey, l1Cursor, 50, l1Rowid);
         groups = dbGroups.map((g) => ({
           sessionId: g.sessionId,
           messages: g.messages.map((m) => ({
@@ -412,6 +415,7 @@ export function createL1Runner(opts: {
               timestamp: m.timestamp,
             },
             recordedAtMs: m.recordedAtMs,
+            rowid: m.rowid,
           })),
         }));
         logger.debug?.(`${TAG} [l1] L0 data source: VectorStore DB`);
@@ -426,7 +430,7 @@ export function createL1Runner(opts: {
         );
         groups = jsonlGroups.map((g) => ({
           sessionId: g.sessionId,
-          messages: g.messages.map((m) => ({ msg: m, recordedAtMs: m.recordedAtMs })),
+          messages: g.messages.map((m) => ({ msg: m, recordedAtMs: m.recordedAtMs, rowid: 0 })),
         }));
       }
 
@@ -506,10 +510,21 @@ export function createL1Runner(opts: {
       let totalExtracted = 0;
       let totalStored = 0;
       let lastSceneName: string | undefined;
-      // The cursor we will persist: max recorded_at over every window that
-      // succeeded. Starts undefined (= unchanged) so a failed first window
-      // leaves the cursor exactly where it was.
+      // The cursor we will persist: the COMPOSITE (recorded_at, rowid) max over
+      // every window that succeeded. Starts undefined (= unchanged) so a failed
+      // first window leaves the cursor exactly where it was. The rowid tie-breaker
+      // pages within a same-recorded_at block (the chat-backfill case).
       let cursorToPersist: number | undefined;
+      let cursorRowidToPersist = 0;
+      const advanceCursor = (m: RunnerMsg) => {
+        if (
+          m.recordedAtMs > (cursorToPersist ?? -1) ||
+          (m.recordedAtMs === cursorToPersist && m.rowid > cursorRowidToPersist)
+        ) {
+          cursorToPersist = m.recordedAtMs;
+          cursorRowidToPersist = m.rowid;
+        }
+      };
       let hardFailure = false;
       // Poison-window tolerance: count windows we had to SKIP because their
       // extraction kept failing across MAX_WINDOW_RETRIES triggers. A single
@@ -640,7 +655,7 @@ export function createL1Runner(opts: {
                 `${skippedWindows} skipped this run). A poison window no longer blocks later messages.`,
               );
               for (const m of windowMsgs) {
-                if (m.recordedAtMs > (cursorToPersist ?? 0)) cursorToPersist = m.recordedAtMs;
+                advanceCursor(m);
               }
               // We moved past the poison window — clear the stuck marker.
               stuckCursor = 0;
@@ -666,11 +681,11 @@ export function createL1Runner(opts: {
             lastSceneName = l1Result.lastSceneName;
           }
 
-          // SUCCESS (including extracted=0): the cursor may move to the max
-          // recorded_at of THIS window — every message in it was fed and
-          // considered. Never let it move backwards.
+          // SUCCESS (including extracted=0): the cursor may move to the composite
+          // (recorded_at, rowid) max of THIS window — every message in it was fed
+          // and considered. Never let it move backwards.
           for (const m of windowMsgs) {
-            if (m.recordedAtMs > (cursorToPersist ?? 0)) cursorToPersist = m.recordedAtMs;
+            advanceCursor(m);
           }
         }
 
@@ -683,7 +698,7 @@ export function createL1Runner(opts: {
       await checkpoint.markL1ExtractionComplete(sessionKey, totalStored, cursorToPersist, lastSceneName, {
         cursor: stuckCursor,
         count: stuckCount,
-      });
+      }, cursorRowidToPersist);
       logger.info(
         `${TAG} [l1] L1 complete: extracted=${totalExtracted}, stored=${totalStored} ` +
         `(${groups.length} group(s), cursor=${cursorToPersist ?? "(unchanged)"}${hardFailure ? ", PARTIAL — failure held cursor" : ""})`,
