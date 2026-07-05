@@ -194,6 +194,60 @@ describe("extractKbDelta (mock LLM, temp DB)", () => {
     expect((handle.prepare("SELECT count(*) AS c FROM entities").all()[0] as { c: number }).c).toBe(0);
   });
 
+  // ── Immune-system fallback: rescue windows the primary (Moonshot/Kimi) refuses ──
+
+  it("primary REFUSES every attempt (high risk) → fallback runner rescues the window", async () => {
+    const primary = new MockLLMRunner(async () => {
+      throw new Error("The request was rejected because it was considered high risk");
+    });
+    const fallback = new MockLLMRunner(FIXED_DELTA_JSON);
+    const res = await extractKbDelta({
+      messages: WINDOW,
+      sessionKey: "sess-1",
+      sessionId: "sid-1",
+      store,
+      embeddingService: embedding,
+      llmRunner: primary,
+      fallbackLlmRunner: fallback,
+      now: "2026-06-06T09:01:00.000Z",
+    });
+    expect(res.success).toBe(true);
+    expect(res.factsCount).toBe(1);
+    expect(res.eventsCount).toBe(1);
+    expect(fallback.lastParams?.taskId).toBe("kb-extraction"); // fallback WAS invoked
+  });
+
+  it("primary AND fallback both fail → success:false (fail-closed preserved)", async () => {
+    const primary = new MockLLMRunner(async () => { throw new Error("high risk"); });
+    const fallback = new MockLLMRunner("not valid json at all");
+    const res = await extractKbDelta({
+      messages: WINDOW,
+      sessionKey: "sess-1",
+      store,
+      embeddingService: embedding,
+      llmRunner: primary,
+      fallbackLlmRunner: fallback,
+    });
+    expect(res.success).toBe(false);
+  });
+
+  it("primary succeeds → fallback runner is NEVER called (no wasted cost)", async () => {
+    const primary = new MockLLMRunner(FIXED_DELTA_JSON);
+    const fallback = new MockLLMRunner(async () => { throw new Error("fallback must not run"); });
+    const res = await extractKbDelta({
+      messages: WINDOW,
+      sessionKey: "sess-1",
+      store,
+      embeddingService: embedding,
+      llmRunner: primary,
+      fallbackLlmRunner: fallback,
+      now: "2026-06-06T09:01:00.000Z",
+    });
+    expect(res.success).toBe(true);
+    expect(res.factsCount).toBe(1);
+    expect(fallback.lastParams).toBeUndefined(); // primary won → fallback untouched
+  });
+
   it("CJK output → success:false, nothing stored (language barrier, fail-closed)", async () => {
     // Model insists on Chinese every attempt (worst case). The barrier's rewrite
     // cannot force it, so the extractor must REJECT rather than store CJK.

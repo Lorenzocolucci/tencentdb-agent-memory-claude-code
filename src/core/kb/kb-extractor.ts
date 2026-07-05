@@ -52,6 +52,72 @@ export interface KbExtractionResult {
 // ============================
 
 /**
+ * Run the LLM → parse → validate attempt loop for ONE runner and return the
+ * first clean KbDelta (or the last error if all attempts failed). Extracted so
+ * the SAME loop drives both the primary runner and the fallback runner — the
+ * fallback reuses the identical parse/validate path, no divergent code.
+ *
+ * Kimi at temperature=1 occasionally emits malformed JSON or a dangling ref; a
+ * fresh retry almost always fixes it. Only after MAX_ATTEMPTS fail does the
+ * caller escalate (to the fallback runner, then fail-closed).
+ */
+async function runExtractionAttempts(opts: {
+  runner: LLMRunner;
+  userPrompt: string;
+  timeoutMs: number;
+  maxAttempts: number;
+  label: string;
+  logger?: Logger;
+}): Promise<{ delta?: KbDelta; lastError: string }> {
+  const { runner, userPrompt, timeoutMs, maxAttempts, label, logger } = opts;
+  let lastError = "unknown";
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let raw: string;
+    try {
+      // Language barrier: the extractor is the SOURCE of every stored event, so
+      // forcing a no-CJK rewrite here keeps recall/recap/principles clean at the root.
+      raw = await runWithoutCjk(runner, {
+        prompt: userPrompt,
+        systemPrompt: resolveKbExtractionSystemPrompt(),
+        taskId: "kb-extraction",
+        timeoutMs,
+      });
+    } catch (err) {
+      lastError = `LLM call failed: ${err instanceof Error ? err.message : String(err)}`;
+      logger?.warn?.(`${TAG} [${label}] attempt ${attempt}/${maxAttempts}: ${lastError}`);
+      continue; // fresh retry of the LLM call
+    }
+
+    // Hard CJK barrier: never store CJK — the reject is deterministic, so the
+    // "no Chinese gets stored" guarantee does not depend on the model complying.
+    if (hasCjk(raw)) {
+      lastError = `output still contains CJK after language guard (rawLen=${raw.length})`;
+      logger?.warn?.(`${TAG} [${label}] attempt ${attempt}/${maxAttempts}: ${lastError}`);
+      continue;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = parseRawKbDeltaJson(raw);
+    } catch (err) {
+      lastError = `JSON parse failed (rawLen=${raw.length}): ${err instanceof Error ? err.message : String(err)}`;
+      logger?.warn?.(`${TAG} [${label}] attempt ${attempt}/${maxAttempts}: ${lastError}`);
+      continue;
+    }
+
+    const validation = parseKbDelta(parsed);
+    if (!validation.ok) {
+      lastError = validation.error;
+      logger?.warn?.(`${TAG} [${label}] attempt ${attempt}/${maxAttempts}: ${lastError}`);
+      continue;
+    }
+
+    return { delta: validation.delta, lastError };
+  }
+  return { lastError };
+}
+
+/**
  * Run single-stage KB extraction over ONE window of messages.
  *
  * @param messages       The window's messages (already sliced by the runner).
@@ -72,6 +138,15 @@ export async function extractKbDelta(params: {
   store: KbWriterStore;
   embeddingService?: EmbeddingService;
   llmRunner: LLMRunner;
+  /**
+   * Optional non-Chinese fallback extractor (e.g. OpenAI gpt-5.4-mini). Tried
+   * ONLY when the primary runner fails every attempt — its main purpose is the
+   * windows Moonshot/Kimi REFUSES with "high risk" (its content-moderation flags
+   * an incidental China-sensitive term like "rubber stamp" and rejects the whole
+   * request), but it also rescues transient parse failures. Absent → unchanged
+   * fail-closed behavior (cursor holds, immune-system quarantine bounds poison).
+   */
+  fallbackLlmRunner?: LLMRunner;
   namespace?: string;
   project?: string;
   knownEntities?: string[];
@@ -99,12 +174,13 @@ export async function extractKbDelta(params: {
     return empty;
   }
 
-  // ── Steps 1-3 with ONE retry: LLM → parse → validate. Kimi at temperature=1
-  //    occasionally emits malformed JSON (e.g. a doubled quote `""key"`) or a
-  //    dangling ref; a single fresh retry almost always yields a clean delta —
-  //    cheap robustness vs. losing the whole window (the recurring "3 windows
-  //    failed in the backfill" cause). Each attempt is independent; only after
-  //    both fail do we fail-closed (cursor holds, retried on the next trigger). ──
+  // ── Steps 1-3: LLM → parse → validate, primary runner first, then the
+  //    non-Chinese fallback runner if the primary fails EVERY attempt. This is
+  //    the fix for Moonshot/Kimi refusing a window with "high risk" (its
+  //    moderation flags an incidental China-sensitive term like "rubber stamp"
+  //    and rejects the whole request → the window would otherwise be lost /
+  //    quarantined). The fallback reuses the SAME attempt loop, so a rescued
+  //    window is parsed/validated/applied identically. ──
   const userPrompt = formatKbExtractionPrompt({
     newMessages: messages,
     backgroundMessages: params.backgroundMessages,
@@ -115,59 +191,43 @@ export async function extractKbDelta(params: {
   const extractTimeoutMs = Number(process.env.TDAI_KB_EXTRACT_TIMEOUT_MS) || 180_000;
   const MAX_ATTEMPTS = 2;
 
-  let delta: KbDelta | undefined;
-  let lastError = "unknown";
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    let raw: string;
-    try {
-      // Language barrier: the extractor is the SOURCE of every stored event, so
-      // forcing a no-CJK rewrite here keeps recall/recap/principles clean at the
-      // root. Falls through to the existing parse/validate/retry loop.
-      raw = await runWithoutCjk(llmRunner, {
-        prompt: userPrompt,
-        systemPrompt: resolveKbExtractionSystemPrompt(),
-        taskId: "kb-extraction",
-        timeoutMs: extractTimeoutMs,
-      });
-    } catch (err) {
-      lastError = `LLM call failed: ${err instanceof Error ? err.message : String(err)}`;
-      logger?.warn?.(`${TAG} attempt ${attempt}/${MAX_ATTEMPTS}: ${lastError}`);
-      continue; // fresh retry of the LLM call
-    }
+  const primary = await runExtractionAttempts({
+    runner: llmRunner,
+    userPrompt,
+    timeoutMs: extractTimeoutMs,
+    maxAttempts: MAX_ATTEMPTS,
+    label: "primary",
+    logger,
+  });
+  let delta = primary.delta;
+  let lastError = primary.lastError;
 
-    // Hard CJK barrier: runWithoutCjk already tried to force a rewrite; if the
-    // output STILL contains CJK, fail this attempt (fresh retry, then fail-closed
-    // = cursor holds). Never store CJK — the reject is deterministic, so the
-    // "no Chinese gets stored" guarantee does not depend on the model complying.
-    if (hasCjk(raw)) {
-      lastError = `output still contains CJK after language guard (rawLen=${raw.length})`;
-      logger?.warn?.(`${TAG} attempt ${attempt}/${MAX_ATTEMPTS}: ${lastError}`);
-      continue;
+  // Fallback: primary failed every attempt AND a fallback runner is wired.
+  if (!delta && params.fallbackLlmRunner) {
+    logger?.warn?.(
+      `${TAG} primary extraction failed (${lastError}) — retrying window with fallback LLM ` +
+      `(non-Chinese; rescues Moonshot "high risk" refusals)`,
+    );
+    const fb = await runExtractionAttempts({
+      runner: params.fallbackLlmRunner,
+      userPrompt,
+      timeoutMs: extractTimeoutMs,
+      maxAttempts: MAX_ATTEMPTS,
+      label: "fallback",
+      logger,
+    });
+    if (fb.delta) {
+      delta = fb.delta;
+      logger?.info?.(`${TAG} fallback LLM extracted the window the primary could not`);
+    } else {
+      lastError = `primary: ${lastError}; fallback: ${fb.lastError}`;
     }
-
-    let parsed: unknown;
-    try {
-      parsed = parseRawKbDeltaJson(raw);
-    } catch (err) {
-      lastError = `JSON parse failed (rawLen=${raw.length}): ${err instanceof Error ? err.message : String(err)}`;
-      logger?.warn?.(`${TAG} attempt ${attempt}/${MAX_ATTEMPTS}: ${lastError}`);
-      continue;
-    }
-
-    const validation = parseKbDelta(parsed);
-    if (!validation.ok) {
-      lastError = validation.error;
-      logger?.warn?.(`${TAG} attempt ${attempt}/${MAX_ATTEMPTS}: ${lastError}`);
-      continue;
-    }
-
-    delta = validation.delta;
-    break;
   }
 
   if (!delta) {
-    // Both attempts failed — hold the cursor (fail-closed, like l1-extractor.ts:175-178).
-    logger?.error(`${TAG} extraction failed after ${MAX_ATTEMPTS} attempts: ${lastError} — cursor will hold`);
+    // Every attempt (primary + fallback) failed — hold the cursor (fail-closed);
+    // the immune-system quarantine bounds a genuinely un-extractable window.
+    logger?.error(`${TAG} extraction failed after all attempts: ${lastError} — cursor will hold`);
     return { ...empty, success: false };
   }
 

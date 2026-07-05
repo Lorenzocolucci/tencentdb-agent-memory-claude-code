@@ -1015,6 +1015,32 @@ export class TdaiCore {
       ? runnerFactory.createRunner({ enableTools: true })
       : undefined;
 
+    // Immune-system extraction fallback: a NON-Chinese model (default OpenAI
+    // gpt-5.4-mini) that rescues the windows Moonshot/Kimi REFUSES with "high
+    // risk" — its content-moderation flags an incidental China-sensitive term
+    // (e.g. the idiom "rubber stamp") and rejects the whole extraction request,
+    // which would otherwise freeze/quarantine the window. Reuses the same
+    // OpenAI-compatible StandaloneLLMRunner. Enabled when a key resolves from
+    // TDAI_FALLBACK_LLM_API_KEY or the OPENAI_API_KEY already used for
+    // embeddings; absent → no fallback (unchanged fail-closed + quarantine).
+    const fallbackKey = process.env.TDAI_FALLBACK_LLM_API_KEY || process.env.OPENAI_API_KEY;
+    const fallbackModel = process.env.TDAI_FALLBACK_LLM_MODEL || "gpt-5.4-mini";
+    const fallbackLlmRunner = fallbackKey
+      ? new StandaloneLLMRunnerFactory({
+          config: {
+            baseUrl: process.env.TDAI_FALLBACK_LLM_BASE_URL || "https://api.openai.com/v1",
+            apiKey: fallbackKey,
+            model: fallbackModel,
+            temperature: 0.2, // low temp for deterministic structured extraction (verified live)
+            timeoutMs: this.cfg.llm.timeoutMs,
+          },
+          logger: this.logger,
+        }).createRunner({ enableTools: false })
+      : undefined;
+    if (fallbackLlmRunner) {
+      this.logger.info(`${TAG} KB extraction fallback enabled: ${fallbackModel} (rescues Moonshot "high risk" refusals)`);
+    }
+
     // L1 runner
     this.scheduler.setL1Runner(createL1Runner({
       pluginDataDir: this.dataDir,
@@ -1025,6 +1051,7 @@ export class TdaiCore {
       logger: this.logger,
       getInstanceId: () => this.instanceId,
       llmRunner: l1LlmRunner,
+      fallbackLlmRunner,
     }));
 
     // Persister

@@ -364,8 +364,14 @@ export function createL1Runner(opts: {
   getInstanceId?: () => string | undefined;
   /** Host-neutral LLM runner for L1 extraction (standalone/gateway mode). */
   llmRunner?: import("../core/types.js").LLMRunner;
+  /**
+   * Non-Chinese fallback extractor (e.g. OpenAI gpt-5.4-mini) for windows the
+   * primary (Moonshot/Kimi) REFUSES with "high risk". Passed straight to the KB
+   * extractor; only used on primary failure. Undefined → unchanged behavior.
+   */
+  fallbackLlmRunner?: import("../core/types.js").LLMRunner;
 }): (params: { sessionKey: string }) => Promise<{ processedCount: number }> {
-  const { pluginDataDir, cfg, openclawConfig, vectorStore, embeddingService, logger, getInstanceId, llmRunner } = opts;
+  const { pluginDataDir, cfg, openclawConfig, vectorStore, embeddingService, logger, getInstanceId, llmRunner, fallbackLlmRunner } = opts;
   const config = openclawConfig as Record<string, unknown> | undefined;
 
   return async ({ sessionKey }) => {
@@ -557,6 +563,7 @@ export function createL1Runner(opts: {
               store: kbStore,
               embeddingService,
               llmRunner: llmRunner!,
+              fallbackLlmRunner,
               logger,
             });
             l1Result = {
