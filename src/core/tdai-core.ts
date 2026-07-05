@@ -1031,7 +1031,10 @@ export class TdaiCore {
             baseUrl: process.env.TDAI_FALLBACK_LLM_BASE_URL || "https://api.openai.com/v1",
             apiKey: fallbackKey,
             model: fallbackModel,
-            temperature: 0.2, // low temp for deterministic structured extraction (verified live)
+            // gpt-5.4-mini is a reasoning model → it rejects/ignores temperature
+            // (AI-SDK warns per call if sent). Omit it entirely; the model's
+            // default is already low-variance enough for structured extraction.
+            omitTemperature: true,
             timeoutMs: this.cfg.llm.timeoutMs,
           },
           logger: this.logger,
