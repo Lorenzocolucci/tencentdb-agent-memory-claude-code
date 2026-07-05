@@ -230,6 +230,14 @@ export class TdaiGateway {
       this.server!.listen(port, host, () => {
         this.startTime = Date.now();
         this.logger.info(`Gateway listening on http://${host}:${port}`);
+        // Immune system: resume any extraction backlog frozen by the previous
+        // shutdown (restart amnesia). Fire-and-forget so it never blocks boot —
+        // recovery enqueues L1 passes that drain in the background.
+        this.core.resumeExtraction().catch((err) => {
+          this.logger.warn(
+            `Extraction resume failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
         resolve();
       });
       this.server!.on("error", reject);

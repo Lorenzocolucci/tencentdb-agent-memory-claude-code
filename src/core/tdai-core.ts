@@ -698,6 +698,14 @@ export class TdaiCore {
     if (!sessionKey) return;
     await this.storeReady?.catch(() => {});
 
+    // Immune system: ensure the scheduler is STARTED (per-session pipeline state
+    // restored from checkpoint + recovery enqueued) BEFORE we flush. On a fresh
+    // gateway that has not seen a capture yet, sessionStates is empty, so the
+    // flush's runL1 bails on `!state` and silently does nothing — the session's
+    // L0 backlog would stay frozen. ensureSchedulerStarted is idempotent, so
+    // this is a cheap no-op once started.
+    await this.ensureSchedulerStarted();
+
     // Flush THIS session's buffered pipeline work (no-op when extraction is
     // disabled and no scheduler exists).
     if (this.scheduler) {
@@ -1051,6 +1059,22 @@ export class TdaiCore {
     });
 
     this.logger.debug?.(`${TAG} Pipeline runners wired`);
+  }
+
+  /**
+   * Immune system — resume extraction after a restart.
+   *
+   * Eagerly starts the scheduler: restores per-session pipeline state from the
+   * checkpoint and runs recovery (re-enqueues an L1 "recovery" pass for every
+   * session with un-extracted L0 backlog). Called fire-and-forget at gateway
+   * boot so a crash/reboot/redeploy resumes frozen backlogs WITHOUT waiting for
+   * the next capture — closing the "restart amnesia" that silently froze
+   * extraction (sessionStates is in-memory; before this, only a /capture rebuilt
+   * it and triggered recovery). Idempotent via {@link ensureSchedulerStarted}.
+   */
+  async resumeExtraction(): Promise<void> {
+    await this.storeReady?.catch(() => {});
+    await this.ensureSchedulerStarted();
   }
 
   private ensureSchedulerStarted(): Promise<void> {
