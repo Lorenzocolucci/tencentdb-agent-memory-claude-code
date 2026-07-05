@@ -3493,6 +3493,50 @@ export class VectorStore implements IMemoryStore {
     return out;
   }
 
+  /**
+   * @see IMemoryStore.getMemoryHealth — the immune system's heartbeat.
+   * Flags sessions where the raw log (L0) is growing but the extracted graph
+   * (events) is NOT keeping up — the exact silent failure that let Sofia/Tutor
+   * freeze for weeks unnoticed. Only ACTIVELY-USED sessions are considered
+   * (recent L0); dormant ones are not "broken". Store-only, never throws.
+   */
+  getMemoryHealth(nowMs: number = Date.now()): {
+    healthy: boolean;
+    stale: Array<{ sessionKey: string; project: string; lagHours: number }>;
+  } {
+    const RECENT_L0_MS = 3 * 24 * 3600 * 1000; // consider only sessions used in last 3 days
+    const LAG_MS = 36 * 3600 * 1000; // events >36h behind their L0 = extraction stalled
+    const out = { healthy: true, stale: [] as Array<{ sessionKey: string; project: string; lagHours: number }> };
+    if (!this.kbReady) return out;
+    try {
+      const rows = this.db
+        .prepare(
+          "SELECT l.session_key sk, MAX(l.recorded_at) l0, " +
+          "(SELECT MAX(e.ts) FROM events e WHERE e.session_key = l.session_key) ev " +
+          "FROM l0_conversations l GROUP BY l.session_key",
+        )
+        .all() as Array<{ sk: string; l0: string | null; ev: string | null }>;
+      for (const r of rows) {
+        const l0ms = Date.parse(r.l0 ?? "");
+        if (!Number.isFinite(l0ms) || nowMs - l0ms > RECENT_L0_MS) continue; // dormant → skip
+        const evms = r.ev ? Date.parse(r.ev) : 0;
+        const lag = l0ms - (Number.isFinite(evms) ? evms : 0);
+        if (lag > LAG_MS) {
+          out.stale.push({
+            sessionKey: r.sk,
+            project: this.getSessionProject(r.sk) ?? r.sk.slice(0, 8),
+            lagHours: Math.round(lag / 3_600_000),
+          });
+        }
+      }
+      out.stale.sort((a, b) => b.lagHours - a.lagHours);
+      out.healthy = out.stale.length === 0;
+    } catch {
+      /* best-effort — health check must never break recall */
+    }
+    return out;
+  }
+
   /** @see IMemoryStore.queryRelationsForEntity */
   queryRelationsForEntity(entityId: string): KbRelation[] {
     if (!this.kbReady) return [];

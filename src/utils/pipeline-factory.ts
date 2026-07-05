@@ -464,6 +464,13 @@ export function createL1Runner(opts: {
       // ════════════════════════════════════════════════════════════════════
       const WINDOW_SIZE = 10; // messages fed to the LLM per extraction call
       const BG_SIZE = 5;      // background-context budget inside the extractor
+      // Poison-window quarantine threshold: how many consecutive TRIGGERS may
+      // fail on the SAME window (holding the cursor, retrying next trigger)
+      // before the window is declared un-extractable and SKIPPED. Below this we
+      // hold + retry (recovers transient outages — rate-limit, timeout — with
+      // ZERO data loss). At/above it we skip ONE window so a genuine poison
+      // message can never freeze the whole session forever.
+      const MAX_WINDOW_RETRIES = 3;
 
       // ── Extraction engine selection (Phase 2, gated by config) ──
       // "kb" requires BOTH a host-neutral LLM runner AND a KB-capable store.
@@ -498,6 +505,16 @@ export function createL1Runner(opts: {
       // leaves the cursor exactly where it was.
       let cursorToPersist: number | undefined;
       let hardFailure = false;
+      // Poison-window tolerance: count windows we had to SKIP because their
+      // extraction kept failing across MAX_WINDOW_RETRIES triggers. A single
+      // un-extractable window must NEVER freeze the whole session forever (the
+      // recurring "cursor stuck for weeks" bug).
+      let skippedWindows = 0;
+      // Quarantine bookkeeping to persist at the end: on a transient HOLD these
+      // carry the held cursor + incremented count; otherwise they stay {0,0}
+      // (reset — the window recovered or was quarantined and we moved past it).
+      let stuckCursor = 0;
+      let stuckCount = 0;
       // Phase-5: did at least one "kb" window write successfully? Drives the
       // deterministic projection refresh after the loop (see call site below).
       let kbWriteSucceeded = false;
@@ -582,14 +599,57 @@ export function createL1Runner(opts: {
           }
 
           if (!l1Result.success) {
-            // HARD FAILURE: leave the cursor at the last successful window so the
-            // next trigger re-reads (and retries) this window and everything
-            // after it. Stop paging immediately — order matters for retries.
-            logger.warn(
-              `${TAG} [l1] Extraction FAILED for window [${i}, ${i + windowMsgs.length}) ` +
-              `of session ${sessionKey} — cursor held, will retry on next trigger`,
-            );
+            // ══ IMMUNE SYSTEM: bounded-retry-then-quarantine ══
+            // The extractor already retried this window internally (2 attempts)
+            // before returning failure. We now distinguish TWO cases instead of
+            // blindly freezing OR blindly skipping:
+            //
+            //   TRANSIENT (rate-limit, timeout, brief outage) — recovers on a
+            //     later trigger. We HOLD the cursor here (advance nothing past
+            //     this window) and retry next trigger. ZERO data loss. This is
+            //     the behavior the no-fact-loss regression test guards.
+            //
+            //   POISON (malformed LLM JSON, a message that trips the parser) —
+            //     never recovers. If we held forever it would freeze the whole
+            //     session (the recurring "cursor stuck for weeks" bug). So after
+            //     MAX_WINDOW_RETRIES consecutive triggers fail on the SAME
+            //     window, we QUARANTINE it: advance the cursor PAST it and keep
+            //     paging. We lose ONE window, never months.
+            //
+            // The held cursor uniquely identifies "which window is stuck": it is
+            // the boundary just before this failing window.
+            const heldCursor = cursorToPersist ?? runnerState.last_l1_cursor ?? 0;
+            const priorFailures =
+              runnerState.l1_stuck_cursor === heldCursor ? (runnerState.l1_stuck_count ?? 0) : 0;
+            const failuresNow = priorFailures + 1;
+
+            if (failuresNow >= MAX_WINDOW_RETRIES) {
+              // POISON confirmed — quarantine & skip. `skippedWindows` is
+              // surfaced so a spike in skips is visible, never silent.
+              skippedWindows++;
+              logger.warn(
+                `${TAG} [l1] Extraction FAILED for window [${i}, ${i + windowMsgs.length}) of session ` +
+                `${sessionKey} — QUARANTINED after ${failuresNow} attempts (cursor advances PAST it; ` +
+                `${skippedWindows} skipped this run). A poison window no longer blocks later messages.`,
+              );
+              for (const m of windowMsgs) {
+                if (m.recordedAtMs > (cursorToPersist ?? 0)) cursorToPersist = m.recordedAtMs;
+              }
+              // We moved past the poison window — clear the stuck marker.
+              stuckCursor = 0;
+              stuckCount = 0;
+              continue;
+            }
+
+            // TRANSIENT — HOLD the cursor and retry this window next trigger.
             hardFailure = true;
+            stuckCursor = heldCursor;
+            stuckCount = failuresNow;
+            logger.warn(
+              `${TAG} [l1] Extraction FAILED for window [${i}, ${i + windowMsgs.length}) of session ` +
+              `${sessionKey} — HOLDING cursor at ${heldCursor} (attempt ${failuresNow}/${MAX_WINDOW_RETRIES}); ` +
+              `will retry next trigger. No data lost.`,
+            );
             break;
           }
 
@@ -613,7 +673,10 @@ export function createL1Runner(opts: {
       // Advance the cursor to the max recorded_at of the SUCCESSFULLY-extracted
       // windows only. If even the first window failed, cursorToPersist is
       // undefined and the cursor stays put (full retry next trigger).
-      await checkpoint.markL1ExtractionComplete(sessionKey, totalStored, cursorToPersist, lastSceneName);
+      await checkpoint.markL1ExtractionComplete(sessionKey, totalStored, cursorToPersist, lastSceneName, {
+        cursor: stuckCursor,
+        count: stuckCount,
+      });
       logger.info(
         `${TAG} [l1] L1 complete: extracted=${totalExtracted}, stored=${totalStored} ` +
         `(${groups.length} group(s), cursor=${cursorToPersist ?? "(unchanged)"}${hardFailure ? ", PARTIAL — failure held cursor" : ""})`,

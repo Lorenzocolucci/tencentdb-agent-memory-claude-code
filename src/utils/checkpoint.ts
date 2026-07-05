@@ -49,6 +49,14 @@ export interface RunnerSessionState {
   last_l1_cursor: number;
   /** Last scene name from the most recent L1 extraction (for cross-batch continuity) */
   last_scene_name: string;
+
+  // ═══ L1 — poison-window quarantine (immune system) ═══
+  /** Held cursor at which extraction last FAILED. Identifies the window being retried. */
+  l1_stuck_cursor: number;
+  /** Consecutive triggers that failed at l1_stuck_cursor. After MAX retries the
+   *  window is quarantined (skipped) so one bad window can never freeze the
+   *  session forever — the recurring "cursor stuck for weeks" bug. */
+  l1_stuck_count: number;
 }
 
 /**
@@ -112,6 +120,8 @@ const DEFAULT_RUNNER_STATE: RunnerSessionState = {
   last_captured_timestamp: 0,
   last_l1_cursor: 0,
   last_scene_name: "",
+  l1_stuck_cursor: 0,
+  l1_stuck_count: 0,
 };
 
 const DEFAULT_PIPELINE_STATE: PipelineSessionState = {
@@ -412,6 +422,7 @@ export class CheckpointManager {
     memoriesExtracted: number,
     cursorRecordedAtMs?: number,
     lastSceneName?: string,
+    stuck?: { cursor: number; count: number },
   ): Promise<void> {
     await this.mutate((cp) => {
       const state = this.getRunnerState(cp, sessionKey);
@@ -420,6 +431,13 @@ export class CheckpointManager {
       }
       if (lastSceneName !== undefined) {
         state.last_scene_name = lastSceneName;
+      }
+      // Poison-window quarantine bookkeeping. On a transient HOLD the runner
+      // passes the held cursor + incremented count; on a clean/quarantined run
+      // it passes {0,0} to reset. Always written so a recovered window clears.
+      if (stuck) {
+        state.l1_stuck_cursor = stuck.cursor;
+        state.l1_stuck_count = stuck.count;
       }
       cp.total_memories_extracted += memoriesExtracted;
       cp.memories_since_last_persona += memoriesExtracted;

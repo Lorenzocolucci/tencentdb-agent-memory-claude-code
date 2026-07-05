@@ -650,6 +650,15 @@ export interface IMemoryStore {
   /** Project tag per event id — lets recall down-weight other-project events. */
   getEventProjects?(ids: string[]): Record<string, string>;
   /**
+   * Immune-system heartbeat: sessions whose raw log (L0) is growing but whose
+   * extracted graph (events) is NOT keeping up — i.e. extraction stalled. Used
+   * to surface a health warning at session open so failures are never silent.
+   */
+  getMemoryHealth?(nowMs?: number): {
+    healthy: boolean;
+    stale: Array<{ sessionKey: string; project: string; lagHours: number }>;
+  };
+  /**
    * All relation edges touching an entity (as src OR dst), within its namespace.
    * Powers the entity-page "Related [[entity]]" links.
    */

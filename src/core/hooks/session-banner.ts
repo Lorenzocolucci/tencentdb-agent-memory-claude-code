@@ -21,6 +21,12 @@ export interface SessionBannerInput {
   personaLoaded: boolean;
   sceneCount: number;
   recentEventText?: string;
+  /**
+   * Immune-system warning. When set (extraction stalled for an active project),
+   * it is shown FIRST and LOUD so the failure is never silent — Lorenzo sees
+   * "memory is sick" at session open instead of discovering it days later.
+   */
+  healthWarning?: string;
 }
 
 /**
@@ -38,9 +44,13 @@ export interface SessionBannerInput {
  *   - no recentEventText   → drop "· ultimo: …"
  */
 export function buildSessionBanner(input: SessionBannerInput): string {
-  const { projectName, personaLoaded, sceneCount, recentEventText } = input;
+  const { projectName, personaLoaded, sceneCount, recentEventText, healthWarning } = input;
 
-  const segments: string[] = ["Sul pezzo"];
+  const segments: string[] = [];
+  // LOUD, first: the immune-system warning. If memory is sick, Lorenzo must see
+  // it at the top of the banner, not discover it days later by a manual audit.
+  if (healthWarning) segments.push(`⚠️ ${escapeXmlTags(healthWarning).slice(0, 90)}`);
+  segments.push("Sul pezzo");
 
   if (projectName) {
     const safeProject = escapeXmlTags(projectName).slice(0, 80);

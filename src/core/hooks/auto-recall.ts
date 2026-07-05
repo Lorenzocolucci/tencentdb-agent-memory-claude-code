@@ -451,11 +451,13 @@ async function performAutoRecallInner(params: {
   if (bannerTracker?.pending(bannerKey)) {
     try {
       const recentEventText = resolveRecentEventText(vectorStore, params.sessionKey);
+      const healthWarning = resolveHealthWarning(vectorStore);
       const banner = buildSessionBanner({
         projectName,
         personaLoaded: personaContent !== undefined,
         sceneCount,
         recentEventText,
+        healthWarning,
       });
       dynamicBlocks.push(banner);
       bannerEmitted = true;
@@ -553,6 +555,28 @@ export function resolveRecentEventText(
       if (!latest || e.ts > latest.ts) latest = { ts: e.ts, text: e.text };
     }
     return latest?.text || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The immune-system warning shown in the session-open banner. Returns a short
+ * Italian phrase when a project's extraction has stalled (L0 growing, events
+ * lagging), else undefined (banner stays clean). Best-effort, never throws.
+ */
+export function resolveHealthWarning(vectorStore?: IMemoryStore): string | undefined {
+  const fn = (vectorStore as {
+    getMemoryHealth?: () => { healthy: boolean; stale: Array<{ project: string; lagHours: number }> };
+  })?.getMemoryHealth;
+  if (typeof fn !== "function") return undefined;
+  try {
+    const h = fn.call(vectorStore);
+    if (!h || h.healthy || h.stale.length === 0) return undefined;
+    const top = h.stale[0];
+    const behind = top.lagHours >= 48 ? `${Math.round(top.lagHours / 24)}gg` : `${top.lagHours}h`;
+    const more = h.stale.length > 1 ? ` +${h.stale.length - 1} progetti` : "";
+    return `estrazione ferma: ${top.project} indietro ${behind}${more}`;
   } catch {
     return undefined;
   }
