@@ -1107,6 +1107,26 @@ export class TdaiCore {
     await this.ensureSchedulerStarted();
   }
 
+  /**
+   * Backfill digestion — extract an arbitrary session_key's un-extracted L0
+   * (an imported claude.ai chat or a historical Code session) into the KB graph,
+   * reusing the LIVE extraction path (Moonshot primary + gpt-5.4-mini fallback +
+   * embeddings) on the serial L1 queue so it never races live capture. Idempotent
+   * + resumable (cursor-based). Drives the "digest the old backlog" job without
+   * stopping the gateway. Returns {processedCount} (messages read this pass).
+   */
+  async digestBacklogSession(sessionKey: string): Promise<{ processedCount: number }> {
+    if (!sessionKey) return { processedCount: 0 };
+    await this.storeReady?.catch(() => {});
+    if (!this.scheduler) return { processedCount: 0 };
+    const res = await this.scheduler.digestBacklogSession(sessionKey);
+    const processedCount =
+      res && typeof res === "object" && "processedCount" in res
+        ? (res as { processedCount: number }).processedCount
+        : 0;
+    return { processedCount };
+  }
+
   private ensureSchedulerStarted(): Promise<void> {
     // Fast path: already started (or starting) — every concurrent caller
     // awaits the same in-flight promise.  The promise is kept around as a

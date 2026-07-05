@@ -98,4 +98,26 @@ describe("MemoryPipelineManager — restart recovery", () => {
 
     await mgr.destroy();
   });
+
+  it("digestBacklogSession fully DRAINS an arbitrary session_key with NO state (backfill)", async () => {
+    const mgr = new MemoryPipelineManager(makeConfig());
+    mgr.setPersister(async () => {});
+    const ranFor: string[] = [];
+    // Simulate a 2-window session: first pass reads 50, second reads the tail 30,
+    // third reads nothing (drained). digestBacklogSession must loop until 0.
+    const passes = [50, 30, 0];
+    let i = 0;
+    mgr.setL1Runner(async ({ sessionKey }) => {
+      ranFor.push(sessionKey);
+      return { processedCount: passes[Math.min(i++, passes.length - 1)] };
+    });
+    mgr.start(); // no sessionState for the imported chat — backfill must NOT bail
+
+    const res = await mgr.digestBacklogSession("chatimport_abc123");
+    // Ran repeatedly (drain loop), summed the processed counts, stopped at 0.
+    expect(ranFor.filter((s) => s === "chatimport_abc123").length).toBe(3);
+    expect((res as { processedCount: number }).processedCount).toBe(80);
+
+    await mgr.destroy();
+  });
 });

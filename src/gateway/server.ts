@@ -298,6 +298,8 @@ export class TdaiGateway {
           return await this.handleObserve(req, res);
         case "POST /session/end":
           return await this.handleSessionEnd(req, res);
+        case "POST /digest":
+          return await this.handleDigest(req, res);
         case "POST /seed":
           return await this.handleSeed(req, res);
         default:
@@ -557,6 +559,22 @@ export class TdaiGateway {
 
     const response: SessionEndResponse = { flushed: true };
     sendJson(res, 200, response);
+  }
+
+  /**
+   * POST /digest — backfill: extract ONE session_key's un-extracted L0 into the
+   * KB graph, reusing the live extraction path (primary + fallback + embeddings)
+   * on the serial L1 queue (no concurrent writers). Drives the "digest the old
+   * backlog" job without stopping the gateway. Idempotent + resumable.
+   */
+  private async handleDigest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await parseJsonBody<{ session_key?: string }>(req);
+    if (!body.session_key) {
+      sendError(res, 400, "Missing required field: session_key");
+      return;
+    }
+    const result = await this.core.digestBacklogSession(body.session_key);
+    sendJson(res, 200, { digested: true, processedCount: result.processedCount });
   }
 
   private async handleSeed(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {

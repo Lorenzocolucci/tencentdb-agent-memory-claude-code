@@ -515,6 +515,36 @@ export class MemoryPipelineManager {
   }
 
   /**
+   * Backfill digestion — run L1 extraction for an ARBITRARY session_key that has
+   * un-extracted L0 (an imported claude.ai chat or a historical Code session),
+   * on the SAME serial L1 queue as live extraction so the two NEVER write the DB
+   * concurrently (no corruption, no checkpoint race). The runner reads L0 by
+   * cursor, so this is idempotent + resumable (re-running a fully-digested
+   * session is a cheap no-op). No-op when destroyed or no L1 runner is wired.
+   */
+  async digestBacklogSession(sessionKey: string): Promise<L1RunnerResult | void> {
+    if (this.destroyed || !this.l1Runner) return;
+    const runner = this.l1Runner;
+    // FULLY drain the session: each pass extracts up to ~50 un-extracted L0 msgs
+    // and advances the cursor; loop until a pass reads nothing. Each pass is a
+    // SEPARATE queue task, so live extraction interleaves BETWEEN passes (no
+    // starvation of Lorenzo's live work). The cap is a runaway backstop: a poison
+    // window holds (processedCount>0, no cursor progress) for at most
+    // MAX_WINDOW_RETRIES passes before the quarantine advances past it, so real
+    // sessions always terminate well under the cap.
+    const MAX_PASSES = 400; // 400 × ~50 = 20k msgs — beyond any single session
+    let total = 0;
+    for (let pass = 0; pass < MAX_PASSES; pass++) {
+      if (this.destroyed) break;
+      const res = await this.l1Queue.add(() => runner({ sessionKey, msg: [], bg_msg: [] }));
+      const n = res && typeof res === "object" ? (res.processedCount ?? 0) : 0;
+      total += n;
+      if (n === 0) break; // nothing left to read → fully drained
+    }
+    return { processedCount: total };
+  }
+
+  /**
    * Maximum time (ms) to wait for pipeline flush during destroy.
    * Must be shorter than the gateway_stop hook timeout (3 s) to leave
    * headroom for VectorStore / EmbeddingService cleanup that runs after.
