@@ -51,10 +51,12 @@ const TAG = "[tdai-gateway]";
 const VERSION = "0.1.0";
 
 // ── HTTP server timeouts ──────────────────────────────────
-// A wedged handler must not hold a connection forever. /seed can legitimately
-// run for minutes, so requestTimeout is generous (10 min) rather than 0, while
-// headers/idle are short so half-open or idle sockets are reaped quickly.
-const HTTP_REQUEST_TIMEOUT_MS = 600_000; // 10 min — accommodates long /seed
+// A wedged handler must not hold a connection forever. /seed and /digest can
+// legitimately run for many minutes (backfill fully drains a session's L0 while
+// sharing the serial L1 queue with live work), so requestTimeout is generous
+// (60 min) rather than 0, while headers/idle are short so half-open or idle
+// sockets are reaped quickly.
+const HTTP_REQUEST_TIMEOUT_MS = 3_600_000; // 60 min — accommodates long /seed and /digest backfill
 const HTTP_HEADERS_TIMEOUT_MS = 30_000; // time to receive request headers
 const HTTP_KEEP_ALIVE_TIMEOUT_MS = 60_000; // idle keep-alive socket lifetime
 
