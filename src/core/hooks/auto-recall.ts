@@ -647,6 +647,12 @@ async function runKbRecall(
       maxResults: cfg.recall.maxResults ?? 5,
       rerank: cfg.recall.rerank ?? false,
       embeddingTimeoutMs: recallEmbeddingTimeoutMs,
+      // System 1 (fast, associative): skip the O(N) global vector scan so the
+      // session-open banner returns within the cc RECALL_TIMEOUT. FTS +
+      // entity-match seed the graph and spreading activation (below) carries the
+      // associative recall. The explicit memory-search tool keeps the vector
+      // source for on-demand deep retrieval (System 2).
+      skipVector: true,
       logger,
     });
 

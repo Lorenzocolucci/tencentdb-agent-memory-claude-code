@@ -96,6 +96,16 @@ export interface KbRecallOptions {
   rerank?: boolean;
   /** Per-call embedding timeout override (recall-path). */
   embeddingTimeoutMs?: number;
+  /**
+   * Skip the global vector candidate source (Source B). The kb_vec KNN is a
+   * brute-force O(N) scan (sqlite-vec vec0), so on a large corpus it dominates
+   * recall latency. The auto-recall / session-open path (System 1 — fast,
+   * associative: FTS + entity-match seeds → spreading activation) sets this so
+   * the banner returns within the cc RECALL_TIMEOUT; the explicit memory-search
+   * tool (System 2 — effortful, on-demand) leaves it off and keeps the vector
+   * source. First step of the associative-first recall redesign, NOT a DB patch.
+   */
+  skipVector?: boolean;
   logger?: Logger;
 }
 
@@ -454,6 +464,7 @@ export async function kbRecall(
     maxResults = 5,
     rerank = false,
     embeddingTimeoutMs,
+    skipVector = false,
     logger,
   } = options;
 
@@ -470,9 +481,15 @@ export async function kbRecall(
 
   // ── Parallel candidate recall (order MUST match fuseRrf source indices) ──
   //    0 = FTS, 1 = vector, 2 = entity-name match.
+  //    skipVector (System 1 / auto-recall) drops Source B: the kb_vec KNN is an
+  //    O(N) brute-force scan that dominates latency on a large corpus. FTS +
+  //    entity-match still seed the graph, and the caller's spreading activation
+  //    expands from those seeds — associative recall survives, fast.
   const [ftsCandidates, vectorCandidates, entityCandidates] = await Promise.all([
     Promise.resolve(recallFts(store, cleanQuery, candidateLimit, logger)),
-    recallVector(store, embeddingService, cleanQuery, candidateLimit, embeddingCallOpts, logger),
+    skipVector
+      ? Promise.resolve<RankedCandidate[]>([])
+      : recallVector(store, embeddingService, cleanQuery, candidateLimit, embeddingCallOpts, logger),
     Promise.resolve(recallEntityMatch(store, cleanQuery, namespace, candidateLimit, logger)),
   ]);
 
