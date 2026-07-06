@@ -4,6 +4,10 @@
 
 ---
 
+## 0-bis. ⚠️ VERA ROOT CAUSE DEL BANNER — TROVATA+FIXATA (2026-07-07, `6bb70c8`)
+
+Anche dopo `skipVector`, il banner "sul pezzo" NON arrivava in una sessione nuova. Causa reale (profilata/misurata, non ipotizzata): sul **cornerstone-cache MISS = primo turno di OGNI sessione**, `buildNeighborMap` (`src/core/distinctiveness/cornerstone-runner.ts`) faceva un loop su ~200 candidati, ognuno con una `searchKbVector` (KNN **brute-force SINCRONA** su ~25k vettori kb_vec), **senza mai cedere l'event-loop**. Post-digest (2k→25k vettori) ogni scan è passato da ~40ms a ~0,7–1,9s → 200× = **minuti di event-loop bloccato** → `/health` e il `/recall` del banner in timeout (cc 4s) → banner scartato. `node:sqlite` è **sincrono**: una funzione `async` che gira un loop sincrono blocca tutto lo stesso — "fire-and-forget" non salva. **FIX** = `await setImmediate` dopo OGNI scan (max ~1 scan ~1s in volo) + `eventLimit` 200→50. **Verifica live**: cornerstone build completa (3 cornerstones), **0 timeout** su 230 probe `/health` durante la build (prima: 30+ consecutivi), banner recall **1,5–1,9s <4s**, banner completo ("Sul pezzo"+"Dove eravamo"+relevant-memories) presente. Gemello fixato: usage-clusters O(N²) cappato a 300 (`be5e5b1`). **Lezione durevole**: qualsiasi lavoro pesante (scan vettoriali, O(N²)) su un loop non-yielding affama il turno — il redesign associativo-first deve eliminare gli scan globali, non solo spostarli.
+
 ## 0. Dove siamo (stato reale, verificato)
 
 - **Digest chat claude.ai = COMPLETATO** (17,8h, in autonomia con un guardiano scheduled-task auto-guaritore che si è auto-rimosso a fine). 664/664 sessioni, **624 con eventi** (40 vuote/saluti = 0 corretto), **10.720 eventi chat** nel grafo.
