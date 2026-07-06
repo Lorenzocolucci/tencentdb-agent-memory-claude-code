@@ -91,7 +91,12 @@ export async function buildCornerstones(params: {
 }): Promise<string> {
   const { vectorStore, embeddingService, injectionTracker, opts = {}, logger } = params;
   const namespace = opts.namespace ?? "default";
-  const eventLimit = opts.eventLimit ?? 200;
+  // Each candidate triggers ONE synchronous brute-force kb_vec KNN (~0.7s on a
+  // ~25k-vector corpus post-digest). eventLimit is therefore the dominant cost
+  // driver of this background build: 200 → ~140s of work. 50 keeps a distinctive
+  // pool while bounding the build; the loop below also yields per scan so it
+  // never blocks live recall regardless.
+  const eventLimit = opts.eventLimit ?? 50;
   const topK = opts.topK ?? 3;
   const neighborTopK = opts.neighborTopK ?? 6;
 
@@ -224,7 +229,15 @@ async function buildNeighborMap(
     return result;
   }
 
-  // Query vector store for each candidate's neighbors (searchKbVector is sync).
+  // Query the vector store for each candidate's neighbors. searchKbVector is a
+  // SYNCHRONOUS brute-force KNN over the whole kb_vec index (~25k vectors post-
+  // digest, ~0.7s each). Running the loop unbroken blocks the single-threaded
+  // event loop for its ENTIRE duration (eventLimit × ~0.7s), starving live
+  // recall — the session-open banner and /health then time out and are dropped.
+  // This build is background/best-effort, so we YIELD to the event loop after
+  // each scan: at most ONE search (~1s) is ever in flight when a live request
+  // arrives. A slower wall-clock here is the correct trade for never blocking a
+  // turn (binding principle: memory must never break the conversation).
   for (let i = 0; i < candidates.length; i++) {
     try {
       // ownerKindFilter = "event" to only compare events vs events.
@@ -239,6 +252,8 @@ async function buildNeighborMap(
       // Per-candidate failure → empty neighbors (isolation=1.0 = conservative/neutral).
       result.set(candidates[i].id, []);
     }
+    // Cooperative yield so the event loop can service live recall between scans.
+    await new Promise<void>((resolve) => setImmediate(resolve));
   }
 
   return result;
