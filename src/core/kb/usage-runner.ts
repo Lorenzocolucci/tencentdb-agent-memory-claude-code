@@ -36,6 +36,8 @@ export interface DistillUsageParams {
   /** Recall threshold for candidate clusters (LLM does precision). */
   candidateTau?: number;
   distill?: DistillUsageOptions;
+  /** Optional logger so the pairwise-cap notice is observable in the gateway. */
+  logger?: { warn?(msg: string): void };
 }
 
 export interface UsageRunStats {
@@ -84,6 +86,7 @@ export async function distillUsage(
       embeddings,
       eligibleTypes,
       tau: params.candidateTau ?? USAGE_CANDIDATE_TAU,
+      logger: params.logger,
     });
     stats.candidates = clusters.length;
     if (clusters.length === 0) return stats;

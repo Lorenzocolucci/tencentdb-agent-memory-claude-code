@@ -3743,6 +3743,8 @@ export class VectorStore implements IMemoryStore {
       now: opts.now,
       namespace: opts.namespace,
       maxClusters: opts.maxClusters,
+      // Surface the pairwise-cap notice in the gateway log (never a silent cap).
+      logger: this.logger,
     });
   }
 

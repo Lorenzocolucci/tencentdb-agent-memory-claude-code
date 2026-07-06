@@ -74,6 +74,52 @@ describe("selectUsageClusters (B1 brain)", () => {
     expect(clusters[0].sessionIds).toEqual(["chat-1", "chat-2"]);
   });
 
+  it("BOUND: caps the pairwise working set to the most-recent maxPairwise and announces it", () => {
+    // 5 eligible events; the 2 most-recent (by id = ULID) are a real cross-session
+    // pair, the 3 oldest are unrelated noise. With maxPairwise=3 only evt_003..005
+    // are clustered, so the recent pair still forms — and the cap is not silent.
+    const events = [
+      evt({ id: "evt_001", session_id: "s-1", text: "old noise one" }),
+      evt({ id: "evt_002", session_id: "s-2", text: "old noise two" }),
+      evt({ id: "evt_003", session_id: "s-3", text: "old noise three" }),
+      evt({ id: "evt_004", session_id: "s-4", text: "aspetta la mia risposta" }),
+      evt({ id: "evt_005", session_id: "s-5", text: "non partire finché non rispondo" }),
+    ];
+    const embeddings = new Map<string, Float32Array>([
+      ["evt_001", vec(0, 1)],
+      ["evt_002", vec(1, 0)],
+      ["evt_003", vec(0.2, 0.98)],
+      ["evt_004", vec(1, 0)],
+      ["evt_005", vec(0.99, 0.14)], // cosine ≈ 0.99 with evt_004
+    ]);
+    const warnings: string[] = [];
+    const logger = { warn: (m: string) => warnings.push(m) };
+
+    const clusters = selectUsageClusters(events, { embeddings, maxPairwise: 3, logger });
+
+    // The cap fired: 5 → 3, dropping the 2 oldest.
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("dropped 2");
+    // Clustering still works on the most-recent window (evt_004 + evt_005).
+    expect(clusters).toHaveLength(1);
+    expect(clusters[0].eventIds).toEqual(["evt_004", "evt_005"]);
+  });
+
+  it("BOUND: no cap and no notice when N <= maxPairwise", () => {
+    const events = [
+      evt({ id: "evt_a", session_id: "s-1" }),
+      evt({ id: "evt_b", session_id: "s-2" }),
+    ];
+    const embeddings = new Map([["evt_a", vec(1, 0)], ["evt_b", vec(1, 0)]]);
+    const warnings: string[] = [];
+    selectUsageClusters(events, {
+      embeddings,
+      maxPairwise: 500,
+      logger: { warn: (m: string) => warnings.push(m) },
+    });
+    expect(warnings).toHaveLength(0);
+  });
+
   it("does NOT cluster semantically distant behaviors", () => {
     const events = [
       evt({ id: "evt_a", session_id: "sess-1" }),

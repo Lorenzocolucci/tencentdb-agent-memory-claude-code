@@ -29,6 +29,18 @@ import {
 /** Behavioral/usage event types (NOT bugs, NOT explicit laws). */
 export const DEFAULT_USAGE_ELIGIBLE_TYPES = ["preference_stated", "observation"] as const;
 
+/**
+ * Hard cap on the pairwise-clustering working set. selectUsageClusters is O(N²)
+ * over 1536-dim cosine; on a large corpus (e.g. after the chat digest, when
+ * "observation" events number in the thousands) an unbounded N pegs the
+ * single-threaded Node event loop for MINUTES, starving live recall — the
+ * session-open banner then times out and is dropped. Measured on ARM (Snapdragon
+ * X Elite): N=862 → 1256ms/pass; N=300 → 146ms/pass. 300 most-recent events keep
+ * one pass well under 200ms while still spanning many sessions for cross-session
+ * evidence, so consolidation cost stays CONSTANT (and non-blocking) as memory grows.
+ */
+export const USAGE_MAX_PAIRWISE_EVENTS = 300;
+
 /** A qualifying cross-session cluster of semantically-related behaviors. */
 export interface UsageCluster {
   /** Representative text of the cluster (its "name"): the first event by id. */
@@ -54,6 +66,10 @@ export interface SelectUsageClustersOptions {
   evidenceMin?: number;
   sessionMin?: number;
   tau?: number;
+  /** Cap on the pairwise working set (default USAGE_MAX_PAIRWISE_EVENTS). */
+  maxPairwise?: number;
+  /** Optional sink so a "capped input" notice is never silent (no hard dep on Logger). */
+  logger?: { warn?(msg: string): void };
 }
 
 function deriveProject(events: readonly KbEvent[]): string {
@@ -93,10 +109,23 @@ export function selectUsageClusters(
 
     // Processable = eligible type AND has an embedding. Sorted by id for a
     // deterministic pairwise order and stable cluster output.
-    const processable = events
+    let processable = events
       .filter((e) => eligible.has(e.type) && embeddings.has(e.id))
       .sort((a, b) => a.id.localeCompare(b.id));
     if (processable.length < evidenceMin) return [];
+
+    // Bound the O(N²) pairwise cost. id is a time-sortable ULID, so the tail is
+    // the most-recent; keep only maxPairwise of them. This caps a single pass at
+    // sub-second regardless of corpus size (the event loop is never starved), and
+    // consolidation is incremental so dropped older events were already clustered.
+    const maxPairwise = opts.maxPairwise ?? USAGE_MAX_PAIRWISE_EVENTS;
+    if (processable.length > maxPairwise) {
+      const dropped = processable.length - maxPairwise;
+      processable = processable.slice(-maxPairwise);
+      opts.logger?.warn?.(
+        `[usage-clusters] capped pairwise input: dropped ${dropped} older event(s), kept ${maxPairwise} most-recent (bounds O(N^2), keeps live recall responsive)`,
+      );
+    }
 
     // Semantic graph: union events whose edge weight meets tau.
     const uf = new UnionFind(processable.map((e) => e.id));
