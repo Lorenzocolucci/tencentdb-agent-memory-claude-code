@@ -4,6 +4,21 @@
 
 ---
 
+## 0-quater. 🎥 BANNER STARVATION DIAGNOSTICATO → INCREMENTO C (2026-07-08)
+
+**Il banner "sul pezzo" moriva per EVENT-LOOP STARVATION, e ora sappiamo ESATTAMENTE chi.** Costruita una telecamera diagnostica (`src/core/diagnostics/`) che, quando un `/recall` supera 1500ms, logga il lag dell'event-loop + quale lavoro pesante era in volo. Provata live: colpevole = **`cornerstone-build`** — 50 scansioni KNN **brute-force** su ~25k vettori `kb_vec` = 35-95s sul loop unico; una SINGOLA build degrada ~60s di recall a 5-7s (non è artefatto: recall #1=1,37s precede la build, #2/#3=7s con la build in volo). `lag_max` fino a 2445ms = un singolo scan blocca il loop ~2,4s.
+
+- **Telecamera** — commit `09bfb15`. `inflight-registry.ts` (active + recent-ring, immutable, mai throw) + `event-loop-monitor.ts` (`perf_hooks.monitorEventLoopDelay`) + `slow-recall.ts` (breadcrumb, `SLOW_RECALL_MS=1500`). Marcatori `beginHeavyTask/endHeavyTask` su consolidation/l0-index/cornerstone-build; breadcrumb in `server.ts handleRecall`; monitor al boot. 16 test, suite `src/` 756/756 verde. Evidenza live in `C:/Users/lo/tdai-backups/culprit-captured-*/`.
+- **Gate anti-pile-up** — commit `afefe99`. `tdai-core.ts buildCornerstoneInBackground`: gate GLOBALE (max 1 build in volo). Prima era per-key su sessionId → N sessioni = N build concorrenti. Necessario ma NON sufficiente (una singola build starva comunque).
+
+**DECISIONE (Lorenzo): "vai diretto a C (HNSW) ora"** — scartati sia il fix interim (throttle+cache+off-loop) sia il solo-gate. Il vero fix = eliminare lo scan brute-force alla radice con una struttura navigabile.
+
+**Verdetto ARM64 (ricerca web + test empirici):** Lorenzo è su Windows 11 ARM64 (Snapdragon). Nessuna libreria ANN pronta è un buon fit — hnswlib-node compila da sorgente (toolchain VS ARM64, fragile); usearch win32-arm64 non confermato; **hnswlib-wasm TESTATO = non gira in Node (build browser-only)**. → **C-1 = indice navigabile IN-HOUSE in TS puro** (`src/core/kb/navigable-index.ts`): nostro, bundle tsdown pulito, ARM64-safe, e più Sinapsys (costruiamo noi la struttura small-world). C-2 = embedding locale Ollama `nomic-embed-text` 768 (re-index, dopo). **Piano completo + prossimo passo esatto: `HANDOFF.md` (root).**
+
+**Questo riordina la coda:** C (indice navigabile) viene PRIMA di B2b (edge `co_recalled`) — il banner starvation ha la precedenza. Le sezioni §0-ter/§0-bis/§0 sotto restano valide (A/B1/B2a + root cause banner precedenti).
+
+---
+
 ## 0-ter. ✅ INCREMENTO A — RECALL ASSOCIATIVO-FIRST: COSTRUITO + VERIFICATO LIVE (2026-07-07)
 
 **La situazione è l'indirizzo (principi 1+2 del §3), consegnati sul path banner/System-1.** Il baricentro del recall si è spostato: da "il testo della query semina" a "la SITUAZIONE semina, e l'attivazione si propaga sul grafo".

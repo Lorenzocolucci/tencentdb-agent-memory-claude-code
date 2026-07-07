@@ -21,6 +21,7 @@
 
 ### 🐛 修复
 
+- **Recall 事件循环饥饿（会话开启 banner 掉线根因）诊断 + 缓解**：`🧠 Sul pezzo` banner 偶发不出现，根因是单线程 event loop 被同步 SQLite 工作饿死（`node:sqlite` 同步；被饿死的 loop 会绕过所有 timeout，`Promise.race` 也无法触发）。新增诊断"摄像头"（`src/core/diagnostics/`：`event-loop-monitor` 基于 `perf_hooks.monitorEventLoopDelay`、`inflight-registry` 记录在飞/刚结束的重任务、`slow-recall` breadcrumb），当 `/recall` 超过 1500ms 时在 `handleRecall` 打一行定位日志，把"banner 没出现"从猜测变成确定性归因。现场复现锁定元凶 = `cornerstone-build`（对 ~25k 向量做 50 次暴力 KNN 扫描 = 35-95s 占用 loop；单次构建即可让随后约 60s 的 recall 退化到 5-7s）。同时把 `buildCornerstoneInBackground` 的在飞去重从 per-sessionId 收紧为全局单发（`cornerstoneInFlight.size>0` 直接跳过），消除多会话并发 cornerstone 构建的堆积。根治（消除暴力扫描本身）留给 Increment C（自建可导航索引）。16 个新单测，`src/` 套件 756/756 绿。
 - **Stop hook 反复重写 L0**：之前每次 Stop 都向 `/capture` 全量发送最近 10 个 turn，而 Gateway 端 `originalUserMessageCount` 位置切片与 `afterTimestamp` 游标都缺失（`CaptureRequest` 不携带这两个字段），导致长会话前 N 个 turn 在每次 Stop 时反复写入 L0，污染 FTS5 与向量索引。改为基于 `$CLAUDE_PLUGIN_DATA/cursors/<sessionId>.json` 持久化的 `lastSentIndex` 取增量，首次发送以 50 turn 封顶，cursor 文件 tmp + rename 原子写。
 - **CJK 召回退化**：底层 2-gram 停用词表此前包含 `我们/你们/他们/这个/那个/可以/有没/没有/就是/不是` 等普通双字实义词，"我们的部署方案" 被切成 `[们的, 的部, 部署, 署方, 方案]`、丢失 "我们" 锚点 token，中文查询召回受损。停用词表缩到真正低信息量的疑问/连接片段。
 - **transcript 等待逻辑**：Stop hook 等待 cc 落盘从硬 sleep(800ms) 改为 `waitForTranscriptStable(2s)`：每 100ms 轮询 `stat().size`，连续两次相同字节数即视为 flush 完成；慢盘场景更稳。
