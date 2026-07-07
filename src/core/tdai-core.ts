@@ -979,6 +979,17 @@ export class TdaiCore {
       this.vectorStore = stores.vectorStore;
       this.embeddingService = stores.embeddingService;
       this.logger.debug?.(`${TAG} Stores initialized: backend=${this.cfg.storeBackend}, embedding=${this.cfg.embedding.provider}`);
+      // Incremento C: build the sub-linear kb_vec index in the BACKGROUND. It
+      // replaces the brute-force scan that starved the event loop / dropped the
+      // "sul pezzo" banner. Fire-and-forget (yields internally); recall falls back
+      // to brute force until it is ready. Feature-detected: only the local
+      // sqlite-vec store implements it. Never throws into init.
+      const vs = this.vectorStore as { buildKbNavIndex?: () => Promise<boolean> } | undefined;
+      if (vs && typeof vs.buildKbNavIndex === "function") {
+        void vs.buildKbNavIndex().catch((e) =>
+          this.logger.warn(`${TAG} kb-nav background build failed: ${e instanceof Error ? e.message : String(e)}`),
+        );
+      }
     } catch (err) {
       this.logger.warn(
         `${TAG} Store init failed; recall/dedup degraded: ${err instanceof Error ? err.message : String(err)}`,

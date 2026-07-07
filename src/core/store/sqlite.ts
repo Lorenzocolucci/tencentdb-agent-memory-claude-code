@@ -88,6 +88,7 @@ import {
   queryEventsForEntity as kbQueryEventsForEntity,
   kbChunkId,
 } from "../kb/kb-queries.js";
+import { NavigableIndex } from "../kb/navigable-index.js";
 
 // ============================
 // Types
@@ -481,6 +482,30 @@ export class VectorStore implements IMemoryStore {
   private stmtKbFtsDelete?: StatementSync;
   private stmtKbFtsInsert?: StatementSync;
   private stmtKbFtsSearch?: StatementSync;
+
+  // ── kb_vec navigable index (Incremento C-1b) ──
+  /** Sub-linear KNN over kb_vec; null = not built yet → searchKbVector falls back to brute force. */
+  private kbNavIndex: NavigableIndex | null = null;
+  /** True while buildKbNavIndex is running (index not yet published). */
+  private kbNavBuilding = false;
+  /** Owners upserted DURING a build — reconciled from the DB once the build publishes. */
+  private kbNavDirtyOwners: Set<string> | null = null;
+  /** chunkId → owner, for mapping index hits back to owners. */
+  private kbNavChunkMeta = new Map<string, { ownerId: string; ownerKind: string }>();
+  /** ownerId → its chunkIds currently in the index (for delete-then-insert sync). */
+  private kbNavOwnerChunks = new Map<string, string[]>();
+  /** Cached kb_vec raw-read statements (build-at-boot + reconcile), avoid re-preparing. */
+  private stmtKbVecReadAll?: StatementSync;
+  private stmtKbVecReadOwner?: StatementSync;
+  private stmtKbVecCount?: StatementSync;
+  /** Hold the loop at most this long (ms) between yields while building the index. */
+  private static readonly KB_NAV_BUILD_YIELD_MS = 12;
+  /** Below this many live nodes, don't bother auto-compacting (churn not worth it). */
+  private static readonly KB_NAV_REBUILD_MIN_LIVE = 200;
+  /** Auto-compact (rebuild) once tombstones exceed this fraction of live nodes. */
+  private static readonly KB_NAV_REBUILD_TOMBSTONE_RATIO = 0.5;
+  /** If more than this fraction of kb_vec rows fail to decode, abort the build (stay on brute force). */
+  private static readonly KB_NAV_MAX_DROP_RATIO = 0.01;
 
   /**
    * Create a VectorStore instance.
@@ -3292,6 +3317,14 @@ export class VectorStore implements IMemoryStore {
         `);
         // vec0 KNN cannot reliably filter by a metadata column inside the MATCH
         // query, so owner_kind filtering is applied in JS (see searchKbVector).
+        // Raw-vector reads for the navigable index (build-at-boot + reconcile).
+        this.stmtKbVecReadAll = this.db.prepare(
+          "SELECT chunk_id, owner_id, owner_kind, embedding FROM kb_vec",
+        );
+        this.stmtKbVecReadOwner = this.db.prepare(
+          "SELECT chunk_id, owner_kind, embedding FROM kb_vec WHERE owner_id = ?",
+        );
+        this.stmtKbVecCount = this.db.prepare("SELECT count(*) AS c FROM kb_vec");
         this.kbVecReady = true;
       } catch (err) {
         this.kbVecReady = false;
@@ -3809,6 +3842,24 @@ export class VectorStore implements IMemoryStore {
         try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
         throw err;
       }
+      // Best-effort navigable-index sync — NEVER affects the (committed) DB result.
+      try {
+        if (this.kbNavBuilding && this.kbNavDirtyOwners) {
+          this.kbNavDirtyOwners.add(ownerId); // reconciled when the build publishes
+        } else if (this.kbNavIndex) {
+          const entries = chunkVectors.map((v, i) => ({
+            chunkId: kbChunkId(ownerKind, ownerId, i),
+            ownerKind,
+            vec: v,
+          }));
+          this.navReplaceOwner(ownerId, entries);
+          this.maybeCompactKbNavIndex(); // GC tombstones once they pile up
+        }
+      } catch (e) {
+        this.logger?.warn?.(
+          `${TAG} nav-index sync (upsert) failed (non-fatal) owner=${ownerId}: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
       return true;
     } catch (err) {
       this.logger?.warn(
@@ -3857,6 +3908,14 @@ export class VectorStore implements IMemoryStore {
    */
   searchKbVector(queryEmbedding: Float32Array, topK = 5, ownerKindFilter?: string): KbVectorSearchResult[] {
     if (this.degraded || !this.kbVecReady) return [];
+    // Route through the navigable index when it is built. Fall back to the
+    // brute-force scan on: an error (null), OR an empty approximate result while
+    // the index is non-empty (a pathological ANN/rare-kind miss). Correctness is
+    // never sacrificed for speed — a non-empty index that returns nothing is not trusted.
+    if (this.kbNavIndex) {
+      const viaIndex = this.searchKbVectorViaIndex(queryEmbedding, topK, ownerKindFilter);
+      if (viaIndex && (viaIndex.length > 0 || this.kbNavIndex.size === 0)) return viaIndex;
+    }
     try {
       const retrieveCount = topK * VectorStore.CHUNK_RECALL_FANOUT + VectorStore.ZERO_VEC_BUFFER;
       const rows = this.stmtKbVecSearch!.all(
@@ -3882,6 +3941,265 @@ export class VectorStore implements IMemoryStore {
       );
       return [];
     }
+  }
+
+  /**
+   * kb_vec KNN via the navigable index. Mirrors the brute-force contract:
+   * de-dup to the best chunk per owner, optional ownerKind filter, trim to topK.
+   * Returns null on any failure so the caller falls back to the brute-force scan.
+   */
+  private searchKbVectorViaIndex(
+    queryEmbedding: Float32Array,
+    topK: number,
+    ownerKindFilter?: string,
+  ): KbVectorSearchResult[] | null {
+    const idx = this.kbNavIndex;
+    if (!idx) return null;
+    try {
+      // Over-fetch: chunks de-dup to owners, and a JS kind filter can drop hits.
+      const retrieveCount = ownerKindFilter
+        ? topK * 20 + VectorStore.ZERO_VEC_BUFFER
+        : topK * VectorStore.CHUNK_RECALL_FANOUT + VectorStore.ZERO_VEC_BUFFER;
+      const hits = idx.search(queryEmbedding, retrieveCount);
+      const results: KbVectorSearchResult[] = [];
+      const seenOwners = new Set<string>();
+      for (const h of hits) {
+        const meta = this.kbNavChunkMeta.get(h.id);
+        if (!meta) continue; // metadata lost → skip (defensive)
+        if (ownerKindFilter && meta.ownerKind !== ownerKindFilter) continue;
+        if (seenOwners.has(meta.ownerId)) continue; // best chunk per owner (hits are score-sorted)
+        seenOwners.add(meta.ownerId);
+        results.push({ owner_id: meta.ownerId, owner_kind: meta.ownerKind, score: h.score });
+        if (results.length >= topK) break;
+      }
+      return results;
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} [kb-vec-search-nav] FAILED (non-fatal, brute-force fallback): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    }
+  }
+
+  /** Whether the navigable kb_vec index is built and serving searches. */
+  isKbNavIndexActive(): boolean {
+    return this.kbNavIndex !== null;
+  }
+
+  /** Live node count of the navigable index (-1 if not built). For health/metrics/tests. */
+  getKbNavIndexSize(): number {
+    return this.kbNavIndex ? this.kbNavIndex.size : -1;
+  }
+
+  /** Decode a raw kb_vec embedding cell (BLOB bytes, or vec_to_json string) → Float32Array. */
+  private static vecFromCell(raw: unknown, dim: number): Float32Array | null {
+    if (raw == null) return null;
+    if (raw instanceof Uint8Array) {
+      // sqlite-vec stores float32 little-endian bytes; node:sqlite returns BLOB as Uint8Array.
+      if (raw.byteLength !== dim * 4) return null;
+      const out = new Float32Array(dim);
+      new Uint8Array(out.buffer).set(raw);
+      return out;
+    }
+    if (raw instanceof ArrayBuffer) {
+      if (raw.byteLength !== dim * 4) return null;
+      return new Float32Array(raw.slice(0));
+    }
+    if (typeof raw === "string") {
+      try {
+        const arr = JSON.parse(raw); // vec_to_json fallback shape
+        if (Array.isArray(arr) && arr.length === dim) return Float32Array.from(arr);
+      } catch { /* not JSON */ }
+      return null;
+    }
+    return null;
+  }
+
+  /**
+   * Read every kb_vec chunk vector (raw). Source of truth for the build-at-boot
+   * of the navigable index — reads the ALREADY-embedded vectors (no re-embedding).
+   */
+  getAllKbVectors(): Array<{ chunkId: string; ownerId: string; ownerKind: string; vec: Float32Array }> {
+    if (this.degraded || !this.kbVecReady || !this.stmtKbVecReadAll) return [];
+    try {
+      const rows = this.stmtKbVecReadAll.all() as Array<{
+        chunk_id: string; owner_id: string; owner_kind: string; embedding: unknown;
+      }>;
+      const out: Array<{ chunkId: string; ownerId: string; ownerKind: string; vec: Float32Array }> = [];
+      let dropped = 0;
+      for (const r of rows) {
+        const vec = VectorStore.vecFromCell(r.embedding, this.dimensions);
+        if (!vec) { dropped++; continue; }
+        out.push({ chunkId: r.chunk_id, ownerId: r.owner_id, ownerKind: r.owner_kind, vec });
+      }
+      if (dropped > 0) {
+        this.logger?.warn(
+          `${TAG} getAllKbVectors: ${dropped}/${rows.length} kb_vec rows failed to decode (owners may be missing from the index)`,
+        );
+      }
+      return out;
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} getAllKbVectors failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return [];
+    }
+  }
+
+  /** Live/tombstone counts of the navigable index (null if not built). For health/metrics/tests. */
+  getKbNavIndexStats(): { size: number; tombstones: number } | null {
+    return this.kbNavIndex ? { size: this.kbNavIndex.size, tombstones: this.kbNavIndex.tombstoneCount } : null;
+  }
+
+  /**
+   * Build the navigable kb_vec index in the BACKGROUND, yielding the event loop
+   * every {@link KB_NAV_BUILD_YIELD_MS} ms so it can never starve a recall (the
+   * whole point of Incremento C). Reads a consistent snapshot, builds into a
+   * LOCAL index, publishes atomically, then reconciles any owner written during
+   * the build (closing the write-during-build race). Idempotent; safe to re-run.
+   * Best-effort: on any failure the index stays null and searches use brute force.
+   */
+  async buildKbNavIndex(): Promise<boolean> {
+    if (this.closed || this.degraded || !this.kbVecReady || this.dimensions <= 0) return false;
+    if (this.kbNavBuilding) return false;
+    this.kbNavBuilding = true;
+    this.kbNavDirtyOwners = new Set<string>();
+    let published = false;
+    try {
+      const snapshot = this.getAllKbVectors();
+      // Refuse to publish a lossy index: if a meaningful fraction of rows failed to
+      // decode, those owners would be missing AND unreachable (the index short-circuits
+      // brute force). Staying on brute force is strictly safer than serving a hole.
+      const rawCount = this.kbVecRowCount();
+      if (rawCount > 0 && snapshot.length < rawCount * (1 - VectorStore.KB_NAV_MAX_DROP_RATIO)) {
+        this.logger?.warn(
+          `${TAG} buildKbNavIndex aborted: only ${snapshot.length}/${rawCount} kb_vec rows decoded — staying on brute force`,
+        );
+        return false;
+      }
+      const local = new NavigableIndex(this.dimensions);
+      const chunkMeta = new Map<string, { ownerId: string; ownerKind: string }>();
+      const ownerChunks = new Map<string, string[]>();
+      let lastYield = performance.now();
+      for (const row of snapshot) {
+        local.add(row.chunkId, row.vec);
+        chunkMeta.set(row.chunkId, { ownerId: row.ownerId, ownerKind: row.ownerKind });
+        const list = ownerChunks.get(row.ownerId);
+        if (list) list.push(row.chunkId);
+        else ownerChunks.set(row.ownerId, [row.chunkId]);
+        if (performance.now() - lastYield > VectorStore.KB_NAV_BUILD_YIELD_MS) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          if (this.closed) return false; // store closed mid-build → abort, stay on brute force
+          lastYield = performance.now();
+        }
+      }
+      if (this.closed) return false;
+      // Publish atomically (a search that starts now uses the fully-built index).
+      this.kbNavChunkMeta = chunkMeta;
+      this.kbNavOwnerChunks = ownerChunks;
+      this.kbNavIndex = local;
+      published = true;
+      // Reconcile owners written while we were building (their snapshot vec is stale).
+      const dirty = this.kbNavDirtyOwners;
+      this.kbNavDirtyOwners = null; // from here, writes sync into the live index directly
+      for (const ownerId of dirty) {
+        if (this.closed) break;
+        this.resyncOwnerFromDb(ownerId);
+      }
+      this.logger?.info(
+        `${TAG} kb-nav index built: ${local.size} live nodes from ${snapshot.length} chunks` +
+          (dirty.size ? ` (reconciled ${dirty.size} owner(s) written during build)` : ""),
+      );
+      return true;
+    } catch (err) {
+      if (!published) this.kbNavIndex = null; // a PUBLISHED index survives a late throw; only drop a partial build
+      this.logger?.warn(
+        `${TAG} buildKbNavIndex failed (non-fatal, brute-force fallback): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return published;
+    } finally {
+      this.kbNavBuilding = false;
+      this.kbNavDirtyOwners = null;
+    }
+  }
+
+  /** Total kb_vec chunk-row count (0 on any error). Used to detect a lossy build snapshot. */
+  private kbVecRowCount(): number {
+    try {
+      const r = this.stmtKbVecCount?.get() as { c: number } | undefined;
+      return r?.c ?? 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Fire a background compacting rebuild if tombstones have piled up past the
+   * threshold — the ONLY GC for the tombstone-based delete (a long-running gateway
+   * would otherwise creep back toward the very starvation this index removes).
+   * Fire-and-forget, guarded by kbNavBuilding so it never overlaps.
+   */
+  private maybeCompactKbNavIndex(): void {
+    const idx = this.kbNavIndex;
+    if (!idx || this.kbNavBuilding || this.closed) return;
+    if (idx.size < VectorStore.KB_NAV_REBUILD_MIN_LIVE) return;
+    if (idx.tombstoneCount <= idx.size * VectorStore.KB_NAV_REBUILD_TOMBSTONE_RATIO) return;
+    // Defer off this write's tick: buildKbNavIndex's synchronous prefix (a full
+    // getAllKbVectors scan) must not block the upsert that triggered it.
+    setImmediate(() => {
+      if (this.closed || this.kbNavBuilding) return;
+      void this.buildKbNavIndex().catch((e) =>
+        this.logger?.warn?.(`${TAG} kb-nav compacting rebuild failed: ${e instanceof Error ? e.message : String(e)}`),
+      );
+    });
+  }
+
+  /** Re-apply an owner's CURRENT kb_vec state to the index (used to reconcile dirty owners). */
+  private resyncOwnerFromDb(ownerId: string): void {
+    if (!this.kbNavIndex) return;
+    try {
+      const rows = (this.stmtKbVecReadOwner?.all(ownerId) ?? []) as Array<{
+        chunk_id: string; owner_kind: string; embedding: unknown;
+      }>;
+      const entries: Array<{ chunkId: string; ownerKind: string; vec: Float32Array }> = [];
+      for (const r of rows) {
+        const vec = VectorStore.vecFromCell(r.embedding, this.dimensions);
+        if (vec) entries.push({ chunkId: r.chunk_id, ownerKind: r.owner_kind, vec });
+      }
+      this.navReplaceOwner(ownerId, entries);
+    } catch (err) {
+      this.logger?.warn?.(
+        `${TAG} resyncOwnerFromDb ${ownerId} failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /** Remove an owner's chunks from the index, then add the given ones (delete-then-insert). */
+  private navReplaceOwner(
+    ownerId: string,
+    entries: Array<{ chunkId: string; ownerKind: string; vec: Float32Array }>,
+  ): void {
+    if (!this.kbNavIndex) return;
+    this.navRemoveOwner(ownerId);
+    const ids: string[] = [];
+    for (const e of entries) {
+      this.kbNavIndex.add(e.chunkId, e.vec);
+      this.kbNavChunkMeta.set(e.chunkId, { ownerId, ownerKind: e.ownerKind });
+      ids.push(e.chunkId);
+    }
+    if (ids.length) this.kbNavOwnerChunks.set(ownerId, ids);
+  }
+
+  /** Remove all of an owner's chunks from the index (tombstone) + its metadata. */
+  private navRemoveOwner(ownerId: string): void {
+    if (!this.kbNavIndex) return;
+    const ids = this.kbNavOwnerChunks.get(ownerId);
+    if (!ids) return;
+    for (const cid of ids) {
+      this.kbNavIndex.remove(cid);
+      this.kbNavChunkMeta.delete(cid);
+    }
+    this.kbNavOwnerChunks.delete(ownerId);
   }
 
   /** kb_fts keyword search. Mirrors searchL1Fts (BM25 → 0–1 score). */
@@ -3935,6 +4253,9 @@ export class VectorStore implements IMemoryStore {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    // Drop the index so any in-flight reconcile/build short-circuits at its guards.
+    this.kbNavIndex = null;
+    this.kbNavDirtyOwners = null;
     try {
       this.db.close();
     } catch (err) {

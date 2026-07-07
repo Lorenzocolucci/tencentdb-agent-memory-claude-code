@@ -196,6 +196,11 @@ export class NavigableIndex {
     return this.liveCount;
   }
 
+  /** Number of tombstoned (removed-but-retained-as-waypoint) nodes. Grows until a rebuild GCs them. */
+  get tombstoneCount(): number {
+    return this.nodes.length - this.liveCount;
+  }
+
   /** Whether an id currently resolves to a live node. */
   has(id: string): boolean {
     return this.idToIdx.has(id);

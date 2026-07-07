@@ -354,6 +354,18 @@ describe("NavigableIndex — score stays within the cosine range", () => {
 });
 
 describe("NavigableIndex — integer top-k", () => {
+  it("tracks tombstoneCount and clears it only on a fresh index", () => {
+    const idx = new NavigableIndex(3, { seed: 1 });
+    idx.add("a", f32([1, 0, 0]));
+    idx.add("b", f32([0, 1, 0]));
+    expect(idx.tombstoneCount).toBe(0);
+    idx.add("a", f32([0, 0, 1])); // upsert → tombstones the old "a"
+    expect(idx.tombstoneCount).toBe(1);
+    idx.remove("b"); // tombstone
+    expect(idx.tombstoneCount).toBe(2);
+    expect(idx.size).toBe(1);
+  });
+
   it("floors a fractional k", () => {
     const idx = new NavigableIndex(3, { seed: 1 });
     idx.add("a", f32([1, 0, 0]));
