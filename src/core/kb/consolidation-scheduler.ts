@@ -15,6 +15,7 @@
  */
 
 import type { ConsolidationStats } from "./consolidation-runner.js";
+import { beginHeavyTask, endHeavyTask } from "../diagnostics/inflight-registry.js";
 
 /** Parameters one consolidation pass needs (mirrors RunConsolidationParams). */
 export interface ConsolidateSessionParams {
@@ -70,7 +71,12 @@ export function scheduleConsolidation(opts: ScheduleConsolidationOptions): Promi
 
   const task = new Promise<void>((resolve) => {
     // Macrotask: let the caller's response flush before the synchronous sweep.
+    // NB: setImmediate defers WHEN the sweep runs, not the fact that its
+    // synchronous SQLite loop blocks the single event loop while it runs — a
+    // concurrent /recall is starved for its whole duration. The heavy-task
+    // marker lets a slow recall attribute the stall to "consolidation".
     setImmediate(() => {
+      const diagToken = beginHeavyTask("consolidation");
       try {
         const stats = store.consolidateSession!({ sessionKey, now, staleAfterMs });
         opts.logger?.debug?.(
@@ -82,6 +88,7 @@ export function scheduleConsolidation(opts: ScheduleConsolidationOptions): Promi
           `${TAG} pass failed for session=${sessionKey}: ${err instanceof Error ? err.message : String(err)}`,
         );
       } finally {
+        endHeavyTask(diagToken);
         resolve();
       }
     });

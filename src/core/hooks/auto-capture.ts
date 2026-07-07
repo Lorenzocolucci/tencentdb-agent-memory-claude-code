@@ -19,6 +19,7 @@ import type { ConversationMessage } from "../conversation/l0-recorder.js";
 import type { IMemoryStore, L0Record } from "../store/types.js";
 import type { EmbeddingService } from "../store/embedding.js";
 import { captureLawFromUserTurn, type LawHookStore } from "../kb/behavioral-law-capture.js";
+import { beginHeavyTask, endHeavyTask } from "../diagnostics/inflight-registry.js";
 
 const TAG = "[memory-tdai] [capture]";
 
@@ -204,6 +205,10 @@ export async function performAutoCapture(params: {
       `(mode=${supportsBgEmbed ? "async-bg" : "sync"})`,
     );
 
+    // Heavy-task marker: the synchronous upsertL0 loop (SQLite transactions) is
+    // a prime event-loop starver on the capture path — a concurrent /recall runs
+    // slow while it churns. A slow recall then attributes the stall to "l0-index".
+    const l0DiagToken = beginHeavyTask("l0-index");
     for (let i = 0; i < filteredMessages.length; i++) {
       const msg = filteredMessages[i];
       try {
@@ -263,6 +268,7 @@ export async function performAutoCapture(params: {
         logger?.warn?.(`${TAG} [L0-vec-index] FAILED for message ${i} (non-blocking): ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+    endHeavyTask(l0DiagToken);
 
     const modeLabel = supportsBgEmbed ? "metadata-only, embed=background" : `embed=${l0EmbedTotalMs.toFixed(0)}ms, upsert=${l0UpsertTotalMs.toFixed(0)}ms`;
     logger?.debug?.(`${TAG} [L0-vec-index] DONE: ${l0VectorsWritten}/${filteredMessages.length} records written (${modeLabel})`);

@@ -46,6 +46,8 @@ import type { Logger } from "../core/types.js";
 import { validateAndNormalizeRaw, fillTimestamps, SeedValidationError } from "../core/seed/input.js";
 import { executeSeed } from "../core/seed/seed-runtime.js";
 import type { SeedProgress } from "../core/seed/types.js";
+import { startEventLoopMonitor, resetEventLoopLag } from "../core/diagnostics/event-loop-monitor.js";
+import { isSlowRecall, composeSlowRecallBreadcrumb } from "../core/diagnostics/slow-recall.js";
 
 const TAG = "[tdai-gateway]";
 const VERSION = "0.1.0";
@@ -206,6 +208,12 @@ export class TdaiGateway {
    * Start the Gateway HTTP server.
    */
   async start(): Promise<void> {
+    // Diagnostics: start the passive event-loop lag monitor as EARLY as possible
+    // so it captures boot-time stalls (resumeExtraction, first cornerstone build)
+    // as well as live starvation. Paired with the in-flight registry, a slow
+    // recall then names its own culprit instead of being guessed at.
+    startEventLoopMonitor();
+
     // Initialize data directories
     initDataDirectories(this.config.data.baseDir);
 
@@ -434,6 +442,17 @@ export class TdaiGateway {
     const startMs = Date.now();
     const result = await this.core.handleBeforeRecall(body.query, body.session_key, body.project, body.session_id);
     const elapsed = Date.now() - startMs;
+
+    // Diagnostics breadcrumb: a slow recall means the single event loop was
+    // starved (node:sqlite is synchronous). Log WHO was hogging it — the
+    // in-flight / just-finished heavy task + the event-loop lag — so the next
+    // natural occurrence is attributed deterministically instead of guessed.
+    // Reset the lag window after reading so the next incident measures a fresh
+    // stall.
+    if (isSlowRecall(elapsed)) {
+      this.logger.warn(`${TAG} ${composeSlowRecallBreadcrumb(elapsed)}`);
+      resetEventLoopLag();
+    }
 
     // Deliver BOTH the stable context (persona/scene/guide) AND the dynamic
     // situation-relevant memories. Returning only appendSystemContext silently

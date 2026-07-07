@@ -32,6 +32,7 @@ import {
 } from "./cornerstone-injection.js";
 import { DEFAULT_WEIGHTS } from "./distinctiveness-scorer.js";
 import { PROTECTED_MIN_SALIENCE } from "../kb/lifecycle-decay.js";
+import { beginHeavyTask, endHeavyTask } from "../diagnostics/inflight-registry.js";
 
 const TAG = "[memory-tdai] [cornerstones]";
 
@@ -100,6 +101,10 @@ export async function buildCornerstones(params: {
   const topK = opts.topK ?? 3;
   const neighborTopK = opts.neighborTopK ?? 6;
 
+  // Heavy-task marker: the neighbor scan yields per-scan (6bb70c8), but this
+  // background build runs on the FIRST turn of each session — exactly when the
+  // banner fires. Marking it lets a slow recall still see it if it contributes.
+  const diagToken = beginHeavyTask("cornerstone-build");
   try {
     if (!vectorStore.listRecentEvents) {
       logger?.debug?.(`${TAG} listRecentEvents not available — skipping cornerstones`);
@@ -182,6 +187,8 @@ export async function buildCornerstones(params: {
     // Off the critical path — log and return empty rather than propagating.
     logger?.warn?.(`${TAG} Cornerstone computation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
     return "";
+  } finally {
+    endHeavyTask(diagToken);
   }
 }
 
