@@ -14,7 +14,11 @@
 - **VERIFICA LIVE** (gateway restart PID 51772, session Sofia `3e78aebfa57691fb`): `[kb] situation-seeded associative: seeds=24`; `[kb-recall] … vec=0` (config live È `source=kb`); recall a **regime = 225ms**; **14 `↳ [fact·associato]`** iniettati nel contesto (ricordi non-nominati, venuti per associazione).
 - **⚠️ Nota onesta:** spike transitori 3–5s SOLO durante la **cornerstone build one-time post-restart** (event-loop `node:sqlite` sincrono blocca i recall concorrenti — PRE-ESISTENTE, non causato da A). È il bersaglio degli incrementi successivi.
 
-**PROSSIMO — B** (due marce: quality-gate che escala a System 2 "a sforzo" quando S1 è magro + rinforzo Hebbian ad ogni richiamo confermato), poi **C** (embedding locale Ollama 768 + indice navigabile HNSW → O(log N) anche su System 2, latenza embedding remoto azzerata, e via anche la contesa cornerstone spostando il lavoro pesante fuori dall'event-loop sincrono).
+**✅ B1 — LE DUE MARCE: SHIPPED (`b1223d5`, pushato, verificato live).** `src/core/kb/recall-confidence.ts` (`assessRecallConfidence`, conservativo: magro se <3 risultati OR nessuno ≥0.4) + gate in `runKbRecall`: se la passata associativa veloce è magra → passata PIÙ PROFONDA (`hops=3`, `maxNodes=16`), sempre O(vicinato). Gated → gira solo quando serve. 6+2 test, regressione 494. Live: recall ricco 174ms, gate silente sul comune, `vec=0`.
+
+**✅ B2a — RINFORZO HEBBIAN (lifecycle): SHIPPED (`5a33488`, pushato, verificato sul DB live).** `reinforceRecalledOwners()` in sqlite.ts (wrappa `reinforce()`) + wiring che rinforza i top-3 ricordi associativi emersi (bounded, best-effort). 3 test, regressione 551. Prova live: `memory_lifecycle` `sum_rc` 9799→9808, 3 fact `rc 0→3` promossi `tier=long`.
+
+**PROSSIMO — B2b** (edge-wiring `co_recalled`: archi espliciti seme→ricordo, `upsertRelation` fa support++ → alimenta `associativeExpand`; nodi da domare: attribuzione del path + crescita non limitata degli archi), poi **C** (embedding locale Ollama 768 + indice navigabile HNSW → O(log N) anche su System 2, latenza embedding remoto azzerata, e via anche la contesa cornerstone spostando il lavoro pesante fuori dall'event-loop sincrono).
 
 ---
 
