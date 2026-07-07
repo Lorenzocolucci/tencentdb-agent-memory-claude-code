@@ -22,6 +22,8 @@ import type { EmbeddingService, EmbeddingCallOptions } from "../store/embedding.
 import { sanitizeText, escapeXmlTags } from "../../utils/sanitize.js";
 import { redactSecrets } from "../../utils/redact-secrets.js";
 import { kbRecall, type KbRecallResult } from "../kb/retrieval.js";
+import { buildSituationSeeds } from "../kb/situation-cue.js";
+import type { SessionSituation } from "./session-situation.js";
 import { loadPrinciples, formatPrinciplesBlock } from "./principles.js";
 import { buildSessionBanner, type SessionBannerTracker } from "./session-banner.js";
 import { latestRecapBlock } from "../continuity/recap-retrieval.js";
@@ -253,7 +255,10 @@ async function performAutoRecallInner(params: {
         // ── Phase-4 entity-centric KB recall path (recall.source = "kb") ──
         // Score injected here is the CALIBRATED 0-1 relevance (never raw RRF).
         const tKb = performance.now();
-        const kbResults = await runKbRecall(userText, cfg, logger, vectorStore, embeddingService, projectName);
+        const kbResults = await runKbRecall(userText, cfg, logger, vectorStore, embeddingService, projectName, {
+          sessionKey: params.sessionKey,
+          namespace: "default",
+        });
         return {
           lines: kbResults.map((r) => formatKbRecallLine(r)),
           strategy: "kb",
@@ -625,13 +630,19 @@ export function applyProjectScope(
  * tolerant: any failure degrades to [] so the recall path never blocks the turn
  * (mirrors searchMemories' try/catch contract).
  */
-async function runKbRecall(
+export async function runKbRecall(
   userText: string,
   cfg: MemoryTdaiConfig,
   logger: Logger | undefined,
   vectorStore?: IMemoryStore,
   embeddingService?: EmbeddingService,
   projectName?: string,
+  /**
+   * Situation context (associative-first, Incremento A): lets the recall be seeded
+   * by WHERE WE ARE (recent events + fingerprint + recent files), not only by the
+   * query text. Optional — when absent, only the query-cue path runs (old behavior).
+   */
+  sit?: { sessionKey: string; namespace: string; situation?: SessionSituation },
 ): Promise<KbRecallResult[]> {
   if (!vectorStore) {
     logger?.debug?.(`${TAG} [kb] vectorStore unavailable — KB recall skipped`);
@@ -692,10 +703,11 @@ async function runKbRecall(
       }
     }
 
-    // The beating heart — ASSOCIATIVE recall (spreading activation). From the entities
-    // the query activated (fact seeds), let activation spread over the graph so
-    // connected-but-unmatched memories COME to the agent. Purely additive, best-effort,
-    // off the critical path: any failure leaves `visible` exactly as the query produced.
+    // ── The beating heart — ASSOCIATIVE recall (spreading activation) ─────────
+    // Reconstruction, not lookup: from a set of seed entities, activation spreads
+    // over the graph so connected-but-unmatched memories COME to the agent. Purely
+    // additive, best-effort, off the critical path: any failure leaves `visible`
+    // as it was. NO global vector scan, NO embedding — O(neighborhood).
     const expand = (vectorStore as {
       associativeExpand?: (seeds: string[], opts?: { maxNodes?: number }) => Array<{
         owner_id: string; owner_kind: "fact" | "event"; text: string; entity_id: string; activation: number;
@@ -703,12 +715,11 @@ async function runKbRecall(
     }).associativeExpand;
     if (typeof expand === "function") {
       const seenKeys = new Set(visible.map((r) => `${r.owner_kind}:${r.owner_id}`));
-      const seedEntityIds = [...new Set(visible.map((r) => r.entity_id).filter((x): x is string => !!x))];
-      if (seedEntityIds.length > 0) {
-        const associated = expand.call(vectorStore, seedEntityIds, { maxNodes: 6 });
-        for (const a of associated) {
+      const addAssociated = (seeds: string[], maxNodes: number): void => {
+        if (seeds.length === 0) return;
+        for (const a of expand.call(vectorStore, seeds, { maxNodes })) {
           const key = `${a.owner_kind}:${a.owner_id}`;
-          if (seenKeys.has(key)) continue; // already query-matched — don't duplicate
+          if (seenKeys.has(key)) continue; // already present — don't duplicate
           seenKeys.add(key);
           visible = visible.concat({
             owner_id: a.owner_id,
@@ -719,7 +730,31 @@ async function runKbRecall(
             associative: true,
           });
         }
+      };
+
+      // PRIMARY — the SITUATION is the address (associative-first redesign, Incremento A).
+      // Seeds come from WHERE WE ARE (recent events + context fingerprint + recent
+      // files), NOT from the query text — so the session-open recall is rich even when
+      // the user's first message ("Ciao Socio, dove eravamo?") names nothing.
+      if (sit?.sessionKey) {
+        const seeds = buildSituationSeeds(vectorStore, {
+          sessionKey: sit.sessionKey,
+          namespace: sit.namespace,
+          situation: sit.situation,
+          logger,
+        });
+        if (seeds.length > 0) {
+          addAssociated(seeds.map((s) => s.id), 8);
+          logger?.debug?.(`${TAG} [kb] situation-seeded associative: seeds=${seeds.length}`);
+        }
       }
+
+      // SECONDARY — expand from the query-matched entities too (cue-da-testo). When the
+      // user's text IS meaningful (mid-conversation) it still drives recall.
+      const querySeeds = [
+        ...new Set(visible.filter((r) => !r.associative).map((r) => r.entity_id).filter((x): x is string => !!x)),
+      ];
+      addAssociated(querySeeds, 6);
     }
 
     return visible;

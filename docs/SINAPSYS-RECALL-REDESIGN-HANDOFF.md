@@ -4,6 +4,20 @@
 
 ---
 
+## 0-ter. ✅ INCREMENTO A — RECALL ASSOCIATIVO-FIRST: COSTRUITO + VERIFICATO LIVE (2026-07-07)
+
+**La situazione è l'indirizzo (principi 1+2 del §3), consegnati sul path banner/System-1.** Il baricentro del recall si è spostato: da "il testo della query semina" a "la SITUAZIONE semina, e l'attivazione si propaga sul grafo".
+
+- **Nuovo `src/core/kb/situation-cue.ts`** — `buildSituationSeeds(store, ctx)`: raccoglie entity-id-semi PESATI da (a) K eventi recenti per ts sotto il session_key ("dove eravamo" + lavoro recente), (b) owner dei Context Fingerprint, (c) file recenti. Puro, immutabile, best-effort, **mai throw** (cap 24 semi). Fondato su misura live: i `session_recap` NON portano entità → i semi "dove eravamo" nascono dagli EVENTI.
+- **Wiring in `runKbRecall`** (`src/core/hooks/auto-recall.ts`, ora `export` + param `sit`): blocco associativo **PRIMARIO** seminato dalla situazione (`associativeExpand`, `maxNodes:8`) + **SECONDARIO** dai match-query (`maxNodes:6`). Nessun motore nuovo — riusa spreading-activation. Zero scansione globale, zero embedding sul path veloce.
+- **Test:** 4/4 unit (`situation-cue.test.ts`) + 2/2 integration (`auto-recall-situation-seed.test.ts`, prova NON circolare: saluto che non nomina nulla → ricordo emerge, `searchKbVector` 0 chiamate). Regressione 486/486, 0 errori tipo, build tsdown pulito.
+- **VERIFICA LIVE** (gateway restart PID 51772, session Sofia `3e78aebfa57691fb`): `[kb] situation-seeded associative: seeds=24`; `[kb-recall] … vec=0` (config live È `source=kb`); recall a **regime = 225ms**; **14 `↳ [fact·associato]`** iniettati nel contesto (ricordi non-nominati, venuti per associazione).
+- **⚠️ Nota onesta:** spike transitori 3–5s SOLO durante la **cornerstone build one-time post-restart** (event-loop `node:sqlite` sincrono blocca i recall concorrenti — PRE-ESISTENTE, non causato da A). È il bersaglio degli incrementi successivi.
+
+**PROSSIMO — B** (due marce: quality-gate che escala a System 2 "a sforzo" quando S1 è magro + rinforzo Hebbian ad ogni richiamo confermato), poi **C** (embedding locale Ollama 768 + indice navigabile HNSW → O(log N) anche su System 2, latenza embedding remoto azzerata, e via anche la contesa cornerstone spostando il lavoro pesante fuori dall'event-loop sincrono).
+
+---
+
 ## 0-bis. ⚠️ VERA ROOT CAUSE DEL BANNER — TROVATA+FIXATA (2026-07-07, `6bb70c8`)
 
 Anche dopo `skipVector`, il banner "sul pezzo" NON arrivava in una sessione nuova. Causa reale (profilata/misurata, non ipotizzata): sul **cornerstone-cache MISS = primo turno di OGNI sessione**, `buildNeighborMap` (`src/core/distinctiveness/cornerstone-runner.ts`) faceva un loop su ~200 candidati, ognuno con una `searchKbVector` (KNN **brute-force SINCRONA** su ~25k vettori kb_vec), **senza mai cedere l'event-loop**. Post-digest (2k→25k vettori) ogni scan è passato da ~40ms a ~0,7–1,9s → 200× = **minuti di event-loop bloccato** → `/health` e il `/recall` del banner in timeout (cc 4s) → banner scartato. `node:sqlite` è **sincrono**: una funzione `async` che gira un loop sincrono blocca tutto lo stesso — "fire-and-forget" non salva. **FIX** = `await setImmediate` dopo OGNI scan (max ~1 scan ~1s in volo) + `eventLimit` 200→50. **Verifica live**: cornerstone build completa (3 cornerstones), **0 timeout** su 230 probe `/health` durante la build (prima: 30+ consecutivi), banner recall **1,5–1,9s <4s**, banner completo ("Sul pezzo"+"Dove eravamo"+relevant-memories) presente. Gemello fixato: usage-clusters O(N²) cappato a 300 (`be5e5b1`). **Lezione durevole**: qualsiasi lavoro pesante (scan vettoriali, O(N²)) su un loop non-yielding affama il turno — il redesign associativo-first deve eliminare gli scan globali, non solo spostarli.
