@@ -63,7 +63,7 @@ import { phaseFor as lessonPhaseFor } from "../kb/lesson-reinforcement.js";
 import { distillLessons as kbDistillLessons } from "../kb/lessons-runner.js";
 import { distillUsage as kbDistillUsage } from "../kb/usage-runner.js";
 import { createKbVecEmbeddingReader } from "../kb/bug-embeddings.js";
-import { ensureLifecycle, confirmProvenance, rejectProvenance, markGatePending, getLifecycle, stampSalience as kbStampSalience } from "../kb/lifecycle-writer.js";
+import { ensureLifecycle, confirmProvenance, rejectProvenance, markGatePending, getLifecycle, stampSalience as kbStampSalience, reinforce as kbReinforce } from "../kb/lifecycle-writer.js";
 import { serializeProvenance, parseProvenance, gateStateOf, type ProvenanceStamp } from "../kb/provenance.js";
 import { classifyStakes, shouldGate } from "../kb/stakes.js";
 import { spreadActivation, isNoiseAttribute, type WeightedNeighbor } from "../kb/spreading-activation.js";
@@ -2459,6 +2459,35 @@ export class VectorStore implements IMemoryStore {
       );
       return [];
     }
+  }
+
+  /**
+   * Hebbian reinforcement (Incremento B2a) — "ogni richiamo rinforza" (CMA:
+   * every access reinforces). Bumps each surfaced owner's lifecycle reinforcement
+   * (count → permanence → long-term promotion) so memories that keep being
+   * recalled resist staleness decay and consolidate. Bounded by the caller (top-K)
+   * and best-effort here: a per-owner failure is swallowed so reinforcement NEVER
+   * breaks the recall it rides on. Returns how many owners were reinforced.
+   */
+  reinforceRecalledOwners(
+    owners: Array<{ owner_id: string; owner_kind: "fact" | "event" }>,
+    now: string,
+  ): number {
+    if (this.degraded || !this.kbReady) return 0;
+    let reinforced = 0;
+    for (const o of owners ?? []) {
+      if (!o?.owner_id) continue;
+      try {
+        kbReinforce(this.db, { ownerId: o.owner_id, ownerKind: o.owner_kind, now });
+        reinforced++;
+      } catch (err) {
+        this.logger?.warn?.(
+          `[memory-tdai][hebbian] reinforce failed for ${o.owner_kind} ${o.owner_id} ` +
+            `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    return reinforced;
   }
 
   /**

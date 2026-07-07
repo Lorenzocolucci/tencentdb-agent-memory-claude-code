@@ -774,6 +774,30 @@ export async function runKbRecall(
       }
     }
 
+    // ── B2a — HEBBIAN reinforcement: every recall strengthens what it surfaced ──
+    // The associatively-surfaced memories (they CAME via spreading activation) are
+    // the "un ricordo tira l'altro" hits — reinforce the strongest few so they
+    // resist staleness decay and consolidate (CMA "every access reinforces").
+    // Bounded (top-3) + best-effort: a small synchronous write (NOT the heavy,
+    // turn-starving kind — cf. the cornerstone-scan lesson) that never throws; the
+    // recall result is already built, so a reinforcement failure can't change it.
+    const reinforceOwners = (vectorStore as {
+      reinforceRecalledOwners?: (owners: Array<{ owner_id: string; owner_kind: "fact" | "event" }>, now: string) => number;
+    }).reinforceRecalledOwners;
+    if (typeof reinforceOwners === "function") {
+      try {
+        const topAssoc = visible
+          .filter((r) => r.associative && (r.owner_kind === "fact" || r.owner_kind === "event"))
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 3) // bounded: only the strongest few, to avoid over-reinforcement
+          .map((r) => ({ owner_id: r.owner_id, owner_kind: r.owner_kind as "fact" | "event" }));
+        if (topAssoc.length > 0) {
+          const n = reinforceOwners.call(vectorStore, topAssoc, new Date().toISOString());
+          logger?.debug?.(`${TAG} [kb] hebbian reinforced ${n} associative memory(ies)`);
+        }
+      } catch { /* best-effort: reinforcement never breaks recall */ }
+    }
+
     return visible;
   } catch (err) {
     logger?.warn?.(`${TAG} [kb] KB recall failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
