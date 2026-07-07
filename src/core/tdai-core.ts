@@ -376,11 +376,20 @@ export class TdaiCore {
    * commit it to the per-session cache, so the NEXT turn injects it. Fire-and-forget:
    * the corpus embed (~5s on a cold/contended connection) must never delay — let
    * alone drop — the session-open injection. All errors are swallowed (memory must
-   * never break a turn). The in-flight guard dedupes concurrent first-turn requests.
+   * never break a turn). The in-flight guard dedupes concurrent first-turn
+   * requests, and a GLOBAL one-at-a-time gate prevents a cornerstone pile-up.
    */
   private buildCornerstoneInBackground(key: string): void {
     if (!this.vectorStore) return;
     if (this.cornerstoneInFlight.has(key)) return;
+    // GLOBAL serialization: the cornerstone block is corpus/namespace-wide, so
+    // concurrent builds for DIFFERENT sessions recompute the same thing and — far
+    // worse — pile up on the single event loop; each build's synchronous KNN scans
+    // then starve live /recall. Measured with the diagnostics camera: N concurrent
+    // builds → 5-8s recalls (banner dropped), vs a single build's ~1.7s. Run at
+    // most ONE reflection at a time; a session that misses while a build runs
+    // re-fires on its next turn (best-effort, self-healing).
+    if (this.cornerstoneInFlight.size > 0) return;
     if (this.cornerstoneCache.get(key) !== undefined) return; // already committed
     const store = this.vectorStore;
     this.cornerstoneInFlight.add(key);
