@@ -23,6 +23,7 @@ import { sanitizeText, escapeXmlTags } from "../../utils/sanitize.js";
 import { redactSecrets } from "../../utils/redact-secrets.js";
 import { kbRecall, type KbRecallResult } from "../kb/retrieval.js";
 import { buildSituationSeeds } from "../kb/situation-cue.js";
+import { assessRecallConfidence } from "../kb/recall-confidence.js";
 import type { SessionSituation } from "./session-situation.js";
 import { loadPrinciples, formatPrinciplesBlock } from "./principles.js";
 import { buildSessionBanner, type SessionBannerTracker } from "./session-banner.js";
@@ -709,15 +710,15 @@ export async function runKbRecall(
     // additive, best-effort, off the critical path: any failure leaves `visible`
     // as it was. NO global vector scan, NO embedding — O(neighborhood).
     const expand = (vectorStore as {
-      associativeExpand?: (seeds: string[], opts?: { maxNodes?: number }) => Array<{
+      associativeExpand?: (seeds: string[], opts?: { hops?: number; maxNodes?: number }) => Array<{
         owner_id: string; owner_kind: "fact" | "event"; text: string; entity_id: string; activation: number;
       }>;
     }).associativeExpand;
     if (typeof expand === "function") {
       const seenKeys = new Set(visible.map((r) => `${r.owner_kind}:${r.owner_id}`));
-      const addAssociated = (seeds: string[], maxNodes: number): void => {
+      const addAssociated = (seeds: string[], maxNodes: number, hops?: number): void => {
         if (seeds.length === 0) return;
-        for (const a of expand.call(vectorStore, seeds, { maxNodes })) {
+        for (const a of expand.call(vectorStore, seeds, { maxNodes, hops })) {
           const key = `${a.owner_kind}:${a.owner_id}`;
           if (seenKeys.has(key)) continue; // already present — don't duplicate
           seenKeys.add(key);
@@ -736,6 +737,7 @@ export async function runKbRecall(
       // Seeds come from WHERE WE ARE (recent events + context fingerprint + recent
       // files), NOT from the query text — so the session-open recall is rich even when
       // the user's first message ("Ciao Socio, dove eravamo?") names nothing.
+      let situationSeedIds: string[] = [];
       if (sit?.sessionKey) {
         const seeds = buildSituationSeeds(vectorStore, {
           sessionKey: sit.sessionKey,
@@ -743,9 +745,10 @@ export async function runKbRecall(
           situation: sit.situation,
           logger,
         });
-        if (seeds.length > 0) {
-          addAssociated(seeds.map((s) => s.id), 8);
-          logger?.debug?.(`${TAG} [kb] situation-seeded associative: seeds=${seeds.length}`);
+        situationSeedIds = seeds.map((s) => s.id);
+        if (situationSeedIds.length > 0) {
+          addAssociated(situationSeedIds, 8);
+          logger?.debug?.(`${TAG} [kb] situation-seeded associative: seeds=${situationSeedIds.length}`);
         }
       }
 
@@ -755,6 +758,20 @@ export async function runKbRecall(
         ...new Set(visible.filter((r) => !r.associative).map((r) => r.entity_id).filter((x): x is string => !!x)),
       ];
       addAssociated(querySeeds, 6);
+
+      // ── B1 — LE DUE MARCE: gate di confidenza → passata profonda "a sforzo" ──
+      // Se la marcia veloce (sopra) è MAGRA, escala a una passata associativa più
+      // profonda (hops=3, vicinato più largo). Resta O(vicinato): NESSUNA scansione
+      // globale, NESSUN embedding. Gated: la marcia profonda gira SOLO quando serve,
+      // così la latenza rimossa dall'Incremento A non torna sul caso comune.
+      const conf = assessRecallConfidence(visible);
+      if (conf.thin) {
+        const deepSeeds = [...new Set([...situationSeedIds, ...querySeeds])];
+        if (deepSeeds.length > 0) {
+          addAssociated(deepSeeds, 16, 3);
+          logger?.debug?.(`${TAG} [kb] recall thin (${conf.reason}) → deeper associative pass (hops=3, maxNodes=16)`);
+        }
+      }
     }
 
     return visible;
