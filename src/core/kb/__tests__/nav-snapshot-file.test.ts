@@ -7,7 +7,7 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -107,7 +107,8 @@ describe("nav-snapshot-file — atomic file I/O", () => {
     const text = encodeKbNavSnapshot(makeFile());
     writeKbNavSnapshotAtomic(path, text);
     expect(readKbNavSnapshot(path)).toBe(text);
-    expect(existsSync(`${path}.tmp.${process.pid}`)).toBe(false);
+    // No temp file leaked (unique-named temp is renamed away on success).
+    expect(readdirSync(dir).filter((f) => f.includes(".tmp."))).toEqual([]);
   });
 
   it("overwrites an existing snapshot in place", () => {

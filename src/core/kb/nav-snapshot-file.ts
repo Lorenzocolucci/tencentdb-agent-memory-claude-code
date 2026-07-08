@@ -82,7 +82,11 @@ export function decodeKbNavSnapshot(text: string): KbNavSnapshotFile {
  * @throws on any fs failure — callers wrap best-effort.
  */
 export function writeKbNavSnapshotAtomic(path: string, text: string): void {
-  const tmp = `${path}.tmp.${process.pid}`;
+  // Unique temp name per write: prevents (a) two overlapping persists in one
+  // process from colliding on the temp path, and (b) a pre-planted-symlink write
+  // redirect (the name is unpredictable). Atomicity no longer relies on the write
+  // staying synchronous.
+  const tmp = `${path}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 10)}`;
   writeFileSync(tmp, text, "utf8");
   try {
     renameSync(tmp, path);

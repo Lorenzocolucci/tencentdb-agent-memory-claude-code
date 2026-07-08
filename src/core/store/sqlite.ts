@@ -4176,7 +4176,7 @@ export class VectorStore implements IMemoryStore {
     try {
       // Defer off the current tick — serialize + stringify are synchronous CPU.
       await new Promise<void>((resolve) => setImmediate(resolve));
-      if (this.closed || this.kbNavIndex !== idx) return; // index swapped/closed meanwhile
+      if (this.closed || this.degraded || this.kbNavIndex !== idx) return; // index swapped/closed/degraded meanwhile
       const topology = idx.serializeTopology();
       const text = encodeKbNavSnapshot({
         formatVersion: KB_NAV_SNAPSHOT_FORMAT,
@@ -4241,6 +4241,16 @@ export class VectorStore implements IMemoryStore {
     if (currentRows < lo || currentRows > hi) {
       this.logger?.info(
         `${TAG} kb-nav snapshot rows ${file.rowCount} vs current ${currentRows} out of band — rebuilding`,
+      );
+      return false;
+    }
+    // Bound the (file-controlled) node count against the LIVE DB row count too, so
+    // a corrupt/crafted snapshot cannot pass the rowCount band yet still force one
+    // huge un-yielded re-hydration pass at boot (rowCount and nodes.length are
+    // independent fields in the file). Legit snapshots have nodes.length ≈ rowCount.
+    if (file.topology.nodes.length > currentRows * VectorStore.KB_NAV_SNAPSHOT_MAX_ROW_RATIO) {
+      this.logger?.info(
+        `${TAG} kb-nav snapshot node count ${file.topology.nodes.length} exceeds current ${currentRows} band — rebuilding`,
       );
       return false;
     }

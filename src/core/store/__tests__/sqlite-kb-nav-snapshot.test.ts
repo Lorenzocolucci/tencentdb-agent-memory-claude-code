@@ -240,6 +240,31 @@ describe("VectorStore kb-nav snapshot — persist + re-hydrate across restart", 
     s2.close();
   });
 
+  it("rebuilds when the snapshot node count is inflated beyond the DB band (anti-DoS)", async () => {
+    const s1 = openStore(dbPath);
+    seedOwners(s1, 15, 8);
+    expect(await s1.buildKbNavIndex()).toBe(true);
+    expect(await waitFor(() => fs.existsSync(snapPath))).toBe(true);
+    s1.close();
+
+    // A crafted file whose rowCount stays in band (15) but whose topology.nodes is
+    // inflated far past currentRows*2 must NOT trigger a huge re-hydration — rebuild.
+    const file = JSON.parse(fs.readFileSync(snapPath, "utf8"));
+    const orig = file.topology.nodes as unknown[];
+    const inflated: unknown[] = [];
+    while (inflated.length < 60) inflated.push(...orig); // 60 > 15*2 band
+    file.topology.nodes = inflated;
+    fs.writeFileSync(snapPath, JSON.stringify(file), "utf8");
+
+    const { logs, logger } = makeLogger();
+    const s2 = openStore(dbPath, logger);
+    expect(await s2.initKbNavIndex()).toBe(true);
+    expect(logs.some((l) => l.includes("exceeds current"))).toBe(true);
+    expect(logs.some((l) => l.includes("LOADED from snapshot"))).toBe(false);
+    expect(s2.getKbNavIndexSize()).toBe(15); // rebuilt from the DB
+    s2.close();
+  });
+
   it("rebuilds (not loads) when the DB row count drifted far out of band", async () => {
     const s1 = openStore(dbPath);
     seedOwners(s1, 40, 7);
