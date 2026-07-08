@@ -89,6 +89,15 @@ import {
   kbChunkId,
 } from "../kb/kb-queries.js";
 import { NavigableIndex } from "../kb/navigable-index.js";
+import { dirname, join } from "node:path";
+import {
+  KB_NAV_SNAPSHOT_FORMAT,
+  decodeKbNavSnapshot,
+  deleteKbNavSnapshot,
+  encodeKbNavSnapshot,
+  readKbNavSnapshot,
+  writeKbNavSnapshotAtomic,
+} from "../kb/nav-snapshot-file.js";
 
 // ============================
 // Types
@@ -507,6 +516,16 @@ export class VectorStore implements IMemoryStore {
   /** If more than this fraction of kb_vec rows fail to decode, abort the build (stay on brute force). */
   private static readonly KB_NAV_MAX_DROP_RATIO = 0.01;
 
+  // ── kb_vec navigable-index snapshot persistence (Incremento b) ──
+  /** Absolute path of the on-disk graph-only snapshot, or null for an in-memory DB (no persistence). */
+  private readonly kbNavSnapshotPath: string | null;
+  /** Reject a snapshot whose rowCount drifted below this fraction of the current DB (mass change → rebuild). */
+  private static readonly KB_NAV_SNAPSHOT_MIN_ROW_RATIO = 0.5;
+  /** Reject a snapshot whose rowCount is above this multiple of the current DB (mass change → rebuild). */
+  private static readonly KB_NAV_SNAPSHOT_MAX_ROW_RATIO = 2;
+  /** After a load reconciled more than this many nodes (added + removed), refresh the on-disk snapshot. */
+  private static readonly KB_NAV_SNAPSHOT_REWRITE_DELTA = 200;
+
   /**
    * Create a VectorStore instance.
    *
@@ -516,6 +535,11 @@ export class VectorStore implements IMemoryStore {
   constructor(dbPath: string, dimensions: number, logger?: Logger) {
     this.dimensions = dimensions;
     this.logger = logger;
+
+    // The graph-only nav-index snapshot lives next to the DB file. In-memory DBs
+    // (":memory:" / empty path, used in tests) have no directory → no persistence.
+    this.kbNavSnapshotPath =
+      dbPath && dbPath !== ":memory:" ? join(dirname(dbPath), "kb-nav-index.v1.snapshot.json") : null;
 
     // Open database with extension support enabled
     const { DatabaseSync: DbSync } = requireNodeSqlite();
@@ -4110,6 +4134,9 @@ export class VectorStore implements IMemoryStore {
         `${TAG} kb-nav index built: ${local.size} live nodes from ${snapshot.length} chunks` +
           (dirty.size ? ` (reconciled ${dirty.size} owner(s) written during build)` : ""),
       );
+      // Persist the graph so the NEXT restart re-hydrates instead of rebuilding
+      // (Incremento b). Off this tick, best-effort, never blocks the caller.
+      void this.persistKbNavSnapshot();
       return true;
     } catch (err) {
       if (!published) this.kbNavIndex = null; // a PUBLISHED index survives a late throw; only drop a partial build
@@ -4117,6 +4144,183 @@ export class VectorStore implements IMemoryStore {
         `${TAG} buildKbNavIndex failed (non-fatal, brute-force fallback): ${err instanceof Error ? err.message : String(err)}`,
       );
       return published;
+    } finally {
+      this.kbNavBuilding = false;
+      this.kbNavDirtyOwners = null;
+    }
+  }
+
+  /**
+   * Boot entry point for the navigable index (Incremento b): try to re-hydrate
+   * from the on-disk snapshot (skips the minutes-long HNSW rebuild); on any
+   * miss/mismatch/corruption fall back to a full {@link buildKbNavIndex}. This
+   * is what init should call at startup — compaction rebuilds keep calling
+   * buildKbNavIndex directly (they WANT a fresh graph).
+   */
+  async initKbNavIndex(): Promise<boolean> {
+    if (await this.tryLoadKbNavSnapshot()) return true;
+    return this.buildKbNavIndex();
+  }
+
+  /**
+   * Persist the CURRENTLY published graph-only topology to disk (atomic). The
+   * vectors are NOT written — they are re-hydrated from the DB on load, so a
+   * snapshot can never serve a stale vector. Best-effort: any failure is logged
+   * and swallowed, and it yields the loop first so the (cheap) serialize never
+   * extends the publishing tick. Idempotent; safe to call repeatedly.
+   */
+  private async persistKbNavSnapshot(): Promise<void> {
+    const path = this.kbNavSnapshotPath;
+    const idx = this.kbNavIndex;
+    if (!path || !idx || this.closed || this.degraded) return;
+    try {
+      // Defer off the current tick — serialize + stringify are synchronous CPU.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (this.closed || this.kbNavIndex !== idx) return; // index swapped/closed meanwhile
+      const topology = idx.serializeTopology();
+      const text = encodeKbNavSnapshot({
+        formatVersion: KB_NAV_SNAPSHOT_FORMAT,
+        dim: this.dimensions,
+        rowCount: this.kbVecRowCount(),
+        builtAtMs: Date.now(),
+        topology,
+      });
+      writeKbNavSnapshotAtomic(path, text);
+      this.logger?.debug?.(
+        `${TAG} kb-nav snapshot persisted: ${topology.nodes.length} nodes → ${path}`,
+      );
+    } catch (err) {
+      this.logger?.warn?.(
+        `${TAG} persistKbNavSnapshot failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Try to publish the navigable index from the on-disk graph-only snapshot,
+   * re-hydrating vectors FRESH from the DB and re-attaching the persisted links.
+   * Reconciles drift since the snapshot: ids gone from the DB are excised (links
+   * repaired), ids new to the DB are inserted with a proper greedy insertion.
+   * Concurrent upserts during the load are captured via {@link kbNavDirtyOwners}
+   * and reconciled after publish (mirrors buildKbNavIndex). Returns false on any
+   * miss/mismatch/corruption so the caller rebuilds — correctness over speed.
+   */
+  private async tryLoadKbNavSnapshot(): Promise<boolean> {
+    const path = this.kbNavSnapshotPath;
+    if (!path || this.closed || this.degraded || !this.kbVecReady || this.dimensions <= 0) return false;
+    if (this.kbNavBuilding) return false;
+
+    const raw = readKbNavSnapshot(path);
+    if (raw == null) return false; // no snapshot yet → clean build
+
+    let file;
+    try {
+      file = decodeKbNavSnapshot(raw);
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} kb-nav snapshot unreadable (${err instanceof Error ? err.message : String(err)}) — discarding, will rebuild`,
+      );
+      deleteKbNavSnapshot(path);
+      return false;
+    }
+
+    if (file.dim !== this.dimensions) {
+      this.logger?.info(
+        `${TAG} kb-nav snapshot dim ${file.dim} != store dim ${this.dimensions} — discarding, will rebuild`,
+      );
+      deleteKbNavSnapshot(path);
+      return false;
+    }
+
+    // Freshness: a rowCount far from the snapshot's means a mass change (reindex /
+    // provider swap / bulk import) — safer to rebuild than to reconcile a huge delta.
+    const currentRows = this.kbVecRowCount();
+    if (currentRows === 0) return false; // empty DB → nothing to load; build no-ops cleanly
+    const lo = file.rowCount * VectorStore.KB_NAV_SNAPSHOT_MIN_ROW_RATIO;
+    const hi = file.rowCount * VectorStore.KB_NAV_SNAPSHOT_MAX_ROW_RATIO;
+    if (currentRows < lo || currentRows > hi) {
+      this.logger?.info(
+        `${TAG} kb-nav snapshot rows ${file.rowCount} vs current ${currentRows} out of band — rebuilding`,
+      );
+      return false;
+    }
+
+    this.kbNavBuilding = true;
+    this.kbNavDirtyOwners = new Set<string>();
+    let published = false;
+    try {
+      const rows = this.getAllKbVectors();
+      if (rows.length === 0) return false;
+      // Guard a lossy read the same way buildKbNavIndex does.
+      if (rows.length < currentRows * (1 - VectorStore.KB_NAV_MAX_DROP_RATIO)) {
+        this.logger?.warn(
+          `${TAG} kb-nav snapshot load aborted: only ${rows.length}/${currentRows} rows decoded — rebuilding`,
+        );
+        return false;
+      }
+
+      const vecById = new Map<string, Float32Array>();
+      const chunkMeta = new Map<string, { ownerId: string; ownerKind: string }>();
+      const ownerChunks = new Map<string, string[]>();
+      for (const r of rows) {
+        vecById.set(r.chunkId, r.vec);
+        chunkMeta.set(r.chunkId, { ownerId: r.ownerId, ownerKind: r.ownerKind });
+        const list = ownerChunks.get(r.ownerId);
+        if (list) list.push(r.chunkId);
+        else ownerChunks.set(r.ownerId, [r.chunkId]);
+      }
+
+      // Re-attach the persisted graph to the fresh vectors (skips HNSW build).
+      const { index, placedIds, missingIds } = NavigableIndex.restoreFromTopology(file.topology, vecById);
+
+      // Insert ids the DB has but the snapshot didn't (memories added since) with
+      // a proper greedy insertion, yielding so a large delta cannot starve recall.
+      let added = 0;
+      let lastYield = performance.now();
+      for (const r of rows) {
+        if (placedIds.has(r.chunkId)) continue;
+        index.add(r.chunkId, r.vec);
+        added++;
+        if (performance.now() - lastYield > VectorStore.KB_NAV_BUILD_YIELD_MS) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          if (this.closed) return false;
+          lastYield = performance.now();
+        }
+      }
+      if (this.closed) return false;
+
+      // Publish atomically.
+      this.kbNavChunkMeta = chunkMeta;
+      this.kbNavOwnerChunks = ownerChunks;
+      this.kbNavIndex = index;
+      published = true;
+
+      // Reconcile owners written while we were loading (their DB vec is authoritative).
+      const dirty = this.kbNavDirtyOwners;
+      this.kbNavDirtyOwners = null;
+      for (const ownerId of dirty) {
+        if (this.closed) break;
+        this.resyncOwnerFromDb(ownerId);
+      }
+
+      this.logger?.info(
+        `${TAG} kb-nav index LOADED from snapshot: ${index.size} live nodes ` +
+          `(topology ${file.topology.nodes.length}, +${added} new, -${missingIds.length} removed) — skipped rebuild` +
+          (dirty.size ? ` (reconciled ${dirty.size} owner(s) written during load)` : ""),
+      );
+
+      // If the on-disk graph drifted a lot from the DB, refresh it so future
+      // restarts keep loading a small delta (bounds reconcile cost over time).
+      if (added + missingIds.length > VectorStore.KB_NAV_SNAPSHOT_REWRITE_DELTA) {
+        void this.persistKbNavSnapshot();
+      }
+      return true;
+    } catch (err) {
+      if (!published) this.kbNavIndex = null; // never publish a partial load
+      this.logger?.warn(
+        `${TAG} tryLoadKbNavSnapshot failed (${err instanceof Error ? err.message : String(err)}) — rebuilding`,
+      );
+      return false;
     } finally {
       this.kbNavBuilding = false;
       this.kbNavDirtyOwners = null;

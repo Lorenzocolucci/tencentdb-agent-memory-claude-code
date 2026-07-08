@@ -984,10 +984,17 @@ export class TdaiCore {
       // "sul pezzo" banner. Fire-and-forget (yields internally); recall falls back
       // to brute force until it is ready. Feature-detected: only the local
       // sqlite-vec store implements it. Never throws into init.
-      const vs = this.vectorStore as { buildKbNavIndex?: () => Promise<boolean> } | undefined;
-      if (vs && typeof vs.buildKbNavIndex === "function") {
-        void vs.buildKbNavIndex().catch((e) =>
-          this.logger.warn(`${TAG} kb-nav background build failed: ${e instanceof Error ? e.message : String(e)}`),
+      // Incremento b: initKbNavIndex first tries to re-hydrate from the on-disk
+      // snapshot (skips the minutes-long rebuild across restarts) and only builds
+      // from scratch on a miss. Fall back to buildKbNavIndex for older stores.
+      const vs = this.vectorStore as {
+        initKbNavIndex?: () => Promise<boolean>;
+        buildKbNavIndex?: () => Promise<boolean>;
+      } | undefined;
+      const startNavIndex = vs?.initKbNavIndex?.bind(vs) ?? vs?.buildKbNavIndex?.bind(vs);
+      if (startNavIndex) {
+        void startNavIndex().catch((e) =>
+          this.logger.warn(`${TAG} kb-nav background init failed: ${e instanceof Error ? e.message : String(e)}`),
         );
       }
     } catch (err) {

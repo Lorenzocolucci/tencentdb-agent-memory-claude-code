@@ -412,6 +412,149 @@ describe("NavigableIndex — deserialize validation", () => {
   });
 });
 
+// ── Wave 4: graph-only topology persistence (Incremento b — index on disk) ──
+//
+// serializeTopology() persists ONLY the small-world graph (neighbor links +
+// levels), NEVER the vectors. restoreFromTopology() re-hydrates the vectors
+// from the DB and re-attaches the persisted graph, skipping the expensive HNSW
+// construction (the "minutes" a restart used to pay). Vectors always come fresh
+// from the DB → no vector staleness. Nodes whose id is gone from the DB are
+// excised and their links repaired (remap), so the graph never disconnects.
+
+describe("NavigableIndex — topology persistence (graph-only)", () => {
+  it("round-trips via topology + re-hydrated vectors with high recall parity", () => {
+    const dim = 32;
+    const vecs = seededVectors(300, dim, 4321);
+    const idx = new NavigableIndex(dim, { seed: 19, M: 16, efConstruction: 200 });
+    for (const v of vecs) idx.add(v.id, f32(v.vec));
+
+    const topo = JSON.parse(JSON.stringify(idx.serializeTopology()));
+    const vecById = new Map(vecs.map((v) => [v.id, f32(v.vec)]));
+    const { index: restored, placedIds, missingIds } = NavigableIndex.restoreFromTopology(topo, vecById);
+
+    expect(missingIds).toEqual([]);
+    expect(placedIds.size).toBe(300);
+    expect(restored.size).toBe(300);
+    expect(restored.dim).toBe(dim);
+
+    // The restored index must agree with the original on top-10 (parity ≥ 0.9).
+    const queries = seededVectors(20, dim, 8642);
+    let agree = 0;
+    let total = 0;
+    for (const q of queries) {
+      const before = idx.search(f32(q.vec), 10).map((h) => h.id);
+      const set = new Set(before);
+      const after = restored.search(f32(q.vec), 10).map((h) => h.id);
+      total += before.length;
+      agree += after.filter((id) => set.has(id)).length;
+    }
+    expect(agree / total).toBeGreaterThanOrEqual(0.9);
+  });
+
+  it("carries NO vector payload and excludes tombstones", () => {
+    const idx = new NavigableIndex(8, { seed: 3 });
+    const vecs = seededVectors(50, 8, 9);
+    for (const v of vecs) idx.add(v.id, f32(v.vec));
+    idx.remove("n0");
+    idx.remove("n1");
+
+    const topo = idx.serializeTopology();
+    expect(topo.nodes.length).toBe(48); // tombstones excised
+    expect(topo.nodes.some((nd) => nd.id === "n0" || nd.id === "n1")).toBe(false);
+    // The whole point of graph-only: the base64 vector field must be absent.
+    expect(JSON.stringify(topo)).not.toContain('"v"');
+  });
+
+  it("drops nodes absent from the re-hydration map (DB-deleted) and keeps recall", () => {
+    const dim = 16;
+    const vecs = seededVectors(100, dim, 111);
+    const idx = new NavigableIndex(dim, { seed: 5, M: 16, efConstruction: 200 });
+    for (const v of vecs) idx.add(v.id, f32(v.vec));
+
+    const topo = JSON.parse(JSON.stringify(idx.serializeTopology()));
+    // Re-hydrate only ~60% of ids → the rest were deleted from the DB since.
+    const kept = vecs.filter((_, i) => i % 5 >= 2);
+    const vecById = new Map(kept.map((v) => [v.id, f32(v.vec)]));
+    const { index: restored, placedIds, missingIds } = NavigableIndex.restoreFromTopology(topo, vecById);
+
+    expect(placedIds.size).toBe(kept.length);
+    expect(missingIds.length).toBe(100 - kept.length);
+    expect(restored.size).toBe(kept.length);
+
+    // Graph repaired (not disconnected): recall over the LIVE set stays high.
+    const queries = seededVectors(20, dim, 222);
+    let recallSum = 0;
+    for (const q of queries) {
+      const truth = new Set(bruteForceTopK(kept, q.vec, 10));
+      const got = restored.search(f32(q.vec), 10, 100).map((h) => h.id);
+      recallSum += got.filter((id) => truth.has(id)).length / 10;
+    }
+    expect(recallSum / queries.length).toBeGreaterThanOrEqual(0.85);
+  });
+
+  it("accepts brand-new nodes added after restore (reconcile of new owners)", () => {
+    const dim = 12;
+    const vecs = seededVectors(80, dim, 42);
+    const idx = new NavigableIndex(dim, { seed: 8, M: 16, efConstruction: 200 });
+    for (const v of vecs) idx.add(v.id, f32(v.vec));
+
+    const topo = JSON.parse(JSON.stringify(idx.serializeTopology()));
+    const vecById = new Map(vecs.map((v) => [v.id, f32(v.vec)]));
+    const { index: restored } = NavigableIndex.restoreFromTopology(topo, vecById);
+
+    const newVec = f32(seededVectors(1, dim, 999)[0].vec);
+    expect(restored.add("brand-new", newVec)).toBe(true);
+    expect(restored.size).toBe(81);
+    const hits = restored.search(newVec, 1);
+    expect(hits[0].id).toBe("brand-new");
+    expect(hits[0].score).toBeCloseTo(1, 4);
+  });
+
+  it("re-hydrates from raw (un-normalized) DB vectors correctly (scale-invariant)", () => {
+    const dim = 6;
+    const idx = new NavigableIndex(dim, { seed: 2 });
+    idx.add("a", f32([1, 0, 0, 0, 0, 0]));
+    idx.add("b", f32([0, 1, 0, 0, 0, 0]));
+    const topo = JSON.parse(JSON.stringify(idx.serializeTopology()));
+    // Supply the SAME directions but scaled by 10 (raw DB vectors are not L2-normalized).
+    const vecById = new Map([
+      ["a", f32([10, 0, 0, 0, 0, 0])],
+      ["b", f32([0, 10, 0, 0, 0, 0])],
+    ]);
+    const { index: restored } = NavigableIndex.restoreFromTopology(topo, vecById);
+    const hits = restored.search(f32([5, 0, 0, 0, 0, 0]), 1);
+    expect(hits[0].id).toBe("a");
+    expect(hits[0].score).toBeCloseTo(1, 4);
+  });
+
+  it("throws RangeError on an out-of-range neighbor index in the topology", () => {
+    const idx = new NavigableIndex(4, { seed: 1 });
+    idx.add("a", f32([1, 0, 0, 0]));
+    idx.add("b", f32([0, 1, 0, 0]));
+    const topo: any = JSON.parse(JSON.stringify(idx.serializeTopology()));
+    topo.nodes[0].neighbors[0] = [999];
+    const vecById = new Map([
+      ["a", f32([1, 0, 0, 0])],
+      ["b", f32([0, 1, 0, 0])],
+    ]);
+    expect(() => NavigableIndex.restoreFromTopology(topo, vecById)).toThrow(RangeError);
+  });
+
+  it("throws RangeError on an unsupported topology version", () => {
+    const vecById = new Map<string, Float32Array>();
+    expect(() => NavigableIndex.restoreFromTopology({ version: 2 } as any, vecById)).toThrow(RangeError);
+  });
+
+  it("round-trips an empty topology", () => {
+    const idx = new NavigableIndex(4);
+    const topo = JSON.parse(JSON.stringify(idx.serializeTopology()));
+    const { index: restored, missingIds } = NavigableIndex.restoreFromTopology(topo, new Map());
+    expect(restored.size).toBe(0);
+    expect(missingIds).toEqual([]);
+    expect(restored.search(f32([1, 0, 0, 0]), 5)).toEqual([]);
+  });
+});
+
 describe("NavigableIndex — determinism", () => {
   it("produces identical results for the same seed + insertion order", () => {
     const vecs = seededVectors(200, 16, 321);

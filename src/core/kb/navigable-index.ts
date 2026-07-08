@@ -60,6 +60,28 @@ export interface NavigableIndexSnapshot {
   readonly nodes: readonly SnapshotNode[];
 }
 
+/** A topology node: id + level + neighbor links. NO vector (re-hydrated from the DB). */
+interface TopologyNode {
+  readonly id: string;
+  readonly level: number;
+  readonly neighbors: number[][];
+}
+
+/**
+ * Graph-ONLY snapshot: the small-world links + levels, WITHOUT the vectors.
+ * Persist this (tiny — no 4-byte-per-dim payload) to skip the expensive HNSW
+ * construction at boot; the vectors are re-hydrated from the DB (always fresh,
+ * so no vector staleness). Tombstones are excised at serialize time.
+ */
+export interface NavigableIndexTopology {
+  readonly version: 1;
+  readonly dim: number;
+  readonly options: Required<NavigableIndexOptions>;
+  readonly entryPoint: number;
+  readonly maxLevel: number;
+  readonly nodes: readonly TopologyNode[];
+}
+
 /** Encode a Float32Array as base64 of its raw little-endian bytes. */
 function encodeVec(vec: Float32Array): string {
   return Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength).toString("base64");
@@ -370,7 +392,7 @@ export class NavigableIndex {
         id: node.id,
         vec,
         level: node.level,
-        neighbors: node.neighbors.map((l) => [...l]),
+        neighbors: node.neighbors.map((l: number[]) => [...l]),
         deleted: !!node.deleted,
       });
     }
@@ -390,6 +412,153 @@ export class NavigableIndex {
     idx.entryPoint = snap.entryPoint;
     idx.maxLevel = snap.maxLevel;
     return idx;
+  }
+
+  /**
+   * Graph-ONLY snapshot for disk persistence (Incremento b). Emits the live
+   * small-world graph — neighbor links + levels — WITHOUT the vectors, which are
+   * re-hydrated from the DB at load. Tombstones are excised and neighbor indices
+   * remapped to the compacted live-only array, so the persisted graph is valid
+   * and self-contained. Cheap: O(nodes + edges), no distance math, no base64.
+   */
+  serializeTopology(): NavigableIndexTopology {
+    const oldToNew = new Int32Array(this.nodes.length).fill(-1);
+    let count = 0;
+    for (let i = 0; i < this.nodes.length; i++) {
+      if (!this.nodes[i].deleted) oldToNew[i] = count++;
+    }
+    const nodes: TopologyNode[] = [];
+    let maxLevel = 0;
+    for (let i = 0; i < this.nodes.length; i++) {
+      if (oldToNew[i] === -1) continue;
+      const nd = this.nodes[i];
+      const neighbors = nd.neighbors.map((layer: number[]) => {
+        const out: number[] = [];
+        for (const nb of layer) {
+          const m = oldToNew[nb];
+          if (m !== -1) out.push(m); // drop links to tombstoned nodes
+        }
+        return out;
+      });
+      nodes.push({ id: nd.id, level: nd.level, neighbors });
+      if (nd.level > maxLevel) maxLevel = nd.level;
+    }
+    // Entry point = first live node at the top layer (search descends from maxLevel).
+    let entryPoint = -1;
+    for (let i = 0; i < nodes.length; i++) {
+      if (nodes[i].level === maxLevel) { entryPoint = i; break; }
+    }
+    return {
+      version: 1,
+      dim: this.dim,
+      options: { M: this.M, efConstruction: this.efConstruction, efSearch: this.efSearch, seed: this.seed },
+      entryPoint: nodes.length === 0 ? -1 : entryPoint,
+      maxLevel: nodes.length === 0 ? 0 : maxLevel,
+      nodes,
+    };
+  }
+
+  /**
+   * Rebuild an index from a graph-only {@link NavigableIndexTopology} plus a map
+   * of id → RAW (un-normalized) vector, typically read fresh from the DB. This
+   * skips HNSW construction (the "minutes" a restart used to pay) yet keeps the
+   * vectors current. A node whose id is ABSENT from `vecById` (deleted from the
+   * DB since the snapshot, or a zero/non-finite vector) is excised and its links
+   * repaired via index remap, so the graph never disconnects or dangles.
+   * New ids (present in the DB, absent from the topology) are NOT added here —
+   * the caller adds them with {@link add} so they get a proper greedy insertion.
+   *
+   * Fully validated: a corrupt topology throws RangeError at LOAD time.
+   * @returns the index, the set of ids actually placed, and the ids dropped.
+   */
+  static restoreFromTopology(
+    topo: NavigableIndexTopology,
+    vecById: Map<string, Float32Array>,
+  ): { index: NavigableIndex; placedIds: Set<string>; missingIds: string[] } {
+    if (!topo || topo.version !== 1 || !Number.isInteger(topo.dim) || topo.dim <= 0) {
+      throw new RangeError("NavigableIndex.restoreFromTopology: invalid or unsupported topology");
+    }
+    if (!Array.isArray(topo.nodes)) {
+      throw new RangeError("NavigableIndex.restoreFromTopology: topology nodes must be an array");
+    }
+    const n = topo.nodes.length;
+    const idx = new NavigableIndex(topo.dim, topo.options);
+
+    // Pass 1: validate every node's shape + neighbor indices, and decide which
+    // nodes are KEPT (id re-hydratable to a finite, non-zero vector).
+    const keptVec: (Float32Array | null)[] = new Array(n).fill(null);
+    const oldToNew = new Int32Array(n).fill(-1);
+    const missingIds: string[] = [];
+    let newCount = 0;
+    for (let i = 0; i < n; i++) {
+      const node = topo.nodes[i];
+      if (!node || typeof node.id !== "string") {
+        throw new RangeError("NavigableIndex.restoreFromTopology: invalid node");
+      }
+      if (!Number.isInteger(node.level) || node.level < 0) {
+        throw new RangeError("NavigableIndex.restoreFromTopology: invalid node level");
+      }
+      if (!Array.isArray(node.neighbors) || node.neighbors.length !== node.level + 1) {
+        throw new RangeError("NavigableIndex.restoreFromTopology: neighbors/level mismatch");
+      }
+      for (const layer of node.neighbors) {
+        if (!Array.isArray(layer)) {
+          throw new RangeError("NavigableIndex.restoreFromTopology: invalid neighbor layer");
+        }
+        for (const nb of layer) {
+          if (!Number.isInteger(nb) || nb < 0 || nb >= n) {
+            throw new RangeError(`NavigableIndex.restoreFromTopology: neighbor index ${nb} out of range`);
+          }
+        }
+      }
+      const raw = vecById.get(node.id);
+      if (!raw) { missingIds.push(node.id); continue; }
+      if (raw.length !== topo.dim) {
+        throw new RangeError(`NavigableIndex.restoreFromTopology: vector length ${raw.length} != dim ${topo.dim}`);
+      }
+      const norm = idx.normalize(raw);
+      if (!norm) { missingIds.push(node.id); continue; } // zero / non-finite — excise
+      keptVec[i] = norm;
+      oldToNew[i] = newCount++;
+    }
+
+    // Pass 2: build the compacted node array, remapping neighbor indices and
+    // dropping links to excised nodes.
+    const placedIds = new Set<string>();
+    let maxLevel = 0;
+    for (let i = 0; i < n; i++) {
+      if (oldToNew[i] === -1) continue;
+      const node = topo.nodes[i];
+      const neighbors: number[][] = node.neighbors.map((layer: number[]) => {
+        const out: number[] = [];
+        for (const nb of layer) {
+          const m = oldToNew[nb];
+          if (m !== -1) out.push(m);
+        }
+        return out;
+      });
+      idx.nodes.push({ id: node.id, vec: keptVec[i]!, level: node.level, neighbors, deleted: false });
+      idx.idToIdx.set(node.id, oldToNew[i]);
+      placedIds.add(node.id);
+      if (node.level > maxLevel) maxLevel = node.level;
+    }
+    idx.liveCount = placedIds.size;
+
+    // Entry point MUST sit at the top layer (search descends from maxLevel). Pick
+    // the first kept node at maxLevel — robust even if the persisted entry was excised.
+    if (idx.nodes.length === 0) {
+      idx.entryPoint = -1;
+      idx.maxLevel = 0;
+    } else {
+      let ep = -1;
+      for (let i = 0; i < idx.nodes.length; i++) {
+        if (idx.nodes[i].level === maxLevel) { ep = i; break; }
+      }
+      idx.entryPoint = ep;
+      idx.maxLevel = maxLevel;
+    }
+
+    return { index: idx, placedIds, missingIds };
   }
 
   /**
