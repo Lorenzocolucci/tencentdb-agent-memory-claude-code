@@ -33,6 +33,7 @@ import type { EmbeddingService } from "../store/embedding.js";
 import type { Logger } from "../types.js";
 import type { KbDelta } from "./extraction-schema.js";
 import { redactSecrets } from "../../utils/redact-secrets.js";
+import { defaultProvenance, type ProvenanceStamp } from "./provenance.js";
 
 const TAG = "[memory-tdai][kb-writer]";
 
@@ -85,6 +86,13 @@ export interface KbWriterStore {
     attribute?: string;
     updatedTime?: string;
   }): boolean;
+  stampProvenance(
+    ownerId: string,
+    ownerKind: "fact" | "event",
+    provenance: ProvenanceStamp,
+    now: string,
+    namespace?: string,
+  ): void;
 }
 
 // ============================
@@ -175,6 +183,8 @@ export async function applyKbDelta(
     });
     eventIdMap.set(ev.ref, inserted.id);
     events.push(inserted);
+    // Grounded Trust (Phase 1): stamp provenance at birth → conversation/unverified.
+    store.stampProvenance(inserted.id, "event", defaultProvenance(ev.source_message_ids ?? []), now, namespace);
   }
 
   // ── 3. Facts (bi-temporal supersession) — collect affected HEAD facts ──
@@ -199,6 +209,8 @@ export async function applyKbDelta(
       now,
     });
     facts.push(fact);
+    // Grounded Trust (Phase 1): stamp provenance at birth → conversation/unverified.
+    store.stampProvenance(fact.id, "fact", defaultProvenance(), now, namespace);
   }
 
   // ── 4. Relations (idempotent by unique edge) ──

@@ -830,7 +830,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
     }
   }
 
-  async queryL0ForL1(sessionKey: string, afterRecordedAtMs?: number, limit = 50): Promise<L0QueryRow[]> {
+  async queryL0ForL1(sessionKey: string, afterRecordedAtMs?: number, limit = 50, _afterRowId = 0): Promise<L0QueryRow[]> {
     try {
       await this._ensureInit();
       if (this.degraded) return [];
@@ -858,6 +858,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
         message_text: String(doc.message_text ?? ""),
         recorded_at: epochMsToIso(Number(doc.recorded_at_ms ?? 0)),
         timestamp: Number(doc.timestamp ?? 0),
+        rowid: 0, // TCVDB has no rowid; same-timestamp paging is a SQLite-only concern
       }));
 
       return rows.reverse();
@@ -867,12 +868,12 @@ export class TcvdbMemoryStore implements IMemoryStore {
     }
   }
 
-  async queryL0GroupedBySessionId(sessionKey: string, afterRecordedAtMs?: number, limit = 50): Promise<L0SessionGroup[]> {
+  async queryL0GroupedBySessionId(sessionKey: string, afterRecordedAtMs?: number, limit = 50, afterRowId = 0): Promise<L0SessionGroup[]> {
     try {
-      const rows = await this.queryL0ForL1(sessionKey, afterRecordedAtMs, limit);
+      const rows = await this.queryL0ForL1(sessionKey, afterRecordedAtMs, limit, afterRowId);
 
       // Group by session_id
-      const groupMap = new Map<string, Array<{ id: string; role: string; content: string; timestamp: number; recordedAtMs: number }>>();
+      const groupMap = new Map<string, Array<{ id: string; role: string; content: string; timestamp: number; recordedAtMs: number; rowid: number }>>();
       for (const row of rows) {
         const sid = row.session_id || "";
         let group = groupMap.get(sid);
@@ -886,6 +887,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
           content: row.message_text,
           timestamp: row.timestamp,
           recordedAtMs: row.recorded_at ? Date.parse(row.recorded_at) || 0 : 0,
+          rowid: 0,
         });
       }
 

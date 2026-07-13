@@ -1014,6 +1014,44 @@ export function listRecentEvents(
 }
 
 /**
+ * All events for a session, chronological (oldest world-time first). Used by the
+ * session-continuity recap capture to reconstruct the session's thread.
+ */
+export function listEventsBySession(db: DatabaseSync, sessionKey: string): KbEvent[] {
+  const key = sessionKey?.trim();
+  if (!key) return [];
+  const rows = db
+    .prepare("SELECT * FROM events WHERE session_key = ? ORDER BY ts ASC, id ASC")
+    .all(key) as Array<Record<string, unknown>>;
+  return rows.map(rowToEvent);
+}
+
+/**
+ * Most recent event of a given type for a session_key (newest world-time
+ * first), or undefined. Used by the session-continuity recap injection to fetch
+ * the latest `session_recap` for the current context. Deterministic — no
+ * embeddings.
+ *
+ * WHY session_key (not project): the `project` column is empty on captured
+ * events, while `session_key` is verified-stable per project across many
+ * sessions (one key spans a month / 25 session_ids). session_key is therefore
+ * the reliable per-project join for cross-session continuity.
+ */
+export function latestEventBySessionKeyType(
+  db: DatabaseSync,
+  sessionKey: string,
+  type: string,
+): KbEvent | undefined {
+  const k = sessionKey?.trim();
+  const t = type?.trim();
+  if (!k || !t) return undefined;
+  const row = db
+    .prepare("SELECT * FROM events WHERE session_key = ? AND type = ? ORDER BY ts DESC, id DESC LIMIT 1")
+    .get(k, t) as Record<string, unknown> | undefined;
+  return row ? rowToEvent(row) : undefined;
+}
+
+/**
  * Events referencing a given entity (its `entities_json` contains the id),
  * within the namespace, newest world-time first. Used by the entity-page
  * projection to render the per-entity "Timeline". Matching is done in JS on the

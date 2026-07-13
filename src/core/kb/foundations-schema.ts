@@ -21,6 +21,7 @@
  */
 
 import type { DatabaseSync } from "node:sqlite";
+import { WILLINGNESS_DEFAULT } from "./stance-track-record.js";
 
 /** Minimal logger shape (decoupled from the host logger type). */
 export interface FoundationsLogger {
@@ -82,6 +83,13 @@ export function initFoundationsSchema(db: DatabaseSync, logger?: FoundationsLogg
     `);
     ddl("CREATE INDEX IF NOT EXISTS idx_life_tier_state ON memory_lifecycle(namespace, tier, state)");
     ddl("CREATE INDEX IF NOT EXISTS idx_life_decay ON memory_lifecycle(decay_at)");
+    // Grounded Trust (Phase 3): getPendingAsks runs each recall turn. Without an
+    // index this json_extract filter full-scans memory_lifecycle every turn (0
+    // pending = scan to end), slowing recall. Expression index → O(log n + matches);
+    // pending rows are rare (conservative gate), so the lookup is tiny.
+    ddl(
+      "CREATE INDEX IF NOT EXISTS idx_life_gate_state ON memory_lifecycle(json_extract(provenance_json, '$.gate_state'))",
+    );
 
     // ── Brick 2 — lessons (Mistake Notebook, Phase B) ──────────────────────
     // Distilled procedural strategies from successes AND failures. Versioned for
@@ -153,6 +161,53 @@ export function initFoundationsSchema(db: DatabaseSync, logger?: FoundationsLogg
     // no-op when the column already exists.
     if (tableExists(db, "relations") && !columnExists(db, "relations", "weight")) {
       ddl("ALTER TABLE relations ADD COLUMN weight REAL NOT NULL DEFAULT 1.0");
+    }
+
+    // ── Brick 6 — lessons reinforcement (B3) ───────────────────────────────
+    // A lesson's confidence grows on successful AVOIDANCE, not only on recurrence
+    // (the step beyond MNL). exposure_count = times the lesson resurfaced into a
+    // matching situation; avoidance_count = times it was credited as avoided (drives
+    // the explicit→implicit phase switch); last_exposed_session_id/at scope the
+    // implicit "exposed-and-not-relapsed-this-session" inference. Additive + guarded.
+    if (tableExists(db, "lessons")) {
+      if (!columnExists(db, "lessons", "exposure_count")) {
+        ddl("ALTER TABLE lessons ADD COLUMN exposure_count INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!columnExists(db, "lessons", "avoidance_count")) {
+        ddl("ALTER TABLE lessons ADD COLUMN avoidance_count INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!columnExists(db, "lessons", "last_exposed_session_id")) {
+        ddl("ALTER TABLE lessons ADD COLUMN last_exposed_session_id TEXT");
+      }
+      if (!columnExists(db, "lessons", "last_exposed_at")) {
+        ddl("ALTER TABLE lessons ADD COLUMN last_exposed_at TEXT");
+      }
+    }
+
+    // ── Brick 7 — stance track record (Pilastro B) ─────────────────────────
+    // Distinct from B3 (which tracks whether the FAILURE recurred). This tracks
+    // whether the STANCE itself was right to fire an interrupt: when a hard
+    // interrupt fires and Lorenzo CONFIRMS it mattered → willingness rises; when
+    // he REJECTS it as a false alarm → willingness falls, and a stance that
+    // repeatedly cries wolf suppresses itself. stance_willingness drives
+    // classifyStanceSeverity's suppress/demote/trusted tiers. Legacy rows default
+    // to WILLINGNESS_DEFAULT (trusted) → no behaviour change until signals arrive.
+    // Additive + guarded, exactly like Brick 6.
+    if (tableExists(db, "lessons")) {
+      if (!columnExists(db, "lessons", "stance_fire_count")) {
+        ddl("ALTER TABLE lessons ADD COLUMN stance_fire_count INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!columnExists(db, "lessons", "stance_confirmed_count")) {
+        ddl("ALTER TABLE lessons ADD COLUMN stance_confirmed_count INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!columnExists(db, "lessons", "stance_rejected_count")) {
+        ddl("ALTER TABLE lessons ADD COLUMN stance_rejected_count INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!columnExists(db, "lessons", "stance_willingness")) {
+        ddl(
+          `ALTER TABLE lessons ADD COLUMN stance_willingness REAL NOT NULL DEFAULT ${WILLINGNESS_DEFAULT}`,
+        );
+      }
     }
 
     logger?.debug?.(`${TAG} foundations schema ready`);

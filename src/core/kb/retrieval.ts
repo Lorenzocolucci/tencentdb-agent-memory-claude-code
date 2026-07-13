@@ -36,6 +36,8 @@ import type { EmbeddingService, EmbeddingCallOptions } from "../store/embedding.
 import { buildFtsQuery } from "../store/sqlite.js";
 import { sanitizeText } from "../../utils/sanitize.js";
 import { applyRecencyBoost, rrfScoreForRank } from "../hooks/auto-recall.js";
+import { computePrimingBoosts, PRIMING_LAMBDA } from "./implicit-priming.js";
+import type { WeightedNeighbor } from "./spreading-activation.js";
 
 const TAG = "[memory-tdai] [kb-recall]";
 
@@ -73,6 +75,12 @@ export interface KbRecallResult {
   attribute?: string;
   /** World-time timestamp (event ts, or fact valid_from). */
   ts?: string;
+  /**
+   * True when this memory was NOT matched by the query but SURFACED by association
+   * (spreading activation over the entity graph) — it "came" to the agent. Rendered
+   * with a distinct marker so query-matched and associative recall stay legible.
+   */
+  associative?: boolean;
 }
 
 export interface KbRecallOptions {
@@ -88,6 +96,16 @@ export interface KbRecallOptions {
   rerank?: boolean;
   /** Per-call embedding timeout override (recall-path). */
   embeddingTimeoutMs?: number;
+  /**
+   * Skip the global vector candidate source (Source B). The kb_vec KNN is a
+   * brute-force O(N) scan (sqlite-vec vec0), so on a large corpus it dominates
+   * recall latency. The auto-recall / session-open path (System 1 — fast,
+   * associative: FTS + entity-match seeds → spreading activation) sets this so
+   * the banner returns within the cc RECALL_TIMEOUT; the explicit memory-search
+   * tool (System 2 — effortful, on-demand) leaves it off and keeps the vector
+   * source. First step of the associative-first recall redesign, NOT a DB patch.
+   */
+  skipVector?: boolean;
   logger?: Logger;
 }
 
@@ -446,6 +464,7 @@ export async function kbRecall(
     maxResults = 5,
     rerank = false,
     embeddingTimeoutMs,
+    skipVector = false,
     logger,
   } = options;
 
@@ -462,9 +481,15 @@ export async function kbRecall(
 
   // ── Parallel candidate recall (order MUST match fuseRrf source indices) ──
   //    0 = FTS, 1 = vector, 2 = entity-name match.
+  //    skipVector (System 1 / auto-recall) drops Source B: the kb_vec KNN is an
+  //    O(N) brute-force scan that dominates latency on a large corpus. FTS +
+  //    entity-match still seed the graph, and the caller's spreading activation
+  //    expands from those seeds — associative recall survives, fast.
   const [ftsCandidates, vectorCandidates, entityCandidates] = await Promise.all([
     Promise.resolve(recallFts(store, cleanQuery, candidateLimit, logger)),
-    recallVector(store, embeddingService, cleanQuery, candidateLimit, embeddingCallOpts, logger),
+    skipVector
+      ? Promise.resolve<RankedCandidate[]>([])
+      : recallVector(store, embeddingService, cleanQuery, candidateLimit, embeddingCallOpts, logger),
     Promise.resolve(recallEntityMatch(store, cleanQuery, namespace, candidateLimit, logger)),
   ]);
 
@@ -513,6 +538,12 @@ export async function kbRecall(
     const ranking = recencyBoosted * (1 + IMPORTANCE_WEIGHT * r.importance);
     return { rendered: r, ranking };
   });
+
+  // ── Implicit Priming (Idea 2): BEFORE the cut, let sub-threshold candidates amplify
+  //    graph-connected ones (co-occurrence ∪ relations) so a weak-but-connected memory
+  //    can cross into the top-K — the primer stays invisible. Best-effort, fail-open.
+  primeRankings(reweighted, store, namespace, logger);
+
   reweighted.sort((a, b) => b.ranking - a.ranking);
 
   // ── Calibrate + trim to maxResults. Returned score = calibrated 0-1 ──
@@ -544,6 +575,46 @@ function clamp01(value: number): number {
 /** Normalize a raw owner_kind string to the two kinds kbRecall returns. */
 function normalizeOwnerKind(kind: string): KbRecallOwnerKind {
   return kind === "event" ? "event" : "fact";
+}
+
+/**
+ * Implicit Priming — mutate candidate rankings in place BEFORE the maxResults cut.
+ * Each candidate (anchored to an entity) is amplified by the activation it receives
+ * from co-recalled neighbors over the dense graph (co-occurrence ∪ relations). A
+ * weak-but-connected candidate can thus cross into the top-K; the primer stays
+ * invisible. Best-effort, fail-open: any failure leaves rankings unchanged.
+ */
+function primeRankings(
+  reweighted: Array<{ rendered: RenderedCandidate; ranking: number }>,
+  store: IMemoryStore,
+  namespace: string,
+  logger?: Logger,
+): void {
+  try {
+    const adjFn = (store as {
+      candidateAdjacency?: (ids: string[], ns: string) => Map<string, WeightedNeighbor[]>;
+    }).candidateAdjacency;
+    if (typeof adjFn !== "function") return;
+
+    const candidates = reweighted
+      .map((rw) => ({ id: rw.rendered.result.entity_id ?? "", ranking: rw.ranking }))
+      .filter((c) => c.id);
+    if (candidates.length < 2) return;
+
+    const entityIds = [...new Set(candidates.map((c) => c.id))];
+    const adjacency = adjFn.call(store, entityIds, namespace);
+    if (adjacency.size === 0) return; // nothing connected → priming is a no-op
+
+    const boosts = computePrimingBoosts(candidates, (id) => adjacency.get(id) ?? []);
+    if (boosts.size === 0) return;
+
+    for (const rw of reweighted) {
+      const eid = rw.rendered.result.entity_id;
+      if (eid) rw.ranking += PRIMING_LAMBDA * (boosts.get(eid) ?? 0);
+    }
+  } catch (err) {
+    logger?.warn?.(`${TAG} implicit priming failed (fail-open): ${errMsg(err)}`);
+  }
 }
 
 function errMsg(err: unknown): string {

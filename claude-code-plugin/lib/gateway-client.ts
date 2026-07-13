@@ -21,8 +21,13 @@ import { appendFile, readFile } from "node:fs/promises";
 import { URL } from "node:url";
 
 // --- Named timeout constants (Phase 3: HOOK CLIENT TIMEOUT) ---
-/** Recall timeout: must not hang the prompt; kept short and non-blocking. */
-export const RECALL_TIMEOUT_MS = 4_000;
+/** Recall timeout: must not hang the prompt; kept short and non-blocking.
+ *  Defence-in-depth at 6s (was 4s): the corpus-embedding that used to push the
+ *  first-turn recall to ~5s is now built off the critical path (see
+ *  tdai-core.buildCornerstoneInBackground), so recall is normally <1s. 6s still
+ *  bounds the prompt but no longer clips a legitimately slow (cold/contended)
+ *  query embedding, which silently dropped the whole session-open injection. */
+export const RECALL_TIMEOUT_MS = 6_000;
 /** Capture timeout: session save is more important; allow extra time for a
  *  slow gateway write-through before declaring the save lost. */
 export const CAPTURE_TIMEOUT_MS = 12_000;

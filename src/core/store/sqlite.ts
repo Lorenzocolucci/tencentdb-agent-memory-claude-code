@@ -47,7 +47,27 @@ import type {
   KbRelationInput,
   KbVectorSearchResult,
   KbFtsSearchResult,
+  KbLessonHit,
 } from "./types.js";
+import {
+  queryHeadLessonsByFile as kbQueryHeadLessonsByFile,
+  recordExposure as kbRecordExposure,
+  creditAvoidance as kbCreditAvoidance,
+  temperOnRecurrence as kbTemperOnRecurrence,
+  queryLessonsExposedInSession as kbQueryLessonsExposedInSession,
+  recordStanceFire as kbRecordStanceFire,
+  creditStanceConfirmed as kbCreditStanceConfirmed,
+  creditStanceRejected as kbCreditStanceRejected,
+} from "../kb/lessons-writer.js";
+import { phaseFor as lessonPhaseFor } from "../kb/lesson-reinforcement.js";
+import { distillLessons as kbDistillLessons } from "../kb/lessons-runner.js";
+import { distillUsage as kbDistillUsage } from "../kb/usage-runner.js";
+import { createKbVecEmbeddingReader } from "../kb/bug-embeddings.js";
+import { ensureLifecycle, confirmProvenance, rejectProvenance, markGatePending, getLifecycle, stampSalience as kbStampSalience, reinforce as kbReinforce } from "../kb/lifecycle-writer.js";
+import { serializeProvenance, parseProvenance, gateStateOf, type ProvenanceStamp } from "../kb/provenance.js";
+import { classifyStakes, shouldGate } from "../kb/stakes.js";
+import { spreadActivation, isNoiseAttribute, type WeightedNeighbor } from "../kb/spreading-activation.js";
+import type { LLMRunner } from "../types.js";
 import {
   resolveOrCreateEntity as kbResolveOrCreateEntity,
   insertEvent as kbInsertEvent,
@@ -62,10 +82,22 @@ import {
   queryEntitiesByTokens as kbQueryEntitiesByTokens,
   listEntities as kbListEntities,
   listRecentEvents as kbListRecentEvents,
+  listEventsBySession as kbListEventsBySession,
+  latestEventBySessionKeyType as kbLatestEventBySessionKeyType,
   queryRelationsForEntity as kbQueryRelationsForEntity,
   queryEventsForEntity as kbQueryEventsForEntity,
   kbChunkId,
 } from "../kb/kb-queries.js";
+import { NavigableIndex } from "../kb/navigable-index.js";
+import { dirname, join } from "node:path";
+import {
+  KB_NAV_SNAPSHOT_FORMAT,
+  decodeKbNavSnapshot,
+  deleteKbNavSnapshot,
+  encodeKbNavSnapshot,
+  readKbNavSnapshot,
+  writeKbNavSnapshotAtomic,
+} from "../kb/nav-snapshot-file.js";
 
 // ============================
 // Types
@@ -460,6 +492,40 @@ export class VectorStore implements IMemoryStore {
   private stmtKbFtsInsert?: StatementSync;
   private stmtKbFtsSearch?: StatementSync;
 
+  // ── kb_vec navigable index (Incremento C-1b) ──
+  /** Sub-linear KNN over kb_vec; null = not built yet → searchKbVector falls back to brute force. */
+  private kbNavIndex: NavigableIndex | null = null;
+  /** True while buildKbNavIndex is running (index not yet published). */
+  private kbNavBuilding = false;
+  /** Owners upserted DURING a build — reconciled from the DB once the build publishes. */
+  private kbNavDirtyOwners: Set<string> | null = null;
+  /** chunkId → owner, for mapping index hits back to owners. */
+  private kbNavChunkMeta = new Map<string, { ownerId: string; ownerKind: string }>();
+  /** ownerId → its chunkIds currently in the index (for delete-then-insert sync). */
+  private kbNavOwnerChunks = new Map<string, string[]>();
+  /** Cached kb_vec raw-read statements (build-at-boot + reconcile), avoid re-preparing. */
+  private stmtKbVecReadAll?: StatementSync;
+  private stmtKbVecReadOwner?: StatementSync;
+  private stmtKbVecCount?: StatementSync;
+  /** Hold the loop at most this long (ms) between yields while building the index. */
+  private static readonly KB_NAV_BUILD_YIELD_MS = 12;
+  /** Below this many live nodes, don't bother auto-compacting (churn not worth it). */
+  private static readonly KB_NAV_REBUILD_MIN_LIVE = 200;
+  /** Auto-compact (rebuild) once tombstones exceed this fraction of live nodes. */
+  private static readonly KB_NAV_REBUILD_TOMBSTONE_RATIO = 0.5;
+  /** If more than this fraction of kb_vec rows fail to decode, abort the build (stay on brute force). */
+  private static readonly KB_NAV_MAX_DROP_RATIO = 0.01;
+
+  // ── kb_vec navigable-index snapshot persistence (Incremento b) ──
+  /** Absolute path of the on-disk graph-only snapshot, or null for an in-memory DB (no persistence). */
+  private readonly kbNavSnapshotPath: string | null;
+  /** Reject a snapshot whose rowCount drifted below this fraction of the current DB (mass change → rebuild). */
+  private static readonly KB_NAV_SNAPSHOT_MIN_ROW_RATIO = 0.5;
+  /** Reject a snapshot whose rowCount is above this multiple of the current DB (mass change → rebuild). */
+  private static readonly KB_NAV_SNAPSHOT_MAX_ROW_RATIO = 2;
+  /** After a load reconciled more than this many nodes (added + removed), refresh the on-disk snapshot. */
+  private static readonly KB_NAV_SNAPSHOT_REWRITE_DELTA = 200;
+
   /**
    * Create a VectorStore instance.
    *
@@ -469,6 +535,11 @@ export class VectorStore implements IMemoryStore {
   constructor(dbPath: string, dimensions: number, logger?: Logger) {
     this.dimensions = dimensions;
     this.logger = logger;
+
+    // The graph-only nav-index snapshot lives next to the DB file. In-memory DBs
+    // (":memory:" / empty path, used in tests) have no directory → no persistence.
+    this.kbNavSnapshotPath =
+      dbPath && dbPath !== ":memory:" ? join(dirname(dbPath), "kb-nav-index.v1.snapshot.json") : null;
 
     // Open database with extension support enabled
     const { DatabaseSync: DbSync } = requireNodeSqlite();
@@ -834,10 +905,10 @@ export class VectorStore implements IMemoryStore {
     // ASC returns the oldest un-extracted window first, so paging + per-window
     // cursor advancement walks the whole backlog across triggers without loss.
     this.stmtL0QueryAllAsc = this.db.prepare(`
-      SELECT record_id, session_key, session_id, role, message_text, recorded_at, timestamp
+      SELECT rowid AS _rowid, record_id, session_key, session_id, role, message_text, recorded_at, timestamp
       FROM l0_conversations
       WHERE session_key = ?
-      ORDER BY recorded_at ASC
+      ORDER BY recorded_at ASC, rowid ASC
       LIMIT ?
     `);
 
@@ -854,11 +925,16 @@ export class VectorStore implements IMemoryStore {
     // SKIPS the oldest un-extracted messages permanently (the cursor then jumps
     // past them). ASC returns the oldest un-extracted window first, so paging +
     // cursor advancement processes the whole backlog across successive triggers.
+    // Composite (recorded_at, rowid) cursor: recorded_at is primary (existing
+    // cursors stay valid), rowid breaks ties. Required because the chat backfill
+    // gives EVERY message in a conversation the SAME recorded_at — a strict
+    // `recorded_at > ?` cursor then can't page past the first window (44/94 msgs
+    // lost). rowid is unique, monotonic, and preserves conversation order.
     this.stmtL0QueryAfterAsc = this.db.prepare(`
-      SELECT record_id, session_key, session_id, role, message_text, recorded_at, timestamp
+      SELECT rowid AS _rowid, record_id, session_key, session_id, role, message_text, recorded_at, timestamp
       FROM l0_conversations
-      WHERE session_key = ? AND recorded_at > ?
-      ORDER BY recorded_at ASC
+      WHERE session_key = ? AND (recorded_at > ? OR (recorded_at = ? AND rowid > ?))
+      ORDER BY recorded_at ASC, rowid ASC
       LIMIT ?
     `);
 
@@ -1144,7 +1220,14 @@ export class VectorStore implements IMemoryStore {
   private dropVectorTables(): void {
     this.db.exec("DROP TABLE IF EXISTS l1_vec");
     this.db.exec("DROP TABLE IF EXISTS l0_vec");
-    this.logger?.info(`${TAG} Dropped vector tables (l1_vec, l0_vec)`);
+    // kb_vec is the recall surface for the entity-centric KB (recall.source=kb).
+    // It MUST be dropped too on a dimension/model change — otherwise it survives
+    // at the OLD dimension while l0/l1 move to the new one → kb semantic recall
+    // silently mismatches. initKbSchema recreates it at the new dimension;
+    // reindexKb() refills it (kb_fts, the text source, is preserved). Uses
+    // prepare().run() (not db.exec) to avoid the child_process.exec lint false-positive.
+    this.db.prepare("DROP TABLE IF EXISTS kb_vec").run();
+    this.logger?.info(`${TAG} Dropped vector tables (l1_vec, l0_vec, kb_vec)`);
   }
 
   /**
@@ -1995,6 +2078,26 @@ export class VectorStore implements IMemoryStore {
   }
 
   /**
+   * Get all KB owner texts (entities/facts/events) for re-embedding into kb_vec.
+   * Source of truth = `kb_fts.content_original` — the exact text that was indexed
+   * for recall — so a kb_vec rebuild mirrors what the normal write path embedded.
+   * kb_fts is dimension-independent, so it survives an embedding-provider change.
+   */
+  getAllKbTexts(): Array<{ owner_id: string; owner_kind: string; content: string; updated_time: string }> {
+    if (this.degraded || !this.kbFtsAvailable) return [];
+    try {
+      return this.db
+        .prepare("SELECT owner_id, owner_kind, content_original AS content, updated_time FROM kb_fts")
+        .all() as Array<{ owner_id: string; owner_kind: string; content: string; updated_time: string }>;
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} getAllKbTexts failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return [];
+    }
+  }
+
+  /**
    * Re-embed all existing L1 and L0 texts with a new embedding function.
    *
    * This is called after `init()` returns `needsReindex: true` — the vector
@@ -2009,6 +2112,500 @@ export class VectorStore implements IMemoryStore {
    *   IDEMPOTENT.
    * @param onProgress  Optional callback for progress reporting.
    */
+  /**
+   * Stamp a memory unit's provenance at write time by creating its
+   * memory_lifecycle row WITH the stamp (idempotent: if the row already exists it
+   * is left untouched, so consolidation's later ensureLifecycle never clobbers it).
+   * Off the critical path: failures are swallowed + logged, never thrown.
+   */
+  stampProvenance(
+    ownerId: string,
+    ownerKind: "fact" | "event",
+    provenance: ProvenanceStamp,
+    now: string,
+    namespace = "default",
+  ): void {
+    try {
+      ensureLifecycle(this.db, {
+        ownerId,
+        ownerKind,
+        now,
+        namespace,
+        provenance: JSON.parse(serializeProvenance(provenance)),
+      });
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][provenance] stamp failed for ${ownerKind} ${ownerId} (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Confirm a memory as ground truth (Lorenzo said so). Flips its provenance to
+   * trusted + writes the audit trail. When a `factId` is given, raises that fact's
+   * confidence; when a `supersededFactId` is given, closes that older uncertain
+   * fact (sets superseded_by + valid_to so it leaves the HEAD set). One transaction
+   * (BEGIN/COMMIT/ROLLBACK via prepared statements — same effect as reindexAll).
+   */
+  confirmMemory(params: {
+    ownerId: string;
+    ownerKind: "fact" | "event";
+    now: string;
+    factId?: string;
+    confidence?: number;
+    supersededFactId?: string;
+  }): void {
+    try {
+      this.db.prepare("BEGIN").run();
+      try {
+        confirmProvenance(this.db, {
+          ownerId: params.ownerId,
+          ownerKind: params.ownerKind,
+          now: params.now,
+        });
+        if (params.factId) {
+          this.db
+            .prepare("UPDATE facts SET confidence = ?, updated_time = ? WHERE id = ?")
+            .run(params.confidence ?? 0.99, params.now, params.factId);
+        }
+        if (params.supersededFactId) {
+          this.db
+            .prepare(
+              "UPDATE facts SET superseded_by = ?, superseded_at = ?, valid_to = ? WHERE id = ?",
+            )
+            .run(params.factId ?? params.ownerId, params.now, params.now, params.supersededFactId);
+        }
+        this.db.prepare("COMMIT").run();
+      } catch (txErr) {
+        try { this.db.prepare("ROLLBACK").run(); } catch { /* ignore */ }
+        throw txErr;
+      }
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][provenance] confirmMemory failed for ${params.ownerKind} ${params.ownerId} ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Carry Idea 5's distinctiveness verdict onto a memory's lifecycle `salience`
+   * (Pilastro C bridge), so distinctiveness-aware decay protects the peak.
+   * Delegates to the monotonic stampSalience primitive. Off the critical path:
+   * failures are logged, never thrown.
+   */
+  stampSalience(params: {
+    ownerId: string;
+    ownerKind: "fact" | "event";
+    salience: number;
+    now: string;
+  }): void {
+    try {
+      kbStampSalience(this.db, {
+        ownerId: params.ownerId,
+        ownerKind: params.ownerKind,
+        salience: params.salience,
+        now: params.now,
+      });
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][cornerstones] stampSalience failed for ${params.ownerKind} ${params.ownerId} ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Tombstone a memory as rejected (Lorenzo said NO to the gate question). Marks
+   * its provenance `rejected` (kept, never hard-deleted) + writes the audit trail.
+   * When a `factId` is given, drops that fact from the HEAD set (valid_to = now) so
+   * it stops driving action while the row itself survives. One transaction.
+   */
+  rejectMemory(params: {
+    ownerId: string;
+    ownerKind: "fact" | "event";
+    now: string;
+    factId?: string;
+  }): void {
+    try {
+      this.db.prepare("BEGIN").run();
+      try {
+        rejectProvenance(this.db, {
+          ownerId: params.ownerId,
+          ownerKind: params.ownerKind,
+          now: params.now,
+        });
+        if (params.factId) {
+          this.db
+            .prepare("UPDATE facts SET valid_to = ? WHERE id = ?")
+            .run(params.now, params.factId);
+        }
+        this.db.prepare("COMMIT").run();
+      } catch (txErr) {
+        try { this.db.prepare("ROLLBACK").run(); } catch { /* ignore */ }
+        throw txErr;
+      }
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][provenance] rejectMemory failed for ${params.ownerKind} ${params.ownerId} ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Mark a memory as pending the ask-loop (Phase 2 gate). Off the critical path:
+   * failures are swallowed + logged. Never re-gates an already pending/rejected unit.
+   */
+  gateMemory(params: {
+    ownerId: string;
+    ownerKind: "fact" | "event";
+    now: string;
+    stakes: "none" | "high";
+    stakesDomain:
+      | "payment" | "credential" | "destructive" | "prod" | "exfil" | "vision" | null;
+  }): void {
+    try {
+      markGatePending(this.db, {
+        ownerId: params.ownerId,
+        ownerKind: params.ownerKind,
+        now: params.now,
+        stakes: params.stakes,
+        stakesDomain: params.stakesDomain,
+      });
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][provenance] gateMemory failed for ${params.ownerKind} ${params.ownerId} ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Recall-time stakes gate (Phase 2 wiring). For each recalled unit, classify
+   * stakes and — if it is unverified, high-stakes, and not yet handled — mark it
+   * pending the ask-loop. This NEVER removes a unit from injection (the soul stays
+   * intact: trust gates ACTION, not injection); it only writes the gate state as a
+   * side effect. Best-effort: off the critical path, each unit isolated, all errors
+   * swallowed + logged. `eventType`/`distinctiveness` are optional — when present
+   * (future recall plumbing) the vision branch activates with no change here.
+   */
+  gateRecalledUnits(
+    units: ReadonlyArray<{
+      owner_id: string;
+      owner_kind: "fact" | "event";
+      text: string;
+      eventType?: string;
+      distinctiveness?: number;
+    }>,
+    now: string,
+  ): void {
+    for (const u of units) {
+      try {
+        const stakes = classifyStakes({
+          content: u.text,
+          eventType: u.eventType,
+          distinctiveness: u.distinctiveness,
+        });
+        if (stakes.stakes !== "high") continue;
+        const life = getLifecycle(this.db, u.owner_id, u.owner_kind);
+        if (!life) continue;
+        const prov = parseProvenance(life.provenance_json);
+        if (!shouldGate({ trust: prov.trust, stakes: stakes.stakes, gateState: gateStateOf(prov) })) {
+          continue;
+        }
+        this.gateMemory({
+          ownerId: u.owner_id,
+          ownerKind: u.owner_kind,
+          now,
+          stakes: stakes.stakes,
+          stakesDomain: stakes.stakes_domain,
+        });
+      } catch (err) {
+        this.logger?.warn?.(
+          `[memory-tdai][provenance] gateRecalledUnits failed for ${u.owner_kind} ${u.owner_id} ` +
+            `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Surface memories pending the ask-loop (gate_state = pending_confirmation),
+   * newest first, with their display text + origin + stakes domain. The Phase 3
+   * interrupt block is rendered from these. Off the critical path: on any failure
+   * returns []. Fact text is rendered "attribute: value"; event text is the event.
+   */
+  getPendingAsks(limit = 10): Array<{
+    owner_id: string;
+    owner_kind: "fact" | "event";
+    text: string;
+    origin: import("../kb/provenance.js").ProvenanceOrigin;
+    stakes_domain: import("../kb/provenance.js").StakesDomain | null;
+  }> {
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT owner_id, owner_kind, provenance_json
+             FROM memory_lifecycle
+            WHERE json_extract(provenance_json, '$.gate_state') = 'pending_confirmation'
+            ORDER BY updated_time DESC
+            LIMIT ?`,
+        )
+        .all(Math.max(1, Math.min(limit, 50))) as Array<{
+        owner_id: string;
+        owner_kind: string;
+        provenance_json: string;
+      }>;
+
+      const out: Array<{
+        owner_id: string;
+        owner_kind: "fact" | "event";
+        text: string;
+        origin: import("../kb/provenance.js").ProvenanceOrigin;
+        stakes_domain: import("../kb/provenance.js").StakesDomain | null;
+      }> = [];
+      for (const r of rows) {
+        const kind = r.owner_kind === "fact" ? "fact" : "event";
+        const prov = parseProvenance(r.provenance_json);
+        let text = "";
+        if (kind === "event") {
+          const ev = this.db.prepare("SELECT text FROM events WHERE id = ?").get(r.owner_id) as
+            | { text: string }
+            | undefined;
+          text = ev?.text ?? "";
+        } else {
+          const f = this.db
+            .prepare("SELECT attribute, value FROM facts WHERE id = ?")
+            .get(r.owner_id) as { attribute: string; value: string } | undefined;
+          text = f ? `${f.attribute}: ${f.value}` : "";
+        }
+        if (!text) continue;
+        out.push({
+          owner_id: r.owner_id,
+          owner_kind: kind,
+          text,
+          origin: prov.origin,
+          stakes_domain: prov.stakes_domain ?? null,
+        });
+      }
+      return out;
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][provenance] getPendingAsks failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return [];
+    }
+  }
+
+  /**
+   * Grounded Trust Phase 4 (learning): the keys of recalled units that Lorenzo has
+   * REJECTED, so the recall path can suppress them from injection — a tombstoned
+   * memory must never drive action again. Keys are "ownerKind:ownerId". Best-effort:
+   * on error returns an empty set (fail-open = show the memory, never break recall).
+   * Facts are already dropped from HEAD by rejectMemory (valid_to); this also covers
+   * append-only events, which have no validity window.
+   */
+  rejectedOwnerKeys(
+    units: ReadonlyArray<{ owner_id: string; owner_kind: "fact" | "event" }>,
+  ): Set<string> {
+    const rejected = new Set<string>();
+    try {
+      for (const u of units) {
+        const life = getLifecycle(this.db, u.owner_id, u.owner_kind);
+        if (!life) continue;
+        if (gateStateOf(parseProvenance(life.provenance_json)) === "rejected") {
+          rejected.add(`${u.owner_kind}:${u.owner_id}`);
+        }
+      }
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][provenance] rejectedOwnerKeys failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    return rejected;
+  }
+
+  /**
+   * Associative recall (the beating heart): from the entities a query activated
+   * (the recall seeds), let activation SPREAD over the entity graph (`relations`,
+   * weighted by `support`) so memories the query never named SURFACE because they
+   * are strongly connected to an active one — converging when reached from several
+   * seeds. Returns one representative memory (top HEAD fact, else latest event) per
+   * newly-activated entity, ordered strongest-first. Best-effort, bounded, off the
+   * critical path: any failure returns [] (associative recall is purely additive).
+   */
+  associativeExpand(
+    seedEntityIds: string[],
+    opts?: { hops?: number; maxNodes?: number; namespace?: string },
+  ): Array<{
+    owner_id: string;
+    owner_kind: "fact" | "event";
+    text: string;
+    entity_id: string;
+    activation: number;
+  }> {
+    try {
+      const seeds = (seedEntityIds ?? []).filter(Boolean);
+      if (seeds.length === 0) return [];
+      const namespace = opts?.namespace ?? "default";
+
+      // Lazy, memoized adjacency over LIVE edges (valid_to IS NULL), weighted by support.
+      const memo = new Map<string, WeightedNeighbor[]>();
+      const neighborsOf = (id: string): WeightedNeighbor[] => {
+        let n = memo.get(id);
+        if (!n) {
+          n = kbQueryRelationsForEntity(this.db, id)
+            .filter((r) => r.valid_to == null && r.namespace === namespace)
+            .map((r) => ({
+              id: r.src_entity_id === id ? r.dst_entity_id : r.src_entity_id,
+              weight: r.support > 0 ? r.support : 1,
+            }))
+            .filter((x) => x.id && x.id !== id);
+          memo.set(id, n);
+        }
+        return n;
+      };
+
+      const activated = spreadActivation(
+        seeds.map((id) => ({ id, activation: 1 })),
+        neighborsOf,
+        { hops: opts?.hops ?? 2, maxNodes: opts?.maxNodes ?? 6 },
+      );
+
+      const out: Array<{
+        owner_id: string;
+        owner_kind: "fact" | "event";
+        text: string;
+        entity_id: string;
+        activation: number;
+      }> = [];
+      for (const [entityId, activation] of activated) {
+        // Pick the SALIENT memory, not a noise metric. Internal counters
+        // (line_count, action_phase, char_count, …) pollute injection — skip them and
+        // take the most-confident real fact; else fall back to the latest event.
+        const facts = kbQueryHeadFacts(this.db, entityId)
+          .filter((f) => !isNoiseAttribute(f.attribute))
+          .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
+        if (facts.length > 0) {
+          const f = facts[0]!;
+          out.push({ owner_id: f.id, owner_kind: "fact", text: `${f.attribute}: ${f.value}`, entity_id: entityId, activation });
+          continue;
+        }
+        const events = kbQueryEventsForEntity(this.db, entityId, namespace, 1);
+        if (events.length > 0) {
+          out.push({ owner_id: events[0]!.id, owner_kind: "event", text: events[0]!.text, entity_id: entityId, activation });
+        }
+      }
+      return out;
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][assoc] associativeExpand failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return [];
+    }
+  }
+
+  /**
+   * Hebbian reinforcement (Incremento B2a) — "ogni richiamo rinforza" (CMA:
+   * every access reinforces). Bumps each surfaced owner's lifecycle reinforcement
+   * (count → permanence → long-term promotion) so memories that keep being
+   * recalled resist staleness decay and consolidate. Bounded by the caller (top-K)
+   * and best-effort here: a per-owner failure is swallowed so reinforcement NEVER
+   * breaks the recall it rides on. Returns how many owners were reinforced.
+   */
+  reinforceRecalledOwners(
+    owners: Array<{ owner_id: string; owner_kind: "fact" | "event" }>,
+    now: string,
+  ): number {
+    if (this.degraded || !this.kbReady) return 0;
+    let reinforced = 0;
+    for (const o of owners ?? []) {
+      if (!o?.owner_id) continue;
+      try {
+        kbReinforce(this.db, { ownerId: o.owner_id, ownerKind: o.owner_kind, now });
+        reinforced++;
+      } catch (err) {
+        this.logger?.warn?.(
+          `[memory-tdai][hebbian] reinforce failed for ${o.owner_kind} ${o.owner_id} ` +
+            `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    return reinforced;
+  }
+
+  /**
+   * The dense associative edge layer (for Implicit Priming + spreading activation),
+   * restricted to a candidate entity set: co-occurrence edges (entities sharing an
+   * event — Hebbian "fire together, wire together", from `events.entities_json`)
+   * UNIONED with explicit `relations`. Co-occurrence densifies a sparse explicit
+   * graph (measured 0.35 rel/entity) so priming actually fires. Edge weight = shared
+   * events (+ relation support). Bounded to the candidate set; best-effort → {} on error.
+   */
+  candidateAdjacency(
+    entityIds: string[],
+    namespace = "default",
+  ): Map<string, WeightedNeighbor[]> {
+    try {
+      const cand = new Set((entityIds ?? []).filter(Boolean));
+      if (cand.size === 0) return new Map();
+      const adj = new Map<string, Map<string, number>>();
+      const addEdge = (a: string, b: string, w: number): void => {
+        if (a === b || !cand.has(a) || !cand.has(b)) return;
+        let m = adj.get(a);
+        if (!m) { m = new Map(); adj.set(a, m); }
+        m.set(b, (m.get(b) ?? 0) + w);
+      };
+
+      // 1. Co-occurrence from events that mention a candidate entity.
+      const ids = [...cand];
+      const likeClauses = ids.map(() => "entities_json LIKE ?").join(" OR ");
+      const rows = this.db
+        .prepare(`SELECT entities_json FROM events WHERE namespace = ? AND (${likeClauses})`)
+        .all(namespace, ...ids.map((id) => `%${id}%`)) as Array<{ entities_json: string }>;
+      for (const r of rows) {
+        let ents: string[] = [];
+        try {
+          const parsed = JSON.parse(r.entities_json);
+          if (Array.isArray(parsed)) ents = parsed.filter((e): e is string => typeof e === "string");
+        } catch { /* skip malformed */ }
+        const inCand = ents.filter((e) => cand.has(e));
+        for (let i = 0; i < inCand.length; i++) {
+          for (let j = i + 1; j < inCand.length; j++) {
+            addEdge(inCand[i]!, inCand[j]!, 1);
+            addEdge(inCand[j]!, inCand[i]!, 1);
+          }
+        }
+      }
+
+      // 2. Explicit live relations (union).
+      for (const id of cand) {
+        for (const rel of kbQueryRelationsForEntity(this.db, id)) {
+          if (rel.valid_to != null || rel.namespace !== namespace) continue;
+          const other = rel.src_entity_id === id ? rel.dst_entity_id : rel.src_entity_id;
+          const w = rel.support > 0 ? rel.support : 1;
+          addEdge(id, other, w);
+          addEdge(other, id, w);
+        }
+      }
+
+      const out = new Map<string, WeightedNeighbor[]>();
+      for (const [id, m] of adj) out.set(id, [...m].map(([nid, w]) => ({ id: nid, weight: w })));
+      return out;
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][assoc] candidateAdjacency failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return new Map();
+    }
+  }
+
   async reindexAll(
     embedFn: (text: string) => Promise<Float32Array | Float32Array[]>,
     onProgress?: (done: number, total: number, layer: "L1" | "L0") => void,
@@ -2119,6 +2716,42 @@ export class VectorStore implements IMemoryStore {
     }
   }
 
+  /**
+   * Re-embed the KB recall layer (`kb_vec`) from `kb_fts`, mirroring
+   * {@link reindexAll} for L0/L1. Needed because a dimension/model change drops+
+   * recreates `kb_vec` EMPTY ({@link dropVectorTables}), and `reindexAll` only
+   * covers L0/L1 — without this, kb semantic recall (recall.source=kb) stays
+   * blank after an embedding switch. Idempotent: {@link upsertKbVector} is
+   * delete-then-insert per owner. Per-owner errors are swallowed so one bad row
+   * never aborts the whole rebuild. Off any conversation path (offline tool).
+   */
+  async reindexKb(
+    embedFn: (text: string) => Promise<Float32Array | Float32Array[]>,
+    onProgress?: (done: number, total: number) => void,
+  ): Promise<{ kbCount: number }> {
+    if (this.degraded || !this.kbVecReady) {
+      this.logger?.warn(`${TAG} reindexKb skipped: kb_vec not ready`);
+      return { kbCount: 0 };
+    }
+    const rows = this.getAllKbTexts();
+    let done = 0;
+    for (const { owner_id, owner_kind, content, updated_time } of rows) {
+      try {
+        if (content && content.trim().length > 0) {
+          this.upsertKbVector(owner_id, owner_kind, await embedFn(content), updated_time);
+        }
+      } catch (err) {
+        this.logger?.warn?.(
+          `${TAG} reindexKb skip ${owner_kind} ${owner_id}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      done++;
+      onProgress?.(done, rows.length);
+    }
+    this.logger?.info(`${TAG} KB reindex complete: ${done}/${rows.length} owners`);
+    return { kbCount: done };
+  }
+
   // ── L0 query operations (for L1 runner) ──────────────────────────────────
 
   /**
@@ -2131,6 +2764,7 @@ export class VectorStore implements IMemoryStore {
     sessionKey: string,
     afterRecordedAtMs?: number,
     limit = 50,
+    afterRowId = 0,
   ): Array<{
     record_id: string;
     session_key: string;
@@ -2139,6 +2773,7 @@ export class VectorStore implements IMemoryStore {
     message_text: string;
     recorded_at: string;
     timestamp: number;
+    rowid: number;
   }> {
     if (this.degraded) {
       this.logger?.warn(`${TAG} [L0-query] SKIPPED (degraded mode)`);
@@ -2156,9 +2791,11 @@ export class VectorStore implements IMemoryStore {
       // per-window cursor advancement walk the whole backlog across triggers.
       const incremental = Boolean(afterRecordedAtMs && afterRecordedAtMs > 0);
       if (incremental) {
-        // Convert epoch ms to ISO string for recorded_at comparison
+        // Convert epoch ms to ISO string for recorded_at comparison. The tie
+        // clause `(recorded_at = iso AND rowid > afterRowId)` pages within a
+        // same-recorded_at block (the chat-backfill case).
         const afterRecordedAtIso = new Date(afterRecordedAtMs!).toISOString();
-        rows = this.stmtL0QueryAfterAsc.all(sessionKey, afterRecordedAtIso, limit) as Array<Record<string, unknown>>;
+        rows = this.stmtL0QueryAfterAsc.all(sessionKey, afterRecordedAtIso, afterRecordedAtIso, afterRowId, limit) as Array<Record<string, unknown>>;
       } else {
         rows = this.stmtL0QueryAllAsc.all(sessionKey, limit) as Array<Record<string, unknown>>;
       }
@@ -2176,6 +2813,7 @@ export class VectorStore implements IMemoryStore {
         message_text: r.message_text as string,
         recorded_at: (r.recorded_at as string) || "",
         timestamp: (r.timestamp as number) || 0,
+        rowid: (r._rowid as number) || 0,
       }));
       // Both paths are already chronological (ASC) — return as-is.
       return mapped;
@@ -2198,16 +2836,17 @@ export class VectorStore implements IMemoryStore {
     sessionKey: string,
     afterRecordedAtMs?: number,
     limit = 50,
-  ): Array<{ sessionId: string; messages: Array<{ id: string; role: string; content: string; timestamp: number; recordedAtMs: number }> }> {
+    afterRowId = 0,
+  ): Array<{ sessionId: string; messages: Array<{ id: string; role: string; content: string; timestamp: number; recordedAtMs: number; rowid: number }> }> {
     if (this.degraded) {
       this.logger?.warn(`${TAG} [L0-query-grouped] SKIPPED (degraded mode)`);
       return [];
     }
     try {
-      const rows = this.queryL0ForL1(sessionKey, afterRecordedAtMs, limit);
+      const rows = this.queryL0ForL1(sessionKey, afterRecordedAtMs, limit, afterRowId);
 
       // Group by session_id
-      const groupMap = new Map<string, Array<{ id: string; role: string; content: string; timestamp: number; recordedAtMs: number }>>();
+      const groupMap = new Map<string, Array<{ id: string; role: string; content: string; timestamp: number; recordedAtMs: number; rowid: number }>>();
       for (const row of rows) {
         const sid = row.session_id || "";
         let group = groupMap.get(sid);
@@ -2221,11 +2860,12 @@ export class VectorStore implements IMemoryStore {
           content: row.message_text,
           timestamp: row.timestamp,
           recordedAtMs: row.recorded_at ? Date.parse(row.recorded_at) || 0 : 0,
+          rowid: row.rowid,
         });
       }
 
       // Convert to array, sorted by earliest message timestamp
-      const groups: Array<{ sessionId: string; messages: Array<{ id: string; role: string; content: string; timestamp: number; recordedAtMs: number }> }> = [];
+      const groups: Array<{ sessionId: string; messages: Array<{ id: string; role: string; content: string; timestamp: number; recordedAtMs: number; rowid: number }> }> = [];
       for (const [sessionId, messages] of groupMap) {
         if (messages.length > 0) {
           groups.push({ sessionId, messages });
@@ -2650,6 +3290,16 @@ export class VectorStore implements IMemoryStore {
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_rel_src ON relations(src_entity_id, type)");
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_rel_dst ON relations(dst_entity_id, type)");
 
+      // ── session_projects: sessionKey → project-name registry. sessionKey is
+      //    per-project (plugin getSessionKey(cwd)) but events/L0 don't store the
+      //    project NAME. This registry lets the background extractor tag new
+      //    events by project, and lets recall scope to the current project.
+      //    Additive & best-effort. prepare().run() (not db.exec) dodges the
+      //    child_process.exec lint false-positive on node:sqlite.
+      this.db
+        .prepare("CREATE TABLE IF NOT EXISTS session_projects (session_key TEXT PRIMARY KEY, project TEXT NOT NULL, updated_at TEXT)")
+        .run();
+
       // ── Sinapsys foundations (Phases A–E): memory_lifecycle / lessons /
       //    memory_audit / context_fingerprints / relations.weight. Additive &
       //    best-effort; never blocks the base KB from becoming ready.
@@ -2691,6 +3341,14 @@ export class VectorStore implements IMemoryStore {
         `);
         // vec0 KNN cannot reliably filter by a metadata column inside the MATCH
         // query, so owner_kind filtering is applied in JS (see searchKbVector).
+        // Raw-vector reads for the navigable index (build-at-boot + reconcile).
+        this.stmtKbVecReadAll = this.db.prepare(
+          "SELECT chunk_id, owner_id, owner_kind, embedding FROM kb_vec",
+        );
+        this.stmtKbVecReadOwner = this.db.prepare(
+          "SELECT chunk_id, owner_kind, embedding FROM kb_vec WHERE owner_id = ?",
+        );
+        this.stmtKbVecCount = this.db.prepare("SELECT count(*) AS c FROM kb_vec");
         this.kbVecReady = true;
       } catch (err) {
         this.kbVecReady = false;
@@ -2877,6 +3535,106 @@ export class VectorStore implements IMemoryStore {
     return kbListRecentEvents(this.db, namespace, opts);
   }
 
+  /** @see IMemoryStore.listEventsBySession */
+  listEventsBySession(sessionKey: string): KbEvent[] {
+    if (!this.kbReady) return [];
+    return kbListEventsBySession(this.db, sessionKey);
+  }
+
+  /** @see IMemoryStore.latestEventBySessionKeyType */
+  latestEventBySessionKeyType(sessionKey: string, type: string): KbEvent | undefined {
+    if (!this.kbReady) return undefined;
+    return kbLatestEventBySessionKeyType(this.db, sessionKey, type);
+  }
+
+  /** @see IMemoryStore.setSessionProject */
+  setSessionProject(sessionKey: string, project: string): void {
+    if (!this.kbReady || !sessionKey || !project) return;
+    try {
+      this.db
+        .prepare(
+          "INSERT INTO session_projects(session_key, project, updated_at) VALUES(?,?,?) " +
+          "ON CONFLICT(session_key) DO UPDATE SET project=excluded.project, updated_at=excluded.updated_at",
+        )
+        .run(sessionKey, project, new Date().toISOString());
+    } catch {
+      /* best-effort registry — never break recall/capture */
+    }
+  }
+
+  /** @see IMemoryStore.getSessionProject */
+  getSessionProject(sessionKey: string): string | undefined {
+    if (!this.kbReady || !sessionKey) return undefined;
+    try {
+      const row = this.db
+        .prepare("SELECT project FROM session_projects WHERE session_key = ?")
+        .get(sessionKey) as { project?: string } | undefined;
+      return row?.project || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** @see IMemoryStore.getEventProjects — project tag per event id (recall scoping). */
+  getEventProjects(ids: string[]): Record<string, string> {
+    const out: Record<string, string> = {};
+    if (!this.kbReady || ids.length === 0) return out;
+    try {
+      const placeholders = ids.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(`SELECT id, project FROM events WHERE id IN (${placeholders})`)
+        .all(...ids) as Array<{ id: string; project?: string }>;
+      for (const r of rows) if (r.project) out[r.id] = r.project;
+    } catch {
+      /* best-effort — recall must never break */
+    }
+    return out;
+  }
+
+  /**
+   * @see IMemoryStore.getMemoryHealth — the immune system's heartbeat.
+   * Flags sessions where the raw log (L0) is growing but the extracted graph
+   * (events) is NOT keeping up — the exact silent failure that let Sofia/Tutor
+   * freeze for weeks unnoticed. Only ACTIVELY-USED sessions are considered
+   * (recent L0); dormant ones are not "broken". Store-only, never throws.
+   */
+  getMemoryHealth(nowMs: number = Date.now()): {
+    healthy: boolean;
+    stale: Array<{ sessionKey: string; project: string; lagHours: number }>;
+  } {
+    const RECENT_L0_MS = 3 * 24 * 3600 * 1000; // consider only sessions used in last 3 days
+    const LAG_MS = 36 * 3600 * 1000; // events >36h behind their L0 = extraction stalled
+    const out = { healthy: true, stale: [] as Array<{ sessionKey: string; project: string; lagHours: number }> };
+    if (!this.kbReady) return out;
+    try {
+      const rows = this.db
+        .prepare(
+          "SELECT l.session_key sk, MAX(l.recorded_at) l0, " +
+          "(SELECT MAX(e.ts) FROM events e WHERE e.session_key = l.session_key) ev " +
+          "FROM l0_conversations l GROUP BY l.session_key",
+        )
+        .all() as Array<{ sk: string; l0: string | null; ev: string | null }>;
+      for (const r of rows) {
+        const l0ms = Date.parse(r.l0 ?? "");
+        if (!Number.isFinite(l0ms) || nowMs - l0ms > RECENT_L0_MS) continue; // dormant → skip
+        const evms = r.ev ? Date.parse(r.ev) : 0;
+        const lag = l0ms - (Number.isFinite(evms) ? evms : 0);
+        if (lag > LAG_MS) {
+          out.stale.push({
+            sessionKey: r.sk,
+            project: this.getSessionProject(r.sk) ?? r.sk.slice(0, 8),
+            lagHours: Math.round(lag / 3_600_000),
+          });
+        }
+      }
+      out.stale.sort((a, b) => b.lagHours - a.lagHours);
+      out.healthy = out.stale.length === 0;
+    } catch {
+      /* best-effort — health check must never break recall */
+    }
+    return out;
+  }
+
   /** @see IMemoryStore.queryRelationsForEntity */
   queryRelationsForEntity(entityId: string): KbRelation[] {
     if (!this.kbReady) return [];
@@ -2887,6 +3645,193 @@ export class VectorStore implements IMemoryStore {
   queryEventsForEntity(entityId: string, namespace = "default", limit = 50): KbEvent[] {
     if (!this.kbReady) return [];
     return kbQueryEventsForEntity(this.db, entityId, namespace, limit);
+  }
+
+  /** @see IMemoryStore.queryHeadLessonsByFile */
+  queryHeadLessonsByFile(fileEntityId: string, namespace = "default", limit = 3): KbLessonHit[] {
+    if (!this.kbReady) return [];
+    return kbQueryHeadLessonsByFile(this.db, fileEntityId, namespace, limit).map((r) => ({
+      id: r.id,
+      domain: r.domain,
+      lessonText: r.lesson_text,
+      confidence: r.confidence,
+      evidenceCount: r.evidence_count,
+      willingness: r.stance_willingness,
+    }));
+  }
+
+  /**
+   * Record that a lesson resurfaced into a matching situation this session (B3
+   * exposure). Best-effort, off the critical path: failures swallowed + logged.
+   */
+  recordLessonExposure(lessonId: string, sessionId: string, now: string): void {
+    if (!this.kbReady) return;
+    try {
+      kbRecordExposure(this.db, lessonId, sessionId, now);
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][lessons] recordLessonExposure failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * @see IMemoryStore.creditSessionAvoidances
+   * Implicit (Phase A) avoidance crediting at session end: for each HEAD lesson
+   * exposed this session whose avoidance_count has crossed τ (so it self-credits),
+   * credit a successful avoidance UNLESS the failure relapsed — a bug event this
+   * session touching the lesson's trigger files — in which case temper its confidence.
+   * Phase-B lessons (still young) are skipped here; they wait for explicit confirmation.
+   * Off the critical path: any failure returns zero counts.
+   */
+  creditLessonAvoidance(lessonId: string, now: string): boolean {
+    if (!this.kbReady) return false;
+    try {
+      return kbCreditAvoidance(this.db, lessonId, now) !== null;
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][lessons] creditLessonAvoidance failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Pilastro B — record that a stance fired a hard interrupt (bumps its fire
+   * count). Best-effort, off the critical path: failures swallowed + logged.
+   */
+  recordStanceFire(lessonId: string, now: string): void {
+    if (!this.kbReady) return;
+    try {
+      kbRecordStanceFire(this.db, lessonId, now);
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][lessons] recordStanceFire failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /** Pilastro B — Lorenzo confirmed a stance interrupt mattered (willingness rises). */
+  creditStanceConfirmed(lessonId: string, now: string): boolean {
+    if (!this.kbReady) return false;
+    try {
+      return kbCreditStanceConfirmed(this.db, lessonId, now) !== null;
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][lessons] creditStanceConfirmed failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
+  /** Pilastro B — Lorenzo rejected a stance interrupt as a false alarm (willingness falls). */
+  creditStanceRejected(lessonId: string, now: string): boolean {
+    if (!this.kbReady) return false;
+    try {
+      return kbCreditStanceRejected(this.db, lessonId, now) !== null;
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][lessons] creditStanceRejected failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
+  creditSessionAvoidances(sessionId: string, now: string): { credited: number; tempered: number } {
+    if (!this.kbReady) return { credited: 0, tempered: 0 };
+    try {
+      const exposed = kbQueryLessonsExposedInSession(this.db, sessionId);
+      if (exposed.length === 0) return { credited: 0, tempered: 0 };
+
+      // Entity ids touched by this session's bug events (the relapse signal).
+      const bugRows = this.db
+        .prepare("SELECT entities_json FROM events WHERE session_key = ? AND type = 'bug'")
+        .all(sessionId) as Array<{ entities_json: string }>;
+      const bugEntities = new Set<string>();
+      for (const r of bugRows) {
+        try {
+          const arr = JSON.parse(r.entities_json);
+          if (Array.isArray(arr)) for (const e of arr) if (typeof e === "string") bugEntities.add(e);
+        } catch { /* skip malformed */ }
+      }
+
+      let credited = 0;
+      let tempered = 0;
+      for (const l of exposed) {
+        if (lessonPhaseFor(l.avoidance_count) !== "implicit") continue; // Phase B → explicit only
+        let files: string[] = [];
+        try {
+          const t = JSON.parse(l.trigger_pattern);
+          if (t && Array.isArray(t.files)) files = t.files.filter((f: unknown): f is string => typeof f === "string");
+        } catch { /* trigger not JSON → no file relapse signal */ }
+        const relapsed = files.some((f) => bugEntities.has(f));
+        if (relapsed) {
+          kbTemperOnRecurrence(this.db, l.id, now);
+          tempered++;
+        } else {
+          kbCreditAvoidance(this.db, l.id, now);
+          credited++;
+        }
+      }
+      return { credited, tempered };
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][lessons] creditSessionAvoidances failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return { credited: 0, tempered: 0 };
+    }
+  }
+
+  /** @see IMemoryStore.runLessonDistillation */
+  async runLessonDistillation(
+    llmRunner: LLMRunner,
+    opts: { now: string; namespace?: string; maxClusters?: number },
+  ): Promise<{ candidates: number; inserted: number; superseded: number; skippedDuplicate: number }> {
+    if (this.degraded || !this.kbReady || !this.kbVecReady) {
+      return { candidates: 0, inserted: 0, superseded: 0, skippedDuplicate: 0 };
+    }
+    // distillLessons reads kb_vec (bug clustering) via this.db (sqlite-vec loaded)
+    // and writes the `lessons` table on the SAME connection — no extra writer.
+    const stats = await kbDistillLessons(this.db, llmRunner, {
+      now: opts.now,
+      namespace: opts.namespace,
+      maxClusters: opts.maxClusters,
+    });
+    return {
+      candidates: stats.candidates,
+      inserted: stats.inserted,
+      superseded: stats.superseded,
+      skippedDuplicate: stats.skippedDuplicate,
+    };
+  }
+
+  /** @see IMemoryStore.runUsageDistillation */
+  async runUsageDistillation(
+    llmRunner: LLMRunner,
+    opts: { now: string; namespace?: string; maxClusters?: number },
+  ): Promise<{ candidates: number; confirmed: number; inserted: number; skippedDuplicate: number; skippedRejected: number }> {
+    if (this.degraded || !this.kbReady || !this.kbVecReady) {
+      return { candidates: 0, confirmed: 0, inserted: 0, skippedDuplicate: 0, skippedRejected: 0 };
+    }
+    // Usage clustering is SEMANTIC → it needs vectors (unlike per-entity
+    // principles). The reader reads this.db's kb_vec; events are read and the
+    // usage atom is written on the SAME store/connection. The LLM is the A3
+    // precision gate that rejects noise clusters (recall from clustering,
+    // precision from the judge).
+    const reader = createKbVecEmbeddingReader(this.db, this.dimensions);
+    return kbDistillUsage(this, reader, llmRunner, {
+      now: opts.now,
+      namespace: opts.namespace,
+      maxClusters: opts.maxClusters,
+      // Surface the pairwise-cap notice in the gateway log (never a silent cap).
+      logger: this.logger,
+    });
   }
 
   /**
@@ -2920,6 +3865,24 @@ export class VectorStore implements IMemoryStore {
       } catch (err) {
         try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
         throw err;
+      }
+      // Best-effort navigable-index sync — NEVER affects the (committed) DB result.
+      try {
+        if (this.kbNavBuilding && this.kbNavDirtyOwners) {
+          this.kbNavDirtyOwners.add(ownerId); // reconciled when the build publishes
+        } else if (this.kbNavIndex) {
+          const entries = chunkVectors.map((v, i) => ({
+            chunkId: kbChunkId(ownerKind, ownerId, i),
+            ownerKind,
+            vec: v,
+          }));
+          this.navReplaceOwner(ownerId, entries);
+          this.maybeCompactKbNavIndex(); // GC tombstones once they pile up
+        }
+      } catch (e) {
+        this.logger?.warn?.(
+          `${TAG} nav-index sync (upsert) failed (non-fatal) owner=${ownerId}: ${e instanceof Error ? e.message : String(e)}`,
+        );
       }
       return true;
     } catch (err) {
@@ -2969,6 +3932,14 @@ export class VectorStore implements IMemoryStore {
    */
   searchKbVector(queryEmbedding: Float32Array, topK = 5, ownerKindFilter?: string): KbVectorSearchResult[] {
     if (this.degraded || !this.kbVecReady) return [];
+    // Route through the navigable index when it is built. Fall back to the
+    // brute-force scan on: an error (null), OR an empty approximate result while
+    // the index is non-empty (a pathological ANN/rare-kind miss). Correctness is
+    // never sacrificed for speed — a non-empty index that returns nothing is not trusted.
+    if (this.kbNavIndex) {
+      const viaIndex = this.searchKbVectorViaIndex(queryEmbedding, topK, ownerKindFilter);
+      if (viaIndex && (viaIndex.length > 0 || this.kbNavIndex.size === 0)) return viaIndex;
+    }
     try {
       const retrieveCount = topK * VectorStore.CHUNK_RECALL_FANOUT + VectorStore.ZERO_VEC_BUFFER;
       const rows = this.stmtKbVecSearch!.all(
@@ -2994,6 +3965,455 @@ export class VectorStore implements IMemoryStore {
       );
       return [];
     }
+  }
+
+  /**
+   * kb_vec KNN via the navigable index. Mirrors the brute-force contract:
+   * de-dup to the best chunk per owner, optional ownerKind filter, trim to topK.
+   * Returns null on any failure so the caller falls back to the brute-force scan.
+   */
+  private searchKbVectorViaIndex(
+    queryEmbedding: Float32Array,
+    topK: number,
+    ownerKindFilter?: string,
+  ): KbVectorSearchResult[] | null {
+    const idx = this.kbNavIndex;
+    if (!idx) return null;
+    try {
+      // Over-fetch: chunks de-dup to owners, and a JS kind filter can drop hits.
+      const retrieveCount = ownerKindFilter
+        ? topK * 20 + VectorStore.ZERO_VEC_BUFFER
+        : topK * VectorStore.CHUNK_RECALL_FANOUT + VectorStore.ZERO_VEC_BUFFER;
+      const hits = idx.search(queryEmbedding, retrieveCount);
+      const results: KbVectorSearchResult[] = [];
+      const seenOwners = new Set<string>();
+      for (const h of hits) {
+        const meta = this.kbNavChunkMeta.get(h.id);
+        if (!meta) continue; // metadata lost → skip (defensive)
+        if (ownerKindFilter && meta.ownerKind !== ownerKindFilter) continue;
+        if (seenOwners.has(meta.ownerId)) continue; // best chunk per owner (hits are score-sorted)
+        seenOwners.add(meta.ownerId);
+        results.push({ owner_id: meta.ownerId, owner_kind: meta.ownerKind, score: h.score });
+        if (results.length >= topK) break;
+      }
+      return results;
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} [kb-vec-search-nav] FAILED (non-fatal, brute-force fallback): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    }
+  }
+
+  /** Whether the navigable kb_vec index is built and serving searches. */
+  isKbNavIndexActive(): boolean {
+    return this.kbNavIndex !== null;
+  }
+
+  /** Live node count of the navigable index (-1 if not built). For health/metrics/tests. */
+  getKbNavIndexSize(): number {
+    return this.kbNavIndex ? this.kbNavIndex.size : -1;
+  }
+
+  /** Decode a raw kb_vec embedding cell (BLOB bytes, or vec_to_json string) → Float32Array. */
+  private static vecFromCell(raw: unknown, dim: number): Float32Array | null {
+    if (raw == null) return null;
+    if (raw instanceof Uint8Array) {
+      // sqlite-vec stores float32 little-endian bytes; node:sqlite returns BLOB as Uint8Array.
+      if (raw.byteLength !== dim * 4) return null;
+      const out = new Float32Array(dim);
+      new Uint8Array(out.buffer).set(raw);
+      return out;
+    }
+    if (raw instanceof ArrayBuffer) {
+      if (raw.byteLength !== dim * 4) return null;
+      return new Float32Array(raw.slice(0));
+    }
+    if (typeof raw === "string") {
+      try {
+        const arr = JSON.parse(raw); // vec_to_json fallback shape
+        if (Array.isArray(arr) && arr.length === dim) return Float32Array.from(arr);
+      } catch { /* not JSON */ }
+      return null;
+    }
+    return null;
+  }
+
+  /**
+   * Read every kb_vec chunk vector (raw). Source of truth for the build-at-boot
+   * of the navigable index — reads the ALREADY-embedded vectors (no re-embedding).
+   */
+  getAllKbVectors(): Array<{ chunkId: string; ownerId: string; ownerKind: string; vec: Float32Array }> {
+    if (this.degraded || !this.kbVecReady || !this.stmtKbVecReadAll) return [];
+    try {
+      const rows = this.stmtKbVecReadAll.all() as Array<{
+        chunk_id: string; owner_id: string; owner_kind: string; embedding: unknown;
+      }>;
+      const out: Array<{ chunkId: string; ownerId: string; ownerKind: string; vec: Float32Array }> = [];
+      let dropped = 0;
+      for (const r of rows) {
+        const vec = VectorStore.vecFromCell(r.embedding, this.dimensions);
+        if (!vec) { dropped++; continue; }
+        out.push({ chunkId: r.chunk_id, ownerId: r.owner_id, ownerKind: r.owner_kind, vec });
+      }
+      if (dropped > 0) {
+        this.logger?.warn(
+          `${TAG} getAllKbVectors: ${dropped}/${rows.length} kb_vec rows failed to decode (owners may be missing from the index)`,
+        );
+      }
+      return out;
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} getAllKbVectors failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return [];
+    }
+  }
+
+  /** Live/tombstone counts of the navigable index (null if not built). For health/metrics/tests. */
+  getKbNavIndexStats(): { size: number; tombstones: number } | null {
+    return this.kbNavIndex ? { size: this.kbNavIndex.size, tombstones: this.kbNavIndex.tombstoneCount } : null;
+  }
+
+  /**
+   * Build the navigable kb_vec index in the BACKGROUND, yielding the event loop
+   * every {@link KB_NAV_BUILD_YIELD_MS} ms so it can never starve a recall (the
+   * whole point of Incremento C). Reads a consistent snapshot, builds into a
+   * LOCAL index, publishes atomically, then reconciles any owner written during
+   * the build (closing the write-during-build race). Idempotent; safe to re-run.
+   * Best-effort: on any failure the index stays null and searches use brute force.
+   */
+  async buildKbNavIndex(): Promise<boolean> {
+    if (this.closed || this.degraded || !this.kbVecReady || this.dimensions <= 0) return false;
+    if (this.kbNavBuilding) return false;
+    this.kbNavBuilding = true;
+    this.kbNavDirtyOwners = new Set<string>();
+    let published = false;
+    try {
+      const snapshot = this.getAllKbVectors();
+      // Refuse to publish a lossy index: if a meaningful fraction of rows failed to
+      // decode, those owners would be missing AND unreachable (the index short-circuits
+      // brute force). Staying on brute force is strictly safer than serving a hole.
+      const rawCount = this.kbVecRowCount();
+      if (rawCount > 0 && snapshot.length < rawCount * (1 - VectorStore.KB_NAV_MAX_DROP_RATIO)) {
+        this.logger?.warn(
+          `${TAG} buildKbNavIndex aborted: only ${snapshot.length}/${rawCount} kb_vec rows decoded — staying on brute force`,
+        );
+        return false;
+      }
+      const local = new NavigableIndex(this.dimensions);
+      const chunkMeta = new Map<string, { ownerId: string; ownerKind: string }>();
+      const ownerChunks = new Map<string, string[]>();
+      let lastYield = performance.now();
+      for (const row of snapshot) {
+        local.add(row.chunkId, row.vec);
+        chunkMeta.set(row.chunkId, { ownerId: row.ownerId, ownerKind: row.ownerKind });
+        const list = ownerChunks.get(row.ownerId);
+        if (list) list.push(row.chunkId);
+        else ownerChunks.set(row.ownerId, [row.chunkId]);
+        if (performance.now() - lastYield > VectorStore.KB_NAV_BUILD_YIELD_MS) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          if (this.closed) return false; // store closed mid-build → abort, stay on brute force
+          lastYield = performance.now();
+        }
+      }
+      if (this.closed) return false;
+      // Publish atomically (a search that starts now uses the fully-built index).
+      this.kbNavChunkMeta = chunkMeta;
+      this.kbNavOwnerChunks = ownerChunks;
+      this.kbNavIndex = local;
+      published = true;
+      // Reconcile owners written while we were building (their snapshot vec is stale).
+      const dirty = this.kbNavDirtyOwners;
+      this.kbNavDirtyOwners = null; // from here, writes sync into the live index directly
+      for (const ownerId of dirty) {
+        if (this.closed) break;
+        this.resyncOwnerFromDb(ownerId);
+      }
+      this.logger?.info(
+        `${TAG} kb-nav index built: ${local.size} live nodes from ${snapshot.length} chunks` +
+          (dirty.size ? ` (reconciled ${dirty.size} owner(s) written during build)` : ""),
+      );
+      // Persist the graph so the NEXT restart re-hydrates instead of rebuilding
+      // (Incremento b). Off this tick, best-effort, never blocks the caller.
+      void this.persistKbNavSnapshot();
+      return true;
+    } catch (err) {
+      if (!published) this.kbNavIndex = null; // a PUBLISHED index survives a late throw; only drop a partial build
+      this.logger?.warn(
+        `${TAG} buildKbNavIndex failed (non-fatal, brute-force fallback): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return published;
+    } finally {
+      this.kbNavBuilding = false;
+      this.kbNavDirtyOwners = null;
+    }
+  }
+
+  /**
+   * Boot entry point for the navigable index (Incremento b): try to re-hydrate
+   * from the on-disk snapshot (skips the minutes-long HNSW rebuild); on any
+   * miss/mismatch/corruption fall back to a full {@link buildKbNavIndex}. This
+   * is what init should call at startup — compaction rebuilds keep calling
+   * buildKbNavIndex directly (they WANT a fresh graph).
+   */
+  async initKbNavIndex(): Promise<boolean> {
+    if (await this.tryLoadKbNavSnapshot()) return true;
+    return this.buildKbNavIndex();
+  }
+
+  /**
+   * Persist the CURRENTLY published graph-only topology to disk (atomic). The
+   * vectors are NOT written — they are re-hydrated from the DB on load, so a
+   * snapshot can never serve a stale vector. Best-effort: any failure is logged
+   * and swallowed, and it yields the loop first so the (cheap) serialize never
+   * extends the publishing tick. Idempotent; safe to call repeatedly.
+   */
+  private async persistKbNavSnapshot(): Promise<void> {
+    const path = this.kbNavSnapshotPath;
+    const idx = this.kbNavIndex;
+    if (!path || !idx || this.closed || this.degraded) return;
+    try {
+      // Defer off the current tick — serialize + stringify are synchronous CPU.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (this.closed || this.degraded || this.kbNavIndex !== idx) return; // index swapped/closed/degraded meanwhile
+      const topology = idx.serializeTopology();
+      const text = encodeKbNavSnapshot({
+        formatVersion: KB_NAV_SNAPSHOT_FORMAT,
+        dim: this.dimensions,
+        rowCount: this.kbVecRowCount(),
+        builtAtMs: Date.now(),
+        topology,
+      });
+      writeKbNavSnapshotAtomic(path, text);
+      this.logger?.debug?.(
+        `${TAG} kb-nav snapshot persisted: ${topology.nodes.length} nodes → ${path}`,
+      );
+    } catch (err) {
+      this.logger?.warn?.(
+        `${TAG} persistKbNavSnapshot failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Try to publish the navigable index from the on-disk graph-only snapshot,
+   * re-hydrating vectors FRESH from the DB and re-attaching the persisted links.
+   * Reconciles drift since the snapshot: ids gone from the DB are excised (links
+   * repaired), ids new to the DB are inserted with a proper greedy insertion.
+   * Concurrent upserts during the load are captured via {@link kbNavDirtyOwners}
+   * and reconciled after publish (mirrors buildKbNavIndex). Returns false on any
+   * miss/mismatch/corruption so the caller rebuilds — correctness over speed.
+   */
+  private async tryLoadKbNavSnapshot(): Promise<boolean> {
+    const path = this.kbNavSnapshotPath;
+    if (!path || this.closed || this.degraded || !this.kbVecReady || this.dimensions <= 0) return false;
+    if (this.kbNavBuilding) return false;
+
+    const raw = readKbNavSnapshot(path);
+    if (raw == null) return false; // no snapshot yet → clean build
+
+    let file;
+    try {
+      file = decodeKbNavSnapshot(raw);
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} kb-nav snapshot unreadable (${err instanceof Error ? err.message : String(err)}) — discarding, will rebuild`,
+      );
+      deleteKbNavSnapshot(path);
+      return false;
+    }
+
+    if (file.dim !== this.dimensions) {
+      this.logger?.info(
+        `${TAG} kb-nav snapshot dim ${file.dim} != store dim ${this.dimensions} — discarding, will rebuild`,
+      );
+      deleteKbNavSnapshot(path);
+      return false;
+    }
+
+    // Freshness: a rowCount far from the snapshot's means a mass change (reindex /
+    // provider swap / bulk import) — safer to rebuild than to reconcile a huge delta.
+    const currentRows = this.kbVecRowCount();
+    if (currentRows === 0) return false; // empty DB → nothing to load; build no-ops cleanly
+    const lo = file.rowCount * VectorStore.KB_NAV_SNAPSHOT_MIN_ROW_RATIO;
+    const hi = file.rowCount * VectorStore.KB_NAV_SNAPSHOT_MAX_ROW_RATIO;
+    if (currentRows < lo || currentRows > hi) {
+      this.logger?.info(
+        `${TAG} kb-nav snapshot rows ${file.rowCount} vs current ${currentRows} out of band — rebuilding`,
+      );
+      return false;
+    }
+    // Bound the (file-controlled) node count against the LIVE DB row count too, so
+    // a corrupt/crafted snapshot cannot pass the rowCount band yet still force one
+    // huge un-yielded re-hydration pass at boot (rowCount and nodes.length are
+    // independent fields in the file). Legit snapshots have nodes.length ≈ rowCount.
+    if (file.topology.nodes.length > currentRows * VectorStore.KB_NAV_SNAPSHOT_MAX_ROW_RATIO) {
+      this.logger?.info(
+        `${TAG} kb-nav snapshot node count ${file.topology.nodes.length} exceeds current ${currentRows} band — rebuilding`,
+      );
+      return false;
+    }
+
+    this.kbNavBuilding = true;
+    this.kbNavDirtyOwners = new Set<string>();
+    let published = false;
+    try {
+      const rows = this.getAllKbVectors();
+      if (rows.length === 0) return false;
+      // Guard a lossy read the same way buildKbNavIndex does.
+      if (rows.length < currentRows * (1 - VectorStore.KB_NAV_MAX_DROP_RATIO)) {
+        this.logger?.warn(
+          `${TAG} kb-nav snapshot load aborted: only ${rows.length}/${currentRows} rows decoded — rebuilding`,
+        );
+        return false;
+      }
+
+      const vecById = new Map<string, Float32Array>();
+      const chunkMeta = new Map<string, { ownerId: string; ownerKind: string }>();
+      const ownerChunks = new Map<string, string[]>();
+      for (const r of rows) {
+        vecById.set(r.chunkId, r.vec);
+        chunkMeta.set(r.chunkId, { ownerId: r.ownerId, ownerKind: r.ownerKind });
+        const list = ownerChunks.get(r.ownerId);
+        if (list) list.push(r.chunkId);
+        else ownerChunks.set(r.ownerId, [r.chunkId]);
+      }
+
+      // Re-attach the persisted graph to the fresh vectors (skips HNSW build).
+      const { index, placedIds, missingIds } = NavigableIndex.restoreFromTopology(file.topology, vecById);
+
+      // Insert ids the DB has but the snapshot didn't (memories added since) with
+      // a proper greedy insertion, yielding so a large delta cannot starve recall.
+      let added = 0;
+      let lastYield = performance.now();
+      for (const r of rows) {
+        if (placedIds.has(r.chunkId)) continue;
+        index.add(r.chunkId, r.vec);
+        added++;
+        if (performance.now() - lastYield > VectorStore.KB_NAV_BUILD_YIELD_MS) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          if (this.closed) return false;
+          lastYield = performance.now();
+        }
+      }
+      if (this.closed) return false;
+
+      // Publish atomically.
+      this.kbNavChunkMeta = chunkMeta;
+      this.kbNavOwnerChunks = ownerChunks;
+      this.kbNavIndex = index;
+      published = true;
+
+      // Reconcile owners written while we were loading (their DB vec is authoritative).
+      const dirty = this.kbNavDirtyOwners;
+      this.kbNavDirtyOwners = null;
+      for (const ownerId of dirty) {
+        if (this.closed) break;
+        this.resyncOwnerFromDb(ownerId);
+      }
+
+      this.logger?.info(
+        `${TAG} kb-nav index LOADED from snapshot: ${index.size} live nodes ` +
+          `(topology ${file.topology.nodes.length}, +${added} new, -${missingIds.length} removed) — skipped rebuild` +
+          (dirty.size ? ` (reconciled ${dirty.size} owner(s) written during load)` : ""),
+      );
+
+      // If the on-disk graph drifted a lot from the DB, refresh it so future
+      // restarts keep loading a small delta (bounds reconcile cost over time).
+      if (added + missingIds.length > VectorStore.KB_NAV_SNAPSHOT_REWRITE_DELTA) {
+        void this.persistKbNavSnapshot();
+      }
+      return true;
+    } catch (err) {
+      if (!published) this.kbNavIndex = null; // never publish a partial load
+      this.logger?.warn(
+        `${TAG} tryLoadKbNavSnapshot failed (${err instanceof Error ? err.message : String(err)}) — rebuilding`,
+      );
+      return false;
+    } finally {
+      this.kbNavBuilding = false;
+      this.kbNavDirtyOwners = null;
+    }
+  }
+
+  /** Total kb_vec chunk-row count (0 on any error). Used to detect a lossy build snapshot. */
+  private kbVecRowCount(): number {
+    try {
+      const r = this.stmtKbVecCount?.get() as { c: number } | undefined;
+      return r?.c ?? 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Fire a background compacting rebuild if tombstones have piled up past the
+   * threshold — the ONLY GC for the tombstone-based delete (a long-running gateway
+   * would otherwise creep back toward the very starvation this index removes).
+   * Fire-and-forget, guarded by kbNavBuilding so it never overlaps.
+   */
+  private maybeCompactKbNavIndex(): void {
+    const idx = this.kbNavIndex;
+    if (!idx || this.kbNavBuilding || this.closed) return;
+    if (idx.size < VectorStore.KB_NAV_REBUILD_MIN_LIVE) return;
+    if (idx.tombstoneCount <= idx.size * VectorStore.KB_NAV_REBUILD_TOMBSTONE_RATIO) return;
+    // Defer off this write's tick: buildKbNavIndex's synchronous prefix (a full
+    // getAllKbVectors scan) must not block the upsert that triggered it.
+    setImmediate(() => {
+      if (this.closed || this.kbNavBuilding) return;
+      void this.buildKbNavIndex().catch((e) =>
+        this.logger?.warn?.(`${TAG} kb-nav compacting rebuild failed: ${e instanceof Error ? e.message : String(e)}`),
+      );
+    });
+  }
+
+  /** Re-apply an owner's CURRENT kb_vec state to the index (used to reconcile dirty owners). */
+  private resyncOwnerFromDb(ownerId: string): void {
+    if (!this.kbNavIndex) return;
+    try {
+      const rows = (this.stmtKbVecReadOwner?.all(ownerId) ?? []) as Array<{
+        chunk_id: string; owner_kind: string; embedding: unknown;
+      }>;
+      const entries: Array<{ chunkId: string; ownerKind: string; vec: Float32Array }> = [];
+      for (const r of rows) {
+        const vec = VectorStore.vecFromCell(r.embedding, this.dimensions);
+        if (vec) entries.push({ chunkId: r.chunk_id, ownerKind: r.owner_kind, vec });
+      }
+      this.navReplaceOwner(ownerId, entries);
+    } catch (err) {
+      this.logger?.warn?.(
+        `${TAG} resyncOwnerFromDb ${ownerId} failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /** Remove an owner's chunks from the index, then add the given ones (delete-then-insert). */
+  private navReplaceOwner(
+    ownerId: string,
+    entries: Array<{ chunkId: string; ownerKind: string; vec: Float32Array }>,
+  ): void {
+    if (!this.kbNavIndex) return;
+    this.navRemoveOwner(ownerId);
+    const ids: string[] = [];
+    for (const e of entries) {
+      this.kbNavIndex.add(e.chunkId, e.vec);
+      this.kbNavChunkMeta.set(e.chunkId, { ownerId, ownerKind: e.ownerKind });
+      ids.push(e.chunkId);
+    }
+    if (ids.length) this.kbNavOwnerChunks.set(ownerId, ids);
+  }
+
+  /** Remove all of an owner's chunks from the index (tombstone) + its metadata. */
+  private navRemoveOwner(ownerId: string): void {
+    if (!this.kbNavIndex) return;
+    const ids = this.kbNavOwnerChunks.get(ownerId);
+    if (!ids) return;
+    for (const cid of ids) {
+      this.kbNavIndex.remove(cid);
+      this.kbNavChunkMeta.delete(cid);
+    }
+    this.kbNavOwnerChunks.delete(ownerId);
   }
 
   /** kb_fts keyword search. Mirrors searchL1Fts (BM25 → 0–1 score). */
@@ -3047,6 +4467,9 @@ export class VectorStore implements IMemoryStore {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    // Drop the index so any in-flight reconcile/build short-circuits at its guards.
+    this.kbNavIndex = null;
+    this.kbNavDirtyOwners = null;
     try {
       this.db.close();
     } catch (err) {

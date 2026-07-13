@@ -8,12 +8,15 @@
 import path from "node:path";
 import type { SceneIndexEntry } from "./scene-index.js";
 
+// NOTE: NAV_HEADER text is the strip anchor (stripSceneNavigation matches it).
+// It is already English+emoji — do NOT change it, or persona.md files written
+// with the old header would no longer be stripped (→ duplicated navigation).
 const NAV_HEADER = "---\n## 🗺️ Scene Navigation (Scene Index)";
 
-const NAV_FOOTER = `📌 使用说明：
-- Path 是 scene block 的绝对路径，可直接使用 read_file 读取完整内容
-- 热度：该场景被记忆命中的累计次数，越高越重要
-- Summary：场景的核心要点摘要`;
+const NAV_FOOTER = `📌 How to use:
+- Path is the scene block's absolute path — use read_file to load its full content.
+- heat: how many times this scene has been hit by recall; higher = more important.
+- Summary: the scene's key points.`;
 
 /**
  * Build a fire-emoji string based on heat value (visual priority cue for the agent).
@@ -45,12 +48,12 @@ export function generateSceneNavigation(entries: SceneIndexEntry[], dataDir?: st
       ? path.join(dataDir, "scene_blocks", e.filename)
       : `scene_blocks/${e.filename}`;
     const pathLine = `### Path: ${scenePath}`;
-    const heatLine = `**热度**: ${e.heat}${heatEmoji(e.heat)}${e.updated ? ` | **更新**: ${e.updated}` : ""}`;
+    const heatLine = `**heat**: ${e.heat}${heatEmoji(e.heat)}${e.updated ? ` | **updated**: ${e.updated}` : ""}`;
     const summaryLine = `Summary: ${e.summary}`;
     return `${pathLine}\n${heatLine}\n${summaryLine}`;
   });
 
-  return `${NAV_HEADER}\n*以下是当前场景记忆的索引，可根据需要 read_file 读取详细内容。*\n\n${blocks.join("\n\n")}\n\n${NAV_FOOTER}`;
+  return `${NAV_HEADER}\n*Index of the current scene memories; use read_file to load details as needed.*\n\n${blocks.join("\n\n")}\n\n${NAV_FOOTER}`;
 }
 
 /**

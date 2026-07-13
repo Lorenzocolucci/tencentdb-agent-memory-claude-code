@@ -102,6 +102,14 @@ export interface RecallConfig {
   /** Overall recall timeout in milliseconds (default: 5000). When exceeded, recall is skipped with a warning. */
   timeoutMs: number;
   /**
+   * Budget for the memory SEARCH alone (embedding + vector/FTS lookup), in ms.
+   * Must be < timeoutMs. When the search (which depends on the REMOTE embedding
+   * provider) exceeds this, it degrades to EMPTY memories while persona/scene/
+   * banner (local, no network) are still injected — so an OpenAI outage never
+   * drops the whole session-open injection. Default: 4000. Falls back when unset.
+   */
+  searchTimeoutMs?: number;
+  /**
    * Recall source (Phase 4, default: "l1").
    * - "l1": legacy l1_vec/l1_fts hybrid recall. UNCHANGED behavior.
    * - "kb": entity-centric KB retrieval (kbRecall over kb_vec/kb_fts + entity
@@ -540,6 +548,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       scoreThreshold: num(recallGroup, "scoreThreshold") ?? 0.3,
       strategy: validateStrategy(str(recallGroup, "strategy")) ?? "hybrid",
       timeoutMs: num(recallGroup, "timeoutMs") ?? 5000,
+      searchTimeoutMs: num(recallGroup, "searchTimeoutMs") ?? 4000,
       // Default "l1" (legacy recall) so live recall is NOT changed. Any value
       // other than the literal "kb" falls back to "l1" (fail-safe).
       source: str(recallGroup, "source") === "kb" ? "kb" : "l1",

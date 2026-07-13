@@ -52,6 +52,13 @@ export interface StandaloneLLMConfig {
    * stable structured output; the runner defaults to 1 when this is omitted.
    */
   temperature?: number;
+  /**
+   * When true, send NO temperature parameter to the API. Required for OpenAI
+   * "reasoning" models (e.g. gpt-5.4-mini), which reject/ignore temperature and
+   * emit an AI-SDK warning on every call if it is passed. Takes precedence over
+   * `temperature`.
+   */
+  omitTemperature?: boolean;
   /** Request timeout in milliseconds (default: 120_000). */
   timeoutMs?: number;
 }
@@ -189,8 +196,11 @@ export class StandaloneLLMRunner implements LLMRunner {
     // extraction JSON, which then failed to parse and dropped all memories.
     const maxTokens = params.maxTokens ?? this.config.maxTokens ?? 16000;
     // RC5: Kimi/Moonshot extraction is only stable at temperature=1. Default to 1
-    // when neither the per-call param nor the config sets it.
-    const temperature = params.temperature ?? this.config.temperature ?? 1;
+    // when neither the per-call param nor the config sets it. Reasoning models
+    // (omitTemperature) send NO temperature at all (undefined → param omitted).
+    const temperature = this.config.omitTemperature
+      ? undefined
+      : (params.temperature ?? this.config.temperature ?? 1);
     const workspaceDir = params.workspaceDir ?? process.cwd();
 
     this.logger?.debug?.(

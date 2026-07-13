@@ -1,6 +1,12 @@
 # Track B — Deep Mistake Notebook (L3) — Design Spec
 
-> Date: 2026-06-24 · Branch: `feat/memory-excellence` · Status: **B1 + B2a BUILT & LIVE** (commits `a3c81c4`, `2a4cc5c`; suite 304 green); B2b (live injection wiring) + B3 remaining
+> Date: 2026-06-24 · Branch: `feat/memory-excellence`
+> Status: **COMPLETE — B1 + B2 + B3 BUILT & DEPLOYED LIVE.** B1 `a3c81c4`, B2a `2a4cc5c`,
+> B2b `e3096ce`, auto-distill `af13fa5`, B3 `1372d44` (see
+> `2026-06-30-mistake-notebook-b3-avoidance-design.md`). The loop self-runs on session
+> end; it stays dormant until a failure class recurs cross-session (0 lessons today =
+> correct, anti-anecdote). Confidence now grows on successful AVOIDANCE (B3), not only
+> recurrence.
 > Scope decided with Lorenzo: design the full arc **B1 + B2 + B3** in one spec, build in slices starting B1.
 > Read first: blueprint Idea 3 / Fase 4 (`C:\Sinapsys\01-vision-and-plan\MEMORIA-BLUEPRINT.md`),
 > cards `sinapsys-phase-b-direction`, `sinapsys-dual-track-direction`.

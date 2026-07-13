@@ -20,6 +20,7 @@
  */
 
 import type { LLMRunner } from "../types.js";
+import { runWithoutCjk, hasCjk } from "../../utils/language-guard.js";
 
 // ── Public types ───────────────────────────────────────────────────────────────
 
@@ -160,13 +161,17 @@ export async function distillLesson(
   opts: DistillOptions = {},
 ): Promise<DistilledLesson | null> {
   try {
-    const raw = await llmRunner.run({
+    // Language barrier: force a rewrite if the model slips into CJK.
+    const raw = await runWithoutCjk(llmRunner, {
       systemPrompt: LESSON_DISTILL_SYSTEM_PROMPT,
       prompt: buildDistillPrompt(cluster),
       taskId: "lesson-distill",
       timeoutMs: opts.timeoutMs ?? 120_000,
     });
-    return parseDistilledLesson(raw);
+    const parsed = parseDistilledLesson(raw);
+    // Reject a residual-CJK lesson rather than store garbage (skip the cluster).
+    if (parsed && (hasCjk(parsed.lessonText) || hasCjk(parsed.domain))) return null;
+    return parsed;
   } catch {
     return null;
   }

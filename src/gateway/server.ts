@@ -9,6 +9,7 @@
  *   POST /search/conversations — L0 conversation search
  *   POST /session/end         — Session end + flush
  *   POST /seed               — Batch seed historical conversations (L0 → L1)
+ *   POST /kb/write            - Deterministic external fact write (KbDelta)
  *
  * Built with Node.js native `http` module — no Express/Fastify dependency.
  * Designed to run as a managed sidecar alongside Hermes.
@@ -40,21 +41,29 @@ import type {
   SessionEndResponse,
   SeedRequest,
   SeedResponse,
+  KbWriteRequest,
+  KbWriteResponse,
   GatewayErrorResponse,
 } from "./types.js";
+import { parseKbDelta } from "../core/kb/extraction-schema.js";
+import { buildRawDeltaFromFacts } from "./kb-write-delta.js";
 import type { Logger } from "../core/types.js";
 import { validateAndNormalizeRaw, fillTimestamps, SeedValidationError } from "../core/seed/input.js";
 import { executeSeed } from "../core/seed/seed-runtime.js";
 import type { SeedProgress } from "../core/seed/types.js";
+import { startEventLoopMonitor, resetEventLoopLag } from "../core/diagnostics/event-loop-monitor.js";
+import { isSlowRecall, composeSlowRecallBreadcrumb } from "../core/diagnostics/slow-recall.js";
 
 const TAG = "[tdai-gateway]";
 const VERSION = "0.1.0";
 
 // ── HTTP server timeouts ──────────────────────────────────
-// A wedged handler must not hold a connection forever. /seed can legitimately
-// run for minutes, so requestTimeout is generous (10 min) rather than 0, while
-// headers/idle are short so half-open or idle sockets are reaped quickly.
-const HTTP_REQUEST_TIMEOUT_MS = 600_000; // 10 min — accommodates long /seed
+// A wedged handler must not hold a connection forever. /seed and /digest can
+// legitimately run for many minutes (backfill fully drains a session's L0 while
+// sharing the serial L1 queue with live work), so requestTimeout is generous
+// (60 min) rather than 0, while headers/idle are short so half-open or idle
+// sockets are reaped quickly.
+const HTTP_REQUEST_TIMEOUT_MS = 3_600_000; // 60 min — accommodates long /seed and /digest backfill
 const HTTP_HEADERS_TIMEOUT_MS = 30_000; // time to receive request headers
 const HTTP_KEEP_ALIVE_TIMEOUT_MS = 60_000; // idle keep-alive socket lifetime
 
@@ -204,6 +213,12 @@ export class TdaiGateway {
    * Start the Gateway HTTP server.
    */
   async start(): Promise<void> {
+    // Diagnostics: start the passive event-loop lag monitor as EARLY as possible
+    // so it captures boot-time stalls (resumeExtraction, first cornerstone build)
+    // as well as live starvation. Paired with the in-flight registry, a slow
+    // recall then names its own culprit instead of being guessed at.
+    startEventLoopMonitor();
+
     // Initialize data directories
     initDataDirectories(this.config.data.baseDir);
 
@@ -230,6 +245,14 @@ export class TdaiGateway {
       this.server!.listen(port, host, () => {
         this.startTime = Date.now();
         this.logger.info(`Gateway listening on http://${host}:${port}`);
+        // Immune system: resume any extraction backlog frozen by the previous
+        // shutdown (restart amnesia). Fire-and-forget so it never blocks boot —
+        // recovery enqueues L1 passes that drain in the background.
+        this.core.resumeExtraction().catch((err) => {
+          this.logger.warn(
+            `Extraction resume failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
         resolve();
       });
       this.server!.on("error", reject);
@@ -290,8 +313,12 @@ export class TdaiGateway {
           return await this.handleObserve(req, res);
         case "POST /session/end":
           return await this.handleSessionEnd(req, res);
+        case "POST /digest":
+          return await this.handleDigest(req, res);
         case "POST /seed":
           return await this.handleSeed(req, res);
+        case "POST /kb/write":
+          return await this.handleKbWrite(req, res);
         default:
           sendError(res, 404, `Not found: ${method} ${pathname}`);
       }
@@ -423,6 +450,17 @@ export class TdaiGateway {
     const result = await this.core.handleBeforeRecall(body.query, body.session_key, body.project, body.session_id);
     const elapsed = Date.now() - startMs;
 
+    // Diagnostics breadcrumb: a slow recall means the single event loop was
+    // starved (node:sqlite is synchronous). Log WHO was hogging it — the
+    // in-flight / just-finished heavy task + the event-loop lag — so the next
+    // natural occurrence is attributed deterministically instead of guessed.
+    // Reset the lag window after reading so the next incident measures a fresh
+    // stall.
+    if (isSlowRecall(elapsed)) {
+      this.logger.warn(`${TAG} ${composeSlowRecallBreadcrumb(elapsed)}`);
+      resetEventLoopLag();
+    }
+
     // Deliver BOTH the stable context (persona/scene/guide) AND the dynamic
     // situation-relevant memories. Returning only appendSystemContext silently
     // dropped the per-prompt <relevant-memories> — proactive injection OFF.
@@ -470,6 +508,77 @@ export class TdaiGateway {
     const response: CaptureResponse = {
       l0_recorded: result.l0RecordedCount,
       scheduler_notified: result.schedulerNotified,
+    };
+    sendJson(res, 200, response);
+  }
+
+  /**
+   * Deterministic external write: `POST /kb/write`. Accepts EITHER the simplified
+   * `facts` array OR a full `delta`, validates it with parseKbDelta (the same
+   * schema + vocab coercion the background extractor uses), and applies it
+   * straight to the KB store via core.applyDelta. A written fact is immediately
+   * recallable. Fail-loud on this route (400 on bad input, 5xx on store failure)
+   * so the caller knows whether the write persisted — recall/capture stay
+   * best-effort, but a deterministic writer must report the truth.
+   */
+  private async handleKbWrite(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await parseJsonBody<KbWriteRequest>(req);
+
+    // Accept EITHER a full pre-built delta OR the simplified flat-facts form.
+    let rawDelta: unknown;
+    if (Array.isArray(body.facts) && body.facts.length > 0) {
+      rawDelta = buildRawDeltaFromFacts(body.facts, body.language);
+    } else if (body.delta !== undefined && body.delta !== null) {
+      rawDelta = body.delta;
+    } else {
+      sendError(
+        res,
+        400,
+        "Missing input: provide a non-empty `facts` array (simplified) or a `delta` object (full KbDelta).",
+      );
+      return;
+    }
+
+    const validation = parseKbDelta(rawDelta);
+    if (!validation.ok) {
+      sendError(res, 400, `Invalid KbDelta: ${validation.error}`);
+      return;
+    }
+
+    // A structurally-valid but empty delta writes nothing — a caller that sent
+    // no writable content is a client bug, not a silent success.
+    const d = validation.delta;
+    if (
+      d.entities.length === 0 &&
+      d.facts.length === 0 &&
+      d.events.length === 0 &&
+      d.relations.length === 0
+    ) {
+      sendError(res, 400, "Empty delta: nothing to write.");
+      return;
+    }
+
+    const startMs = Date.now();
+    const result = await this.core.applyDelta(validation.delta, {
+      namespace: body.namespace,
+      project: body.project,
+      sessionKey: body.session_key,
+    });
+    const elapsed = Date.now() - startMs;
+
+    this.logger.info(
+      `KB write completed in ${elapsed}ms: entities=${result.entities.length}, ` +
+      `facts=${result.facts.length}, events=${result.events.length}, ` +
+      `relations=${result.relations.length}, embedded=${result.embedded}`,
+    );
+
+    const response: KbWriteResponse = {
+      ok: true,
+      entities_written: result.entities.length,
+      facts_written: result.facts.length,
+      events_written: result.events.length,
+      relations_written: result.relations.length,
+      embedded: result.embedded,
     };
     sendJson(res, 200, response);
   }
@@ -549,6 +658,22 @@ export class TdaiGateway {
 
     const response: SessionEndResponse = { flushed: true };
     sendJson(res, 200, response);
+  }
+
+  /**
+   * POST /digest — backfill: extract ONE session_key's un-extracted L0 into the
+   * KB graph, reusing the live extraction path (primary + fallback + embeddings)
+   * on the serial L1 queue (no concurrent writers). Drives the "digest the old
+   * backlog" job without stopping the gateway. Idempotent + resumable.
+   */
+  private async handleDigest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await parseJsonBody<{ session_key?: string }>(req);
+    if (!body.session_key) {
+      sendError(res, 400, "Missing required field: session_key");
+      return;
+    }
+    const result = await this.core.digestBacklogSession(body.session_key);
+    sendJson(res, 200, { digested: true, processedCount: result.processedCount });
   }
 
   private async handleSeed(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {

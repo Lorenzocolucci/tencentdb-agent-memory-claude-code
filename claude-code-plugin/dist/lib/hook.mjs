@@ -26,8 +26,13 @@ import { homedir } from "node:os";
 * - On any capture failure the caller (hook.ts) emits a loud stderr warning
 *   visible in the Claude Code UI — not just a hidden log file.
 */
-/** Recall timeout: must not hang the prompt; kept short and non-blocking. */
-const RECALL_TIMEOUT_MS = 4e3;
+/** Recall timeout: must not hang the prompt; kept short and non-blocking.
+*  Defence-in-depth at 6s (was 4s): the corpus-embedding that used to push the
+*  first-turn recall to ~5s is now built off the critical path (see
+*  tdai-core.buildCornerstoneInBackground), so recall is normally <1s. 6s still
+*  bounds the prompt but no longer clips a legitimately slow (cold/contended)
+*  query embedding, which silently dropped the whole session-open injection. */
+const RECALL_TIMEOUT_MS = 6e3;
 /** Capture timeout: session save is more important; allow extra time for a
 *  slow gateway write-through before declaring the save lost. */
 const CAPTURE_TIMEOUT_MS = 12e3;

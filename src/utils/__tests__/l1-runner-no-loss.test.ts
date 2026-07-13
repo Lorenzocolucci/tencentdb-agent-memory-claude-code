@@ -53,7 +53,7 @@ function newMessageIds(prompt: string): string[] {
  * which messages were extracted. Optionally throws on the Nth call to simulate
  * a hard LLM failure (success=false path).
  */
-function makeFakeRunner(opts: { failOnCall?: number } = {}): {
+function makeFakeRunner(opts: { failOnCall?: number; failOnFirstId?: string } = {}): {
   runner: LLMRunner;
   fedWindows: string[][];
   callCount: () => number;
@@ -67,6 +67,12 @@ function makeFakeRunner(opts: { failOnCall?: number } = {}): {
       fedWindows.push(ids);
       if (opts.failOnCall && calls === opts.failOnCall) {
         throw new Error("simulated LLM failure");
+      }
+      // Deterministic POISON window: always fail whenever this exact window is
+      // fed (identified by its first message id), on every trigger. Simulates a
+      // genuinely un-extractable window that never recovers on retry.
+      if (opts.failOnFirstId && ids[0] === opts.failOnFirstId) {
+        throw new Error(`simulated poison window at ${opts.failOnFirstId}`);
       }
       const memories = ids.map((id) => ({
         content: `Fact recorded for message ${id}.`,
@@ -216,6 +222,84 @@ describe("L1 runner — no fact loss across windows / warmup boundaries", () => 
     for (let i = 1; i <= N; i++) {
       expect(counts.get(`m${i}`), `m${i} must be stored exactly once after retry`).toBe(1);
     }
+  });
+
+  it("fully drains a session where EVERY message shares one recorded_at (chat-backfill)", async () => {
+    // The claude.ai chat import gives every message in a conversation the SAME
+    // recorded_at. A strict `recorded_at > cursor` cursor can't page past the
+    // first 50 → the rest is lost forever. The composite (recorded_at, rowid)
+    // cursor must page through the whole same-timestamp block.
+    const N = 60; // > one 50-msg read → forces a second cursor-advanced read
+    const iso = "2024-10-26T21:39:32.000Z";
+    for (let i = 0; i < N; i++) {
+      // ids MUST be m<n> — the fake runner's id parser only matches /m\d+/.
+      const ok = store.upsertL0(
+        { id: `m${i + 1}`, sessionKey, sessionId: "sid-chat", role: i % 2 === 0 ? "user" : "assistant", messageText: `chat message ${i + 1}, decided approach ${i + 1}.`, recordedAt: iso, timestamp: Date.parse(iso) + i },
+        undefined,
+      );
+      expect(ok).toBe(true);
+    }
+
+    // Drive the runner until drained (each call reads up to 50; the composite
+    // cursor must advance by rowid within the identical-timestamp block).
+    const healthy = makeFakeRunner();
+    for (let t = 0; t < 5; t++) {
+      const runner = createL1Runner({
+        pluginDataDir: dir, cfg, openclawConfig: {}, vectorStore: store,
+        embeddingService: undefined, logger: silentLogger, llmRunner: healthy.runner,
+      });
+      await runner({ sessionKey });
+    }
+
+    // EVERY message extracted exactly once — nothing lost past the first window.
+    const counts = countStoredBySourceId(dir);
+    expect(counts.size).toBe(N);
+    for (let i = 1; i <= N; i++) {
+      expect(counts.get(`m${i}`), `m${i} must be stored exactly once`).toBe(1);
+    }
+  });
+
+  it("QUARANTINES a persistently-poison window after MAX retries and digests the rest", async () => {
+    // The immune-system invariant: a window that fails on EVERY trigger (genuine
+    // poison, e.g. malformed LLM output) must NOT freeze the session forever.
+    // After MAX_WINDOW_RETRIES (3) consecutive holds, it is skipped and the
+    // later windows (m11..m24) are extracted. We lose ONE window, never months.
+    const N = 24; // 3 windows: [m1..m10] poison, [m11..m20], [m21..m24]
+    const base = Date.parse("2026-06-16T00:00:00.000Z");
+    seedL0(store, sessionKey, N, base);
+
+    const mkRunner = () => {
+      const poison = makeFakeRunner({ failOnFirstId: "m1" }); // window 1 always throws
+      return createL1Runner({
+        pluginDataDir: dir, cfg, openclawConfig: {}, vectorStore: store,
+        embeddingService: undefined, logger: silentLogger, llmRunner: poison.runner,
+      });
+    };
+
+    // Triggers 1 & 2: window 1 fails → HOLD (transient assumption). Cursor stays
+    // at 0, NOTHING is stored yet, and crucially NOTHING is lost.
+    await mkRunner()({ sessionKey });
+    await mkRunner()({ sessionKey });
+    let counts = countStoredBySourceId(dir);
+    expect(counts.size, "held: nothing stored, nothing lost").toBe(0);
+    let cp = await new CheckpointManager(dir, silentLogger).read();
+    expect(cp.runner_states[sessionKey]?.last_l1_cursor ?? 0).toBe(0); // held at start
+    expect(cp.runner_states[sessionKey]?.l1_stuck_count).toBe(2);
+
+    // Trigger 3: 3rd consecutive failure on window 1 → QUARANTINE it, then window
+    // 2 and window 3 extract normally.
+    await mkRunner()({ sessionKey });
+    counts = countStoredBySourceId(dir);
+    for (let i = 1; i <= 10; i++) {
+      expect(counts.get(`m${i}`), `m${i} quarantined (lost by design)`).toBeUndefined();
+    }
+    for (let i = 11; i <= N; i++) {
+      expect(counts.get(`m${i}`), `m${i} extracted after quarantine`).toBe(1);
+    }
+    // Cursor advanced PAST the whole backlog; stuck marker cleared.
+    cp = await new CheckpointManager(dir, silentLogger).read();
+    expect(cp.runner_states[sessionKey]?.last_l1_cursor).toBe(base + (N - 1) * 1000);
+    expect(cp.runner_states[sessionKey]?.l1_stuck_count).toBe(0);
   });
 
   it("loses nothing across multiple incremental triggers (warmup-style batches)", async () => {

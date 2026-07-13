@@ -106,6 +106,45 @@ describe("initFoundationsSchema", () => {
     ).not.toThrow();
   });
 
+  it("adds the four stance track-record columns to lessons (Pilastro B, additive)", () => {
+    initFoundationsSchema(db);
+    const cols = columns(db, "lessons");
+    expect(cols).toEqual(
+      expect.arrayContaining([
+        "stance_fire_count",
+        "stance_confirmed_count",
+        "stance_rejected_count",
+        "stance_willingness",
+      ]),
+    );
+  });
+
+  it("defaults a fresh lesson to zero counts and WILLINGNESS_DEFAULT willingness", () => {
+    initFoundationsSchema(db);
+    db.prepare(
+      `INSERT INTO lessons (id, domain, trigger_pattern, lesson_text, created_time, updated_time)
+       VALUES ('les_1','deploy','{}','always verify live','2024-01-01','2024-01-01')`,
+    ).run();
+    const row = db
+      .prepare(
+        `SELECT stance_fire_count AS f, stance_confirmed_count AS c,
+                stance_rejected_count AS r, stance_willingness AS w
+           FROM lessons WHERE id='les_1'`,
+      )
+      .get() as { f: number; c: number; r: number; w: number };
+    expect(row.f).toBe(0);
+    expect(row.c).toBe(0);
+    expect(row.r).toBe(0);
+    expect(row.w).toBeCloseTo(0.7); // WILLINGNESS_DEFAULT
+  });
+
+  it("is idempotent for the stance columns (no duplicate on re-run)", () => {
+    expect(initFoundationsSchema(db)).toBe(true);
+    expect(initFoundationsSchema(db)).toBe(true);
+    const willingnessCols = columns(db, "lessons").filter((c) => c === "stance_willingness");
+    expect(willingnessCols).toHaveLength(1);
+  });
+
   it("still creates the 4 new tables when relations is absent (best-effort)", () => {
     const fresh = new DB(":memory:");
     // No relations table: the guarded ALTER is skipped, tables still created.

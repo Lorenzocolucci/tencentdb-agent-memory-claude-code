@@ -33,6 +33,8 @@ import type { MemoryTdaiConfig } from "../config.js";
 import type { IMemoryStore } from "./store/types.js";
 import type { EmbeddingService } from "./store/embedding.js";
 import { scheduleConsolidation } from "./kb/consolidation-scheduler.js";
+import { captureSessionRecap } from "./continuity/recap-capture.js";
+import { distillPrinciples } from "./kb/principle-runner.js";
 import { extractSituation } from "./hooks/situation.js";
 import { buildFileInjection, resolveFileOwnerId } from "./hooks/situation-injection.js";
 import {
@@ -43,8 +45,13 @@ import {
 import { inferTaskType } from "./hooks/task-type.js";
 import { buildSituationInjection } from "./hooks/fingerprint-injection.js";
 import { canonicalKey } from "./kb/kb-queries.js";
+import { applyKbDelta, type KbWriterStore, type ApplyKbDeltaResult } from "./kb/kb-writer.js";
+import type { KbDelta } from "./kb/extraction-schema.js";
 import { performAutoRecall } from "./hooks/auto-recall.js";
 import { SessionBannerTracker } from "./hooks/session-banner.js";
+import { CornerstoneInjectionTracker, buildCornerstones } from "./distinctiveness/cornerstone-runner.js";
+import { CornerstoneSessionCache } from "./distinctiveness/cornerstone-cache.js";
+import { renderGroundedTrustInterrupt } from "./kb/grounded-trust-ask.js";
 import { performAutoCapture } from "./hooks/auto-capture.js";
 import { executeMemorySearch, formatSearchResponse } from "./tools/memory-search.js";
 import { executeConversationSearch, formatConversationSearchResponse } from "./tools/conversation-search.js";
@@ -83,6 +90,28 @@ export interface TdaiCoreOptions {
   sessionFilter?: SessionFilter;
   /** Plugin instance ID for metric reporting. */
   instanceId?: string;
+}
+
+/**
+ * Whether a store implements the KB write/embed primitives required by
+ * {@link TdaiCore.applyDelta}. Mirrors `supportsKbWrite` in pipeline-factory:
+ * `isKbReady()` (when present) must be true and every KB primitive must exist.
+ * A store missing any primitive (non-sqlite backend, or KB tables not ready)
+ * means the deterministic write path is unavailable → the caller returns a 4xx.
+ */
+function isKbWriterStore(store?: IMemoryStore): store is IMemoryStore & KbWriterStore {
+  if (!store) return false;
+  const ready = (store as unknown as { isKbReady?: () => boolean }).isKbReady;
+  if (typeof ready === "function" && !ready.call(store)) return false;
+  return (
+    typeof store.resolveOrCreateEntity === "function" &&
+    typeof store.insertEvent === "function" &&
+    typeof store.upsertFact === "function" &&
+    typeof store.upsertRelation === "function" &&
+    typeof store.queryEntityById === "function" &&
+    typeof store.upsertKbVector === "function" &&
+    typeof store.upsertKbFts === "function"
+  );
 }
 
 // ============================
@@ -165,6 +194,13 @@ export class TdaiCore {
    * One TRUE per sessionKey per process lifetime (in-memory, long-lived).
    */
   private readonly bannerTracker = new SessionBannerTracker();
+  // Idea 5 (Distinctiveness Scorer): decay tracker (long-lived) + per-session block
+  // cache so the corpus-embedding cost runs once per session, not per turn.
+  private readonly cornerstoneTracker = new CornerstoneInjectionTracker();
+  private readonly cornerstoneCache = new CornerstoneSessionCache();
+  /** Session keys whose cornerstone block is being built off-path — dedupes the
+   *  concurrent turns that arrive before the first background build commits. */
+  private readonly cornerstoneInFlight = new Set<string>();
 
   constructor(opts: TdaiCoreOptions) {
     this.hostAdapter = opts.hostAdapter;
@@ -293,6 +329,11 @@ export class TdaiCore {
   ): Promise<RecallResult> {
     await this.storeReady?.catch(() => {});
 
+    // Maintain the sessionKey → project registry (recall knows BOTH values). The
+    // background extractor reads it to tag new events by project; recall scoping
+    // relies on it. Best-effort, never blocks a turn.
+    if (projectName) this.vectorStore?.setSessionProject?.(sessionKey, projectName);
+
     const result = await performAutoRecall({
       userText,
       actorId: "default_user",
@@ -305,6 +346,8 @@ export class TdaiCore {
       vectorStore: this.vectorStore,
       embeddingService: this.embeddingService,
       bannerTracker: this.bannerTracker,
+      cornerstoneTracker: this.cornerstoneTracker,
+      cornerstoneCache: this.cornerstoneCache,
     });
 
     // Commit the banner slot ONLY after a real (non-timed-out) result actually
@@ -313,9 +356,86 @@ export class TdaiCore {
     // Key MUST match the one performAutoRecall peeked (sessionId ?? sessionKey).
     if (result?.bannerEmitted) {
       this.bannerTracker.markEmitted(sessionId ?? sessionKey);
+      // First turn of a new session = the one reliably-fired event in the desktop
+      // app. Kick the LLM distillation (lessons + principles) here so it actually
+      // runs (handleSessionEnd/`/clear` rarely fires). Detached, off critical path.
+      this.scheduleBackgroundDistillation();
     }
 
-    return result ?? {};
+    // Cornerstone cache MISS → build the block OFF the recall critical path and
+    // commit it to the per-session cache so the NEXT turn injects it. The corpus
+    // embed (~5s on a cold connection) is NEVER awaited on the recall path: inline
+    // it blew the cc hook's RECALL_TIMEOUT and silently dropped the whole
+    // session-open injection on the first turn.
+    if (result?.cornerstoneMiss) {
+      this.buildCornerstoneInBackground(result.cornerstoneMiss.key);
+    }
+
+    // Grounded Trust Phase 3: surface the INTERRUPT for any uncertain, high-stakes
+    // memory now pending Lorenzo's confirmation. Prepended to the turn context so
+    // the agent must raise it before acting. Best-effort: never breaks the turn.
+    const out: RecallResult = result ?? {};
+    try {
+      const store = this.vectorStore as
+        | { getPendingAsks?: (n?: number) => import("./kb/grounded-trust-ask.js").PendingAsk[] }
+        | undefined;
+      if (store && typeof store.getPendingAsks === "function") {
+        const asks = store.getPendingAsks(5);
+        const block = renderGroundedTrustInterrupt(asks);
+        if (block) {
+          out.prependContext = out.prependContext ? `${block}\n\n${out.prependContext}` : block;
+        }
+      }
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][grounded-trust] interrupt injection failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    return out;
+  }
+
+  /**
+   * Build the cornerstone block for a session OFF the recall critical path and
+   * commit it to the per-session cache, so the NEXT turn injects it. Fire-and-forget:
+   * the corpus embed (~5s on a cold/contended connection) must never delay — let
+   * alone drop — the session-open injection. All errors are swallowed (memory must
+   * never break a turn). The in-flight guard dedupes concurrent first-turn
+   * requests, and a GLOBAL one-at-a-time gate prevents a cornerstone pile-up.
+   */
+  private buildCornerstoneInBackground(key: string): void {
+    if (!this.vectorStore) return;
+    if (this.cornerstoneInFlight.has(key)) return;
+    // GLOBAL serialization: the cornerstone block is corpus/namespace-wide, so
+    // concurrent builds for DIFFERENT sessions recompute the same thing and — far
+    // worse — pile up on the single event loop; each build's synchronous KNN scans
+    // then starve live /recall. Measured with the diagnostics camera: N concurrent
+    // builds → 5-8s recalls (banner dropped), vs a single build's ~1.7s. Run at
+    // most ONE reflection at a time; a session that misses while a build runs
+    // re-fires on its next turn (best-effort, self-healing).
+    if (this.cornerstoneInFlight.size > 0) return;
+    if (this.cornerstoneCache.get(key) !== undefined) return; // already committed
+    const store = this.vectorStore;
+    this.cornerstoneInFlight.add(key);
+    void (async () => {
+      try {
+        const block = await buildCornerstones({
+          vectorStore: store,
+          embeddingService: this.embeddingService,
+          injectionTracker: this.cornerstoneTracker,
+          logger: this.logger,
+        });
+        // Commit even when "" (computed-empty) — a valid result that prevents
+        // recomputing the corpus embed every turn for a corpus with no cornerstones.
+        this.cornerstoneCache.commit(key, block);
+      } catch (err) {
+        this.logger.warn(
+          `[memory-tdai] cornerstone background build failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      } finally {
+        this.cornerstoneInFlight.delete(key);
+      }
+    })();
   }
 
   /**
@@ -390,6 +510,118 @@ export class TdaiCore {
   }
 
   /**
+   * Grounded Trust ask-loop (Phase 3): record Lorenzo's answer to a gated memory.
+   * `decision="confirm"` → the memory becomes authoritative (trusted); `"reject"`
+   * → it is tombstoned (kept, never hard-deleted). Off the critical path: returns
+   * a human line, never throws. Maps to: tdai_confirm_memory / tdai_reject_memory.
+   */
+  async resolveGatedMemory(params: {
+    ownerId: string;
+    ownerKind: "fact" | "event";
+    decision: "confirm" | "reject";
+  }): Promise<{ ok: boolean; text: string }> {
+    await this.storeReady?.catch(() => {});
+    const store = this.vectorStore;
+    if (!store) return { ok: false, text: "Memory store unavailable." };
+    const now = new Date().toISOString();
+    try {
+      if (params.decision === "confirm") {
+        store.confirmMemory({ ownerId: params.ownerId, ownerKind: params.ownerKind, now });
+        return { ok: true, text: `Confermato: il ricordo ${params.ownerKind} ${params.ownerId} è ora autorevole.` };
+      }
+      store.rejectMemory({ ownerId: params.ownerId, ownerKind: params.ownerKind, now });
+      return { ok: true, text: `Rifiutato: il ricordo ${params.ownerKind} ${params.ownerId} è stato marcato come errato (lapide).` };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger?.warn?.(`[memory-tdai][grounded-trust] resolveGatedMemory failed (non-fatal): ${msg}`);
+      return { ok: false, text: `Operazione non riuscita: ${msg}` };
+    }
+  }
+
+  /**
+   * Deterministic external write path (POST /kb/write). Apply an already-validated
+   * KbDelta straight to the KB store — entities + bi-temporal facts + append-only
+   * events + relations, then embed — reusing the SAME redacting writer
+   * ({@link applyKbDelta}) the background extractor uses. This is the only
+   * non-LLM ingestion route: an external agent (e.g. Argus) supplies the delta,
+   * the core never invents memory. Writes land on the namespace recall reads
+   * (default "default", see {@link NAMESPACE}) so a written fact is immediately
+   * recallable. Unlike recall/capture, this MAY throw: the HTTP handler maps a
+   * failure to a 4xx/5xx rather than silently swallowing (the caller must know
+   * the write did not persist).
+   */
+  async applyDelta(
+    delta: KbDelta,
+    opts: { namespace?: string; project?: string; sessionKey?: string; sessionId?: string } = {},
+  ): Promise<ApplyKbDeltaResult> {
+    await this.storeReady?.catch(() => {});
+    const store = this.vectorStore;
+    if (!isKbWriterStore(store)) {
+      throw new Error(
+        "KB write path unavailable: the store does not implement the KB primitives (kb engine not ready).",
+      );
+    }
+    const now = new Date().toISOString();
+    return applyKbDelta(delta, {
+      store,
+      embeddingService: this.embeddingService,
+      namespace: opts.namespace,
+      project: opts.project,
+      sessionKey: opts.sessionKey ?? "external:kb-write",
+      sessionId: opts.sessionId,
+      now,
+      logger: this.logger,
+    });
+  }
+
+  /**
+   * Mistake Notebook B3 — explicit avoidance confirmation. The agent calls this
+   * when it followed a resurfaced lesson and the failure did NOT happen. Raises the
+   * lesson's confidence + avoidance_count (Phase B path). Off the critical path.
+   * Maps to: tdai_lesson_helped.
+   */
+  async confirmLessonHelped(lessonId: string): Promise<{ ok: boolean; text: string }> {
+    await this.storeReady?.catch(() => {});
+    const store = this.vectorStore;
+    if (!store?.creditLessonAvoidance) return { ok: false, text: "Lessons store unavailable." };
+    const ok = store.creditLessonAvoidance(lessonId, new Date().toISOString());
+    return ok
+      ? { ok: true, text: `Lezione ${lessonId} rinforzata: evitamento confermato.` }
+      : { ok: false, text: `Lezione ${lessonId} non trovata.` };
+  }
+
+  /**
+   * Pilastro B (Strada A) — the agent calls this when Lorenzo CONFIRMED that a
+   * stance interrupt was right to fire. Raises the stance's willingness (it earns
+   * more room to interrupt). Off the critical path. Maps to: tdai_stance_confirmed.
+   */
+  async confirmStanceFire(lessonId: string): Promise<{ ok: boolean; text: string }> {
+    await this.storeReady?.catch(() => {});
+    const store = this.vectorStore;
+    if (!store?.creditStanceConfirmed) return { ok: false, text: "Lessons store unavailable." };
+    const ok = store.creditStanceConfirmed(lessonId, new Date().toISOString());
+    return ok
+      ? { ok: true, text: `Stance ${lessonId} confermata: era giusto fermarsi — willingness in salita.` }
+      : { ok: false, text: `Stance ${lessonId} non trovata.` };
+  }
+
+  /**
+   * Pilastro B (Strada A) — the agent calls this when Lorenzo said a stance
+   * interrupt was a FALSE ALARM. Lowers the stance's willingness (cry-wolf); a
+   * stance rejected enough times suppresses itself. Off the critical path.
+   * Maps to: tdai_stance_rejected.
+   */
+  async rejectStanceFire(lessonId: string): Promise<{ ok: boolean; text: string }> {
+    await this.storeReady?.catch(() => {});
+    const store = this.vectorStore;
+    if (!store?.creditStanceRejected) return { ok: false, text: "Lessons store unavailable." };
+    const ok = store.creditStanceRejected(lessonId, new Date().toISOString());
+    return ok
+      ? { ok: true, text: `Stance ${lessonId} segnata come falso allarme — willingness in discesa.` }
+      : { ok: false, text: `Stance ${lessonId} non trovata.` };
+  }
+
+  /**
    * Handle end-of-conversation for a single session.
    *
    * ⚠️ Read this if you are editing the method:
@@ -420,9 +652,128 @@ export class TdaiCore {
    *                    don't have to pre-check whether the session was
    *                    already evicted or never produced a capture.
    */
+  /**
+   * Schedule the LLM distillation passes (Track B lessons + Pilastro C Fase 2
+   * principles) as DETACHED background tasks — off the critical path, errors
+   * swallowed, tracked in bgTasks so a shutdown drain awaits them.
+   *
+   * Called from BOTH handleSessionEnd AND the first turn of each session
+   * (handleBeforeRecall, gated on bannerEmitted). Reason: handleSessionEnd fires
+   * only on POST /session/end, which the plugin sends only on /clear — an event
+   * the desktop app rarely produces. Wiring distillation there alone left it
+   * effectively dead (verified: 0 lessons distilled in months). The first turn of
+   * a session is the one reliably-fired event, so we also run it there. CHEAP:
+   * no cluster → no LLM; idempotent (already-distilled skipped) → safe on both.
+   */
+  private scheduleBackgroundDistillation(): void {
+    const runnerFactory = this.runnerFactory;
+    const logger = this.logger;
+
+    // Track B (Mistake Notebook): recurring-failure clusters → lessons.
+    if (this.vectorStore?.runLessonDistillation) {
+      const store = this.vectorStore;
+      const distillTask = (async () => {
+        try {
+          const runner = runnerFactory.createRunner({ enableTools: false });
+          const stats = await store.runLessonDistillation!(runner, {
+            now: new Date().toISOString(),
+            maxClusters: 3,
+          });
+          if (stats.inserted > 0 || stats.superseded > 0) {
+            logger.info(
+              `${TAG} [lessons] distilled: inserted=${stats.inserted}, superseded=${stats.superseded} ` +
+                `(candidates=${stats.candidates}, skippedDuplicate=${stats.skippedDuplicate})`,
+            );
+          } else {
+            logger.debug?.(`${TAG} [lessons] no new lessons (candidates=${stats.candidates})`);
+          }
+        } catch (err) {
+          logger.warn(
+            `${TAG} [lessons] distillation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      })();
+      this.bgTasks.add(distillTask);
+      void distillTask.then(() => this.bgTasks.delete(distillTask));
+    }
+
+    // Pilastro C Fase 2 ("dimenticare con gusto"): recurring cross-session
+    // DECISIONS → `principle` atoms. CONSERVATIVE: additive only (sources decay
+    // via Fase 1, never deleted).
+    if (typeof this.vectorStore?.insertEvent === "function" && typeof this.vectorStore?.listRecentEvents === "function") {
+      const store = this.vectorStore;
+      const principleTask = (async () => {
+        try {
+          const runner = runnerFactory.createRunner({ enableTools: false });
+          const stats = await distillPrinciples(store, runner, {
+            now: new Date().toISOString(),
+            maxClusters: 3,
+          });
+          if (stats.inserted > 0) {
+            logger.info(
+              `${TAG} [principles] distilled: inserted=${stats.inserted} ` +
+                `(candidates=${stats.candidates}, skippedDuplicate=${stats.skippedDuplicate})`,
+            );
+          } else {
+            logger.debug?.(`${TAG} [principles] no new principles (candidates=${stats.candidates})`);
+          }
+        } catch (err) {
+          logger.warn(
+            `${TAG} [principles] distillation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      })();
+      this.bgTasks.add(principleTask);
+      void principleTask.then(() => this.bgTasks.delete(principleTask));
+    }
+
+    // Percorso B (behavioral notebook) — recurring cross-session BEHAVIORAL
+    // tendencies ("what you do") → `usage` atoms via SEMANTIC clustering. The
+    // second axis principle-clusters (per-entity) misses: entity-less behaviors.
+    // Deterministic, no LLM. CONSERVATIVE: additive only. Fire-and-forget.
+    if (typeof this.vectorStore?.runUsageDistillation === "function") {
+      const store = this.vectorStore;
+      const usageTask = (async () => {
+        try {
+          const runner = runnerFactory.createRunner({ enableTools: false });
+          const stats = await store.runUsageDistillation!(runner, {
+            now: new Date().toISOString(),
+            maxClusters: 3,
+          });
+          if (stats.inserted > 0) {
+            logger.info(
+              `${TAG} [usage] distilled: inserted=${stats.inserted} ` +
+                `(candidates=${stats.candidates}, confirmed=${stats.confirmed}, ` +
+                `skippedRejected=${stats.skippedRejected}, skippedDuplicate=${stats.skippedDuplicate})`,
+            );
+          } else {
+            logger.debug?.(
+              `${TAG} [usage] no new usage tendencies (candidates=${stats.candidates}, ` +
+                `rejected=${stats.skippedRejected})`,
+            );
+          }
+        } catch (err) {
+          logger.warn(
+            `${TAG} [usage] distillation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      })();
+      this.bgTasks.add(usageTask);
+      void usageTask.then(() => this.bgTasks.delete(usageTask));
+    }
+  }
+
   async handleSessionEnd(sessionKey: string): Promise<void> {
     if (!sessionKey) return;
     await this.storeReady?.catch(() => {});
+
+    // Immune system: ensure the scheduler is STARTED (per-session pipeline state
+    // restored from checkpoint + recovery enqueued) BEFORE we flush. On a fresh
+    // gateway that has not seen a capture yet, sessionStates is empty, so the
+    // flush's runL1 bails on `!state` and silently does nothing — the session's
+    // L0 backlog would stay frozen. ensureSchedulerStarted is idempotent, so
+    // this is a cheap no-op once started.
+    await this.ensureSchedulerStarted();
 
     // Flush THIS session's buffered pipeline work (no-op when extraction is
     // disabled and no scheduler exists).
@@ -444,6 +795,62 @@ export class TdaiCore {
       unregister: (t) => this.bgTasks.delete(t),
       logger: this.logger,
     });
+
+    // "Dove eravamo" — capture this session into a first-class session_recap
+    // event (Sinapsys session-continuity). Deferred to a macrotask so the
+    // /session/end response flushes first; tracked in bgTasks so destroy()
+    // drains it before the DB closes. Errors are swallowed inside.
+    // Runs AFTER the flush above so this session's events are queryable.
+    if (this.vectorStore) {
+      const store = this.vectorStore;
+      const recapTask = new Promise<void>((resolve) => {
+        setImmediate(() => {
+          try {
+            captureSessionRecap({
+              store,
+              sessionKey,
+              now: new Date().toISOString(),
+              logger: this.logger,
+            });
+          } finally {
+            resolve();
+          }
+        });
+      });
+      this.bgTasks.add(recapTask);
+      void recapTask.then(() => this.bgTasks.delete(recapTask));
+    }
+
+    // LLM distillation (Track B lessons + Pilastro C Fase 2 principles).
+    // Scheduled here AND at the first turn of each session (see
+    // scheduleBackgroundDistillation): handleSessionEnd fires only on /clear,
+    // which the desktop app rarely sends, so this path alone left distillation
+    // effectively dead (0 lessons ever distilled in months). Idempotent + cheap.
+    this.scheduleBackgroundDistillation();
+
+    // B3: credit successful AVOIDANCES for lessons that resurfaced this session and
+    // did not relapse (implicit, Phase A) — confidence grows from successes, not only
+    // failures (the step beyond MNL). Fire-and-forget, off the critical path.
+    if (this.vectorStore?.creditSessionAvoidances) {
+      const store = this.vectorStore;
+      const logger = this.logger;
+      const creditTask = new Promise<void>((resolve) => {
+        setImmediate(() => {
+          try {
+            const r = store.creditSessionAvoidances!(sessionKey, new Date().toISOString());
+            if (r.credited > 0 || r.tempered > 0) {
+              logger.info(`${TAG} [lessons] avoidance: credited=${r.credited}, tempered=${r.tempered}`);
+            }
+          } catch (err) {
+            logger.warn(`${TAG} [lessons] avoidance crediting failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+          } finally {
+            resolve();
+          }
+        });
+      });
+      this.bgTasks.add(creditTask);
+      void creditTask.then(() => this.bgTasks.delete(creditTask));
+    }
 
     // Drop the per-session proactive-injection state (bounded memory).
     this.injectedFilesBySession.delete(sessionKey);
@@ -508,7 +915,19 @@ export class TdaiCore {
       }
       if (!injectedFiles.has(fileKey)) {
         try {
-          const block = buildFileInjection(store, situation.filePath);
+          // The current action's raw content — feeds the graduated stance gate
+          // (Pilastro A): a one-way-door action can escalate an attested lesson
+          // to a block-before-acting interrupt. Safe-stringify the unknown input.
+          let actionContent = "";
+          if (typeof obs.toolInput === "string") {
+            actionContent = obs.toolInput;
+          } else if (obs.toolInput != null) {
+            try { actionContent = JSON.stringify(obs.toolInput) ?? ""; } catch { actionContent = ""; }
+          }
+          const block = buildFileInjection(store, situation.filePath, {
+            sessionId: obs.sessionKey,
+            actionContent,
+          });
           if (block) {
             injectedFiles.add(fileKey);
             blocks.push(block);
@@ -620,6 +1039,24 @@ export class TdaiCore {
       this.vectorStore = stores.vectorStore;
       this.embeddingService = stores.embeddingService;
       this.logger.debug?.(`${TAG} Stores initialized: backend=${this.cfg.storeBackend}, embedding=${this.cfg.embedding.provider}`);
+      // Incremento C: build the sub-linear kb_vec index in the BACKGROUND. It
+      // replaces the brute-force scan that starved the event loop / dropped the
+      // "sul pezzo" banner. Fire-and-forget (yields internally); recall falls back
+      // to brute force until it is ready. Feature-detected: only the local
+      // sqlite-vec store implements it. Never throws into init.
+      // Incremento b: initKbNavIndex first tries to re-hydrate from the on-disk
+      // snapshot (skips the minutes-long rebuild across restarts) and only builds
+      // from scratch on a miss. Fall back to buildKbNavIndex for older stores.
+      const vs = this.vectorStore as {
+        initKbNavIndex?: () => Promise<boolean>;
+        buildKbNavIndex?: () => Promise<boolean>;
+      } | undefined;
+      const startNavIndex = vs?.initKbNavIndex?.bind(vs) ?? vs?.buildKbNavIndex?.bind(vs);
+      if (startNavIndex) {
+        void startNavIndex().catch((e) =>
+          this.logger.warn(`${TAG} kb-nav background init failed: ${e instanceof Error ? e.message : String(e)}`),
+        );
+      }
     } catch (err) {
       this.logger.warn(
         `${TAG} Store init failed; recall/dedup degraded: ${err instanceof Error ? err.message : String(err)}`,
@@ -665,6 +1102,35 @@ export class TdaiCore {
       ? runnerFactory.createRunner({ enableTools: true })
       : undefined;
 
+    // Immune-system extraction fallback: a NON-Chinese model (default OpenAI
+    // gpt-5.4-mini) that rescues the windows Moonshot/Kimi REFUSES with "high
+    // risk" — its content-moderation flags an incidental China-sensitive term
+    // (e.g. the idiom "rubber stamp") and rejects the whole extraction request,
+    // which would otherwise freeze/quarantine the window. Reuses the same
+    // OpenAI-compatible StandaloneLLMRunner. Enabled when a key resolves from
+    // TDAI_FALLBACK_LLM_API_KEY or the OPENAI_API_KEY already used for
+    // embeddings; absent → no fallback (unchanged fail-closed + quarantine).
+    const fallbackKey = process.env.TDAI_FALLBACK_LLM_API_KEY || process.env.OPENAI_API_KEY;
+    const fallbackModel = process.env.TDAI_FALLBACK_LLM_MODEL || "gpt-5.4-mini";
+    const fallbackLlmRunner = fallbackKey
+      ? new StandaloneLLMRunnerFactory({
+          config: {
+            baseUrl: process.env.TDAI_FALLBACK_LLM_BASE_URL || "https://api.openai.com/v1",
+            apiKey: fallbackKey,
+            model: fallbackModel,
+            // gpt-5.4-mini is a reasoning model → it rejects/ignores temperature
+            // (AI-SDK warns per call if sent). Omit it entirely; the model's
+            // default is already low-variance enough for structured extraction.
+            omitTemperature: true,
+            timeoutMs: this.cfg.llm.timeoutMs,
+          },
+          logger: this.logger,
+        }).createRunner({ enableTools: false })
+      : undefined;
+    if (fallbackLlmRunner) {
+      this.logger.info(`${TAG} KB extraction fallback enabled: ${fallbackModel} (rescues Moonshot "high risk" refusals)`);
+    }
+
     // L1 runner
     this.scheduler.setL1Runner(createL1Runner({
       pluginDataDir: this.dataDir,
@@ -675,6 +1141,7 @@ export class TdaiCore {
       logger: this.logger,
       getInstanceId: () => this.instanceId,
       llmRunner: l1LlmRunner,
+      fallbackLlmRunner,
     }));
 
     // Persister
@@ -709,6 +1176,42 @@ export class TdaiCore {
     });
 
     this.logger.debug?.(`${TAG} Pipeline runners wired`);
+  }
+
+  /**
+   * Immune system — resume extraction after a restart.
+   *
+   * Eagerly starts the scheduler: restores per-session pipeline state from the
+   * checkpoint and runs recovery (re-enqueues an L1 "recovery" pass for every
+   * session with un-extracted L0 backlog). Called fire-and-forget at gateway
+   * boot so a crash/reboot/redeploy resumes frozen backlogs WITHOUT waiting for
+   * the next capture — closing the "restart amnesia" that silently froze
+   * extraction (sessionStates is in-memory; before this, only a /capture rebuilt
+   * it and triggered recovery). Idempotent via {@link ensureSchedulerStarted}.
+   */
+  async resumeExtraction(): Promise<void> {
+    await this.storeReady?.catch(() => {});
+    await this.ensureSchedulerStarted();
+  }
+
+  /**
+   * Backfill digestion — extract an arbitrary session_key's un-extracted L0
+   * (an imported claude.ai chat or a historical Code session) into the KB graph,
+   * reusing the LIVE extraction path (Moonshot primary + gpt-5.4-mini fallback +
+   * embeddings) on the serial L1 queue so it never races live capture. Idempotent
+   * + resumable (cursor-based). Drives the "digest the old backlog" job without
+   * stopping the gateway. Returns {processedCount} (messages read this pass).
+   */
+  async digestBacklogSession(sessionKey: string): Promise<{ processedCount: number }> {
+    if (!sessionKey) return { processedCount: 0 };
+    await this.storeReady?.catch(() => {});
+    if (!this.scheduler) return { processedCount: 0 };
+    const res = await this.scheduler.digestBacklogSession(sessionKey);
+    const processedCount =
+      res && typeof res === "object" && "processedCount" in res
+        ? (res as { processedCount: number }).processedCount
+        : 0;
+    return { processedCount };
   }
 
   private ensureSchedulerStarted(): Promise<void> {

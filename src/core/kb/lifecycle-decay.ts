@@ -19,6 +19,19 @@ export const DECAY_FACTOR = 0.5;
 /** Below this permanence a 'short' memory goes dormant. */
 export const DORMANT_MIN_PERMANENCE = 0.25;
 
+// ── Distinctiveness-aware protection (Pilastro C, Fase 1) ──────────────────
+// A memory whose `salience` clears PROTECTED_MIN_SALIENCE is a distinctive peak
+// (von Restorff / cornerstone, stamped by Idea 5). It must fade like a peak, not
+// like noise: gentler decay, a permanence floor, and it NEVER goes dormant.
+// Protection = attenuated decay + floor, NOT total exemption — a peak that truly
+// goes cold can still drift down (just far slower), so we avoid inertia.
+/** Salience at/above which a memory is treated as a protected distinctive peak. */
+export const PROTECTED_MIN_SALIENCE = 0.7;
+/** Gentle decay factor for protected peaks (vs DECAY_FACTOR for noise). */
+export const PROTECTED_DECAY_FACTOR = 0.9;
+/** A protected peak's permanence never decays below this floor (stays retrievable). */
+export const PROTECTED_PERMANENCE_FLOOR = 0.25;
+
 /** Decay one memory: lower permanence, demote tier/state if it falls through. */
 export function decay(
   db: DatabaseSync,
@@ -28,12 +41,17 @@ export function decay(
   const cur = getLifecycle(db, ownerId, ownerKind);
   if (!cur || cur.state === "dormant") return cur;
 
-  const newPerm = cur.permanence_score * DECAY_FACTOR;
+  const isProtectedPeak = cur.salience >= PROTECTED_MIN_SALIENCE;
+  const factor = isProtectedPeak ? PROTECTED_DECAY_FACTOR : DECAY_FACTOR;
+  let newPerm = cur.permanence_score * factor;
+  if (isProtectedPeak) newPerm = Math.max(newPerm, PROTECTED_PERMANENCE_FLOOR);
+
   let newTier = cur.tier;
   let newState = cur.state;
   if (cur.tier === "long" && newPerm < PROMOTE_MIN_PERMANENCE) {
     newTier = "short";
-  } else if (cur.tier === "short" && newPerm < DORMANT_MIN_PERMANENCE) {
+  } else if (cur.tier === "short" && newPerm < DORMANT_MIN_PERMANENCE && !isProtectedPeak) {
+    // A distinctive peak fades toward the floor but never goes dormant.
     newState = "dormant";
   }
 
@@ -52,7 +70,9 @@ export function decay(
       actor: "consolidation",
       before: { tier: cur.tier, state: cur.state, permanence_score: cur.permanence_score },
       after: { tier: newTier, state: newState, permanence_score: newPerm },
-      reason: params.reason ?? "staleness decay",
+      reason: isProtectedPeak
+        ? "protected decay (distinctive peak)"
+        : (params.reason ?? "staleness decay"),
       namespace: cur.namespace,
     },
     now,

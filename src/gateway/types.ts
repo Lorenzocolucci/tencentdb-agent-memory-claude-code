@@ -167,3 +167,55 @@ export interface SeedResponse {
   duration_ms: number;
   output_dir: string;
 }
+
+// ============================
+// /kb/write (deterministic external fact ingestion)
+// ============================
+
+/**
+ * One flat fact in the simplified `/kb/write` form. `entity_type` may be any
+ * string — out-of-vocabulary types are coerced to "concept" by
+ * normalizeRawKbDelta; `attribute` is coerced to snake_case. A group of facts
+ * sharing (entity_type, entity_name) is written under one entity.
+ */
+export interface KbWriteFact {
+  entity_type: string;
+  entity_name: string;
+  attribute: string;
+  value: string;
+  confidence?: number;
+}
+
+/**
+ * Request body for `POST /kb/write` — the deterministic external write path.
+ * Provide EITHER the simplified `facts` array (converted to a KbDelta
+ * server-side) OR a full pre-built `delta` (validated as-is). `facts` takes
+ * precedence: when it is present and non-empty the handler uses it and ignores
+ * `delta`; `delta` is used only when `facts` is absent or empty.
+ */
+export interface KbWriteRequest {
+  /** Simplified flat facts — the ergonomic form. */
+  facts?: KbWriteFact[];
+  /** OR a full KbDelta object (power form) — validated by parseKbDelta. */
+  delta?: unknown;
+  /**
+   * Namespace to write under. Default "default" — the namespace proactive
+   * recall reads (see tdai-core NAMESPACE); override only for isolated corpora.
+   */
+  namespace?: string;
+  /** Project tag stored on entities/events (provenance; cross-project recall). */
+  project?: string;
+  /** Session key stamped on inserted events (default "external:kb-write"). */
+  session_key?: string;
+  /** Language tag for the delta (default "und"). */
+  language?: string;
+}
+
+export interface KbWriteResponse {
+  ok: boolean;
+  entities_written: number;
+  facts_written: number;
+  events_written: number;
+  relations_written: number;
+  embedded: number;
+}

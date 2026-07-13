@@ -225,6 +225,39 @@ describe("kbRecall (temp DB, deterministic fake embedding)", () => {
     expect(betterScore).toBeCloseTo(1, 5);
   });
 
+  it("skipVector drops the global vector source (System 1 fast path): a vector-only match is reachable normally but absent when skipped", async () => {
+    // A fact reachable ONLY by vector: neither its name nor value shares any
+    // keyword with the query, so FTS + entity-match cannot surface it.
+    const semanticOnly = await seedFact(store, embedding, {
+      type: "library",
+      name: "Redis",
+      attribute: "role",
+      value: "ephemeral cache",
+      validFrom: "2026-06-01T00:00:00Z",
+      now: "2026-06-01T00:00:00Z",
+      vec: [1, 0, 0, 0],
+    });
+    // Query vector points exactly at the fact (cosine 1.0) but shares no term.
+    embedding.register("which datastore holds transient state", [1, 0, 0, 0]);
+
+    const withVector = await kbRecall("which datastore holds transient state", {
+      store,
+      embeddingService: embedding,
+      maxResults: 5,
+    });
+    const withoutVector = await kbRecall("which datastore holds transient state", {
+      store,
+      embeddingService: embedding,
+      maxResults: 5,
+      skipVector: true,
+    });
+
+    // The vector source makes the semantic-only fact reachable...
+    expect(withVector.some((r) => r.owner_id === semanticOnly.factId)).toBe(true);
+    // ...and skipping it (auto-recall / banner path) removes the only route to it.
+    expect(withoutVector.some((r) => r.owner_id === semanticOnly.factId)).toBe(false);
+  });
+
   it("a superseded fact is NOT returned (only HEAD)", async () => {
     const entity = store.resolveOrCreateEntity({ type: "bug", name: "login-loop", now: "2026-06-01T00:00:00Z" });
 

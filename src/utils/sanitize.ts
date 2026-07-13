@@ -150,7 +150,9 @@ export function shouldExtractL1(text: string): boolean {
   // ── Security filters ──
   // Reject prompt-injection payloads — prevent malicious content from being
   // persisted into structured memory and re-injected on future recalls.
-  // if (looksLikePromptInjection(text)) return false;
+  // (Defense-in-depth: the recall path also escapes XML boundaries via
+  // escapeXmlTags, but a stored jailbreak payload should not become a memory.)
+  if (looksLikePromptInjection(text)) return false;
 
   return true;
 }
@@ -288,7 +290,7 @@ export function pickRecentUnique(texts: string[], max: number): string[] {
 export function escapeXmlTags(text: string): string {
   // Escape closing tags that match our injection section boundaries
   return text.replace(
-    /<\/?(?:user-persona|relevant-memories|scene-navigation|relevant-scenes|memory-tools-guide|system|assistant|session-open-banner)>/gi,
+    /<\/?(?:user-persona|relevant-memories|scene-navigation|relevant-scenes|memory-tools-guide|system|assistant|session-open-banner|cornerstone-memories|session-recap|grounded-trust-interrupt)>/gi,
     (match) => match.replace(/</g, "&lt;").replace(/>/g, "&gt;"),
   );
 }

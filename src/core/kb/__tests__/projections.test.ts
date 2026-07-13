@@ -144,6 +144,40 @@ describe("KB projections (temp DB)", () => {
       expect(persona).toContain("## Credential Locations");
       expect(persona).toContain("## Active Projects");
     });
+
+    // ── Percorso A (behavioral laws) — rule_* family renders in the process section ──
+    it("projects MANY behavioral-law facts (rule_* family) into Process & Working-Style Rules", () => {
+      store.upsertFact({ entityId: lorenzoId, attribute: "rule_wait_for_answer", value: "Aspetta la mia risposta prima di proseguire", validFrom: "2026-07-01T00:00:00Z", now: "2026-07-01T00:00:00.000Z" });
+      store.upsertFact({ entityId: lorenzoId, attribute: "rule_no_people_pleasing", value: "Non compiacere mai, sfida quando ho torto", validFrom: "2026-07-01T00:00:00Z", now: "2026-07-01T00:00:00.000Z" });
+
+      const persona = projectPersonaBody(store as unknown as ProjectionStore, { namespace: NS });
+      expect(persona).toContain("## Process & Working-Style Rules");
+      // BOTH laws survive (distinct rule_* attributes do not self-supersede).
+      expect(persona).toContain("Aspetta la mia risposta prima di proseguire");
+      expect(persona).toContain("Non compiacere mai, sfida quando ho torto");
+    });
+
+    it("orders behavioral laws by STRENGTH (a reinforced law surfaces first, survives truncation)", () => {
+      // Alphabetically "Aaa…" precedes "Zzz…"; confidence-desc must OVERRIDE alpha
+      // so the stronger (reinforced) law comes first regardless of its text.
+      // Attribute slugs are chosen so ALPHABETICAL order (aaa < zzz) would put the
+      // WEAK law first; only confidence-desc ordering flips the strong one ahead.
+      store.upsertFact({ entityId: lorenzoId, attribute: "rule_aaa", value: "Legge poco ribadita", confidence: 0.3, validFrom: "2026-07-01T00:00:00Z", now: "2026-07-01T00:00:00.000Z" });
+      store.upsertFact({ entityId: lorenzoId, attribute: "rule_zzz", value: "Legge molto ribadita", confidence: 0.95, validFrom: "2026-07-01T00:00:00Z", now: "2026-07-01T00:00:00.000Z" });
+
+      const persona = projectPersonaBody(store as unknown as ProjectionStore, { namespace: NS });
+      const iStrong = persona.indexOf("Legge molto ribadita");
+      const iWeak = persona.indexOf("Legge poco ribadita");
+      expect(iStrong).toBeGreaterThan(-1);
+      expect(iWeak).toBeGreaterThan(-1);
+      expect(iStrong).toBeLessThan(iWeak); // strength beats alphabetical
+    });
+
+    it("still drops a behavioral-law fact whose VALUE looks like a secret", () => {
+      store.upsertFact({ entityId: lorenzoId, attribute: "rule_leak", value: SECRET_VALUE, validFrom: "2026-07-01T00:00:00Z", now: "2026-07-01T00:00:00.000Z" });
+      const persona = projectPersonaBody(store as unknown as ProjectionStore, { namespace: NS });
+      expect(persona).not.toContain(SECRET_VALUE);
+    });
   });
 
   // ──────────────────────────────────────────────────────────────────────────

@@ -148,6 +148,8 @@ export interface L0QueryRow {
   message_text: string;
   recorded_at: string;
   timestamp: number;
+  /** Table rowid — composite-cursor tie-breaker within a same-recorded_at block. */
+  rowid: number;
 }
 
 /** L0 messages grouped by session ID (for L1 runner). */
@@ -160,6 +162,8 @@ export interface L0SessionGroup {
     timestamp: number;
     /** Epoch ms when this message was recorded into L0 (used by L1 cursor). */
     recordedAtMs: number;
+    /** Table rowid — composite-cursor tie-breaker (same-recorded_at paging). */
+    rowid: number;
   }>;
 }
 
@@ -288,6 +292,28 @@ export interface KbFtsSearchResult {
   attribute: string;
   /** BM25-derived score (0–1, higher is better). */
   score: number;
+}
+
+/**
+ * A lesson surfaced for a touched file (Mistake Notebook B2b read shape).
+ * Lean projection of a `lessons` HEAD row — only what Proactive Injection needs.
+ */
+export interface KbLessonHit {
+  /** Lesson id — lets the caller credit exposure/avoidance (B3). */
+  id: string;
+  domain: string;
+  lessonText: string;
+  /** 0–1; higher = better-attested across recurrences. */
+  confidence: number;
+  /** How many failure events back this lesson. */
+  evidenceCount: number;
+  /**
+   * Pilastro B willingness-to-fire ∈ [0,1] from the stance's own hit/miss record.
+   * The live sqlite mapping always populates it (legacy rows default to
+   * WILLINGNESS_DEFAULT); optional so non-KB backends / older fixtures omitting it
+   * are treated as trusted by classifyStanceSeverity (undefined → trusted).
+   */
+  willingness?: number;
 }
 
 /** Input payload for inserting an event (append-only). */
@@ -454,8 +480,8 @@ export interface IMemoryStore {
   // ── L0 Read ──────────────────────────────────────────────
 
   countL0(): MaybePromise<number>;
-  queryL0ForL1(sessionKey: string, afterRecordedAtMs?: number, limit?: number): MaybePromise<L0QueryRow[]>;
-  queryL0GroupedBySessionId(sessionKey: string, afterRecordedAtMs?: number, limit?: number): MaybePromise<L0SessionGroup[]>;
+  queryL0ForL1(sessionKey: string, afterRecordedAtMs?: number, limit?: number, afterRowId?: number): MaybePromise<L0QueryRow[]>;
+  queryL0GroupedBySessionId(sessionKey: string, afterRecordedAtMs?: number, limit?: number, afterRowId?: number): MaybePromise<L0SessionGroup[]>;
   getAllL0Texts(): MaybePromise<Array<{ record_id: string; message_text: string; recorded_at: string }>>;
 
   // ── L0 Search ────────────────────────────────────────────
@@ -502,6 +528,19 @@ export interface IMemoryStore {
 
   /** Append-only event insert. Never updates or deletes existing events. */
   insertEvent?(event: KbEventInput): KbEvent;
+
+  /**
+   * Carry Idea 5's distinctiveness verdict onto a memory's lifecycle `salience`
+   * (Pilastro C bridge), so distinctiveness-aware decay protects the peak.
+   * Monotonic (only raises). Off the critical path: never throws. Optional so
+   * non-sqlite backends (TCVDB) can omit it and the cornerstone runner no-ops.
+   */
+  stampSalience?(params: {
+    ownerId: string;
+    ownerKind: "fact" | "event";
+    salience: number;
+    now: string;
+  }): void;
 
   /**
    * Run one deterministic consolidation pass for a finished session: reinforce
@@ -596,6 +635,33 @@ export interface IMemoryStore {
    * those with `ts` strictly after `sinceTs`. `limit` bounds the result.
    */
   listRecentEvents?(namespace?: string, opts?: { sinceTs?: string; limit?: number }): KbEvent[];
+
+  /** All events for a session (chronological). Optional — backends may omit. */
+  listEventsBySession?(sessionKey: string): KbEvent[];
+
+  /**
+   * Most recent event of a given type for a session_key, or undefined. Optional.
+   * session_key is the verified-stable per-project join (the `project` column is
+   * empty on captured events).
+   */
+  latestEventBySessionKeyType?(sessionKey: string, type: string): KbEvent | undefined;
+  /**
+   * session_key → project-name registry. Recall (which knows both) writes it;
+   * the background extractor reads it to tag new events by project. Best-effort.
+   */
+  setSessionProject?(sessionKey: string, project: string): void;
+  getSessionProject?(sessionKey: string): string | undefined;
+  /** Project tag per event id — lets recall down-weight other-project events. */
+  getEventProjects?(ids: string[]): Record<string, string>;
+  /**
+   * Immune-system heartbeat: sessions whose raw log (L0) is growing but whose
+   * extracted graph (events) is NOT keeping up — i.e. extraction stalled. Used
+   * to surface a health warning at session open so failures are never silent.
+   */
+  getMemoryHealth?(nowMs?: number): {
+    healthy: boolean;
+    stale: Array<{ sessionKey: string; project: string; lagHours: number }>;
+  };
   /**
    * All relation edges touching an entity (as src OR dst), within its namespace.
    * Powers the entity-page "Related [[entity]]" links.
@@ -606,6 +672,73 @@ export interface IMemoryStore {
    * Powers the entity-page "Timeline".
    */
   queryEventsForEntity?(entityId: string, namespace?: string, limit?: number): KbEvent[];
+
+  /**
+   * HEAD lessons (Mistake Notebook) whose trigger pattern involves `fileEntityId`.
+   * Powers Track B's proactive injection: a recurring-failure lesson resurfaces
+   * when the agent touches a file in its trigger. Returns [] when KB/lessons off.
+   */
+  queryHeadLessonsByFile?(fileEntityId: string, namespace?: string, limit?: number): KbLessonHit[];
+
+  /**
+   * B3: record that a lesson resurfaced into a matching situation this session.
+   * Best-effort, off the critical path. Absent on non-KB backends → caller no-ops.
+   */
+  recordLessonExposure?(lessonId: string, sessionId: string, now: string): void;
+
+  /**
+   * B3: explicit (Phase B) avoidance credit — the agent confirmed it followed a
+   * lesson. Returns whether a row was updated. Best-effort. Absent → caller no-ops.
+   */
+  creditLessonAvoidance?(lessonId: string, now: string): boolean;
+
+  /**
+   * Pilastro B: record that a stance FIRED a hard interrupt (bumps its fire count).
+   * Best-effort, off the critical path. Absent on non-KB backends → caller no-ops.
+   */
+  recordStanceFire?(lessonId: string, now: string): void;
+
+  /**
+   * Pilastro B: Lorenzo CONFIRMED a stance interrupt mattered → willingness rises.
+   * Returns whether a row was updated. Best-effort. Absent → caller no-ops.
+   */
+  creditStanceConfirmed?(lessonId: string, now: string): boolean;
+
+  /**
+   * Pilastro B: Lorenzo REJECTED a stance interrupt as a false alarm → willingness
+   * falls (cry-wolf). Returns whether a row was updated. Best-effort. Absent → no-op.
+   */
+  creditStanceRejected?(lessonId: string, now: string): boolean;
+
+  /**
+   * B3: credit successful avoidances for lessons exposed this session that did not
+   * relapse (implicit, Phase A), and temper those that did. Returns counts.
+   * Off the critical path; caller fires it on session end. Absent → caller no-ops.
+   */
+  creditSessionAvoidances?(sessionId: string, now: string): { credited: number; tempered: number };
+
+  /**
+   * Track B write side: distill recurring-failure clusters into `lessons` (LLM).
+   * Idempotent (clusters already turned into a lesson are skipped). Off the
+   * critical path; callers fire-and-forget it on session end. Returns run stats.
+   * Absent on backends without KB write + clustering support → caller no-ops.
+   */
+  runLessonDistillation?(
+    llmRunner: import("../types.js").LLMRunner,
+    opts: { now: string; namespace?: string; maxClusters?: number },
+  ): Promise<{ candidates: number; inserted: number; superseded: number; skippedDuplicate: number }>;
+
+  /**
+   * Percorso B (behavioral notebook) write side: distill recurring cross-session
+   * BEHAVIORAL tendencies into `usage` atoms via SEMANTIC clustering (no LLM —
+   * deterministic wiring). Idempotent (clusters already covered are skipped).
+   * Off the critical path; fire-and-forget. Absent on backends without KB write
+   * + vector support → caller no-ops.
+   */
+  runUsageDistillation?(
+    llmRunner: import("../types.js").LLMRunner,
+    opts: { now: string; namespace?: string; maxClusters?: number },
+  ): Promise<{ candidates: number; confirmed: number; inserted: number; skippedDuplicate: number; skippedRejected: number }>;
 
   /** kb_vec / kb_fts recall primitives (mirror searchL1Vector / searchL1Fts). */
   searchKbVector?(queryEmbedding: Float32Array, topK?: number, ownerKindFilter?: string): KbVectorSearchResult[];

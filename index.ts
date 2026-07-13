@@ -486,6 +486,155 @@ export default function register(api: OpenClawPluginApi) {
     },
     { name: "tdai_conversation_search" },
   );
+
+  // tdai_confirm_memory / tdai_reject_memory — Grounded Trust ask-loop (Phase 3).
+  // The agent calls these to re-bind Lorenzo's answer to a gated (pending) memory:
+  // confirm → the memory becomes authoritative; reject → it is tombstoned (kept).
+  const groundedTrustResolve = (decision: "confirm" | "reject") =>
+    async (_toolCallId: string, params: Record<string, unknown>) => {
+      const ownerId = String(params.owner_id ?? "");
+      const ownerKind = params.owner_kind === "fact" ? "fact" : "event";
+      if (!ownerId) {
+        return { content: [{ type: "text" as const, text: "owner_id is required" }], details: { error: "missing owner_id" } };
+      }
+      try {
+        const res = await core.resolveGatedMemory({ ownerId, ownerKind, decision });
+        report("tool_call", { tool: `tdai_${decision}_memory`, ownerId, ownerKind, success: res.ok });
+        return { content: [{ type: "text" as const, text: res.text }], details: { ok: res.ok } };
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        api.logger.error(`${TAG} [tool] tdai_${decision}_memory failed: ${errMsg}`);
+        return { content: [{ type: "text" as const, text: `Operation failed: ${errMsg}` }], details: { error: errMsg } };
+      }
+    };
+
+  const groundedTrustParams = {
+    type: "object" as const,
+    properties: {
+      owner_id: { type: "string", description: "The memory id from the grounded-trust-interrupt block" },
+      owner_kind: { type: "string", enum: ["event", "fact"], description: "Whether the memory is an event or a fact" },
+    },
+    required: ["owner_id", "owner_kind"],
+  };
+
+  api.registerTool(
+    {
+      name: "tdai_confirm_memory",
+      label: "Confirm Memory",
+      description:
+        "Record that Lorenzo CONFIRMED an uncertain memory raised in a grounded-trust-interrupt block. " +
+        "Call this ONLY after Lorenzo explicitly confirms the memory is correct. It becomes authoritative and is never re-asked.",
+      parameters: groundedTrustParams,
+      execute: groundedTrustResolve("confirm"),
+    },
+    { name: "tdai_confirm_memory" },
+  );
+
+  api.registerTool(
+    {
+      name: "tdai_reject_memory",
+      label: "Reject Memory",
+      description:
+        "Record that Lorenzo REJECTED an uncertain memory raised in a grounded-trust-interrupt block. " +
+        "Call this ONLY after Lorenzo says the memory is wrong. It is tombstoned (kept for the audit trail, never acted on, never re-asked).",
+      parameters: groundedTrustParams,
+      execute: groundedTrustResolve("reject"),
+    },
+    { name: "tdai_reject_memory" },
+  );
+
+  // tdai_lesson_helped — Mistake Notebook B3: explicit avoidance confirmation.
+  // Call ONLY after following a resurfaced ⚠️ lesson and the failure did NOT recur.
+  api.registerTool(
+    {
+      name: "tdai_lesson_helped",
+      label: "Lesson Helped",
+      description:
+        "Confirm that a recurring-failure lesson (surfaced earlier as a ⚠️ lesson in a <file-memory> block) was followed AND the failure was avoided. " +
+        "Call this ONLY when you actually applied the lesson and the mistake did not happen — it strengthens the lesson's confidence.",
+      parameters: {
+        type: "object",
+        properties: {
+          lesson_id: { type: "string", description: "The id of the lesson that helped" },
+        },
+        required: ["lesson_id"],
+      },
+      async execute(_toolCallId: string, params: Record<string, unknown>) {
+        const lessonId = String(params.lesson_id ?? "");
+        if (!lessonId) {
+          return { content: [{ type: "text" as const, text: "lesson_id is required" }], details: { error: "missing lesson_id" } };
+        }
+        try {
+          const res = await core.confirmLessonHelped(lessonId);
+          report("tool_call", { tool: "tdai_lesson_helped", lessonId, success: res.ok });
+          return { content: [{ type: "text" as const, text: res.text }], details: { ok: res.ok } };
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          api.logger.error(`${TAG} [tool] tdai_lesson_helped failed: ${errMsg}`);
+          return { content: [{ type: "text" as const, text: `Operation failed: ${errMsg}` }], details: { error: errMsg } };
+        }
+      },
+    },
+    { name: "tdai_lesson_helped" },
+  );
+
+  // tdai_stance_confirmed / tdai_stance_rejected — Pilastro B (Strada A): the
+  // stance track record. Call ONLY after Lorenzo answers a <stance-interrupt>:
+  // confirmed → the stance earns more willingness to fire; rejected (false alarm)
+  // → willingness falls, and a stance that cries wolf silences itself over time.
+  const stanceVerdict = (verdict: "confirmed" | "rejected") =>
+    async (_toolCallId: string, params: Record<string, unknown>) => {
+      const lessonId = String(params.lesson_id ?? "");
+      if (!lessonId) {
+        return { content: [{ type: "text" as const, text: "lesson_id is required" }], details: { error: "missing lesson_id" } };
+      }
+      try {
+        const res =
+          verdict === "confirmed"
+            ? await core.confirmStanceFire(lessonId)
+            : await core.rejectStanceFire(lessonId);
+        report("tool_call", { tool: `tdai_stance_${verdict}`, lessonId, success: res.ok });
+        return { content: [{ type: "text" as const, text: res.text }], details: { ok: res.ok } };
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        api.logger.error(`${TAG} [tool] tdai_stance_${verdict} failed: ${errMsg}`);
+        return { content: [{ type: "text" as const, text: `Operation failed: ${errMsg}` }], details: { error: errMsg } };
+      }
+    };
+
+  const stanceParams = {
+    type: "object" as const,
+    properties: {
+      lesson_id: { type: "string", description: "The lesson id carried in the <stance-interrupt> block" },
+    },
+    required: ["lesson_id"],
+  };
+
+  api.registerTool(
+    {
+      name: "tdai_stance_confirmed",
+      label: "Stance Confirmed",
+      description:
+        "Record that Lorenzo CONFIRMED a <stance-interrupt> was right to fire (a real one-way-door risk). " +
+        "Call this ONLY after Lorenzo agrees the stop mattered — it raises the stance's willingness to interrupt again.",
+      parameters: stanceParams,
+      execute: stanceVerdict("confirmed"),
+    },
+    { name: "tdai_stance_confirmed" },
+  );
+
+  api.registerTool(
+    {
+      name: "tdai_stance_rejected",
+      label: "Stance Rejected",
+      description:
+        "Record that Lorenzo said a <stance-interrupt> was a FALSE ALARM. " +
+        "Call this ONLY after Lorenzo says the stop was unwarranted — it lowers the stance's willingness so it stops crying wolf.",
+      parameters: stanceParams,
+      execute: stanceVerdict("rejected"),
+    },
+    { name: "tdai_stance_rejected" },
+  );
   } else {
     api.logger.debug?.(`${TAG} Memory tools (tdai_memory_search, tdai_conversation_search) not registered — memory features disabled`);
   }

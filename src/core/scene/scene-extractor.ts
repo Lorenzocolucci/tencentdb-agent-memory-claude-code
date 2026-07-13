@@ -156,13 +156,13 @@ export class SceneExtractor {
     let sceneCountWarning: string | undefined;
     const sceneCount = index.length;
     if (sceneCount >= this.maxScenes) {
-      sceneCountWarning = `当前场景数量为 **${sceneCount} 个**，已达到或超过 ${this.maxScenes} 个上限！\n**你必须先执行 MERGE 操作**，将最相似的 2-4 个场景合并为 1 个，然后再处理新记忆。\n参考合并对象：热度最低或主题高度重叠的场景。`;
+      sceneCountWarning = `Current scene count is **${sceneCount}**, which has reached or exceeded the limit of ${this.maxScenes}!\n**You must perform a MERGE operation first** — combine the 2–4 most similar scenes into 1, then process the new memories.\nMerge candidates: scenes with the lowest heat or the highest thematic overlap.`;
       this.logger?.warn(`${TAG} extract() scene count at limit: ${sceneCount}/${this.maxScenes}`);
     } else if (sceneCount === this.maxScenes - 1) {
-      sceneCountWarning = `当前场景数量为 **${sceneCount} 个**，距离上限只差 1 个！\n本次处理**只能 UPDATE 现有场景，不能 CREATE 新场景**。`;
+      sceneCountWarning = `Current scene count is **${sceneCount}**, only 1 away from the limit!\nThis pass **may only UPDATE existing scenes — do not CREATE new scenes**.`;
       this.logger?.warn(`${TAG} extract() scene count near limit (CREATE blocked): ${sceneCount}/${this.maxScenes}`);
     } else if (sceneCount >= this.maxScenes - 3) {
-      sceneCountWarning = `当前场景数量为 **${sceneCount} 个**，建议优先考虑 UPDATE 或主动 MERGE 相似场景。`;
+      sceneCountWarning = `Current scene count is **${sceneCount}**. Consider prioritising UPDATE or proactively merging similar scenes.`;
       this.logger?.debug?.(`${TAG} extract() scene count approaching limit: ${sceneCount}/${this.maxScenes}`);
     }
 
@@ -194,7 +194,7 @@ export class SceneExtractor {
 
     const { systemPrompt, userPrompt } = buildSceneExtractionPrompt({
       memoriesJson,
-      sceneSummaries: sceneSummaries || "(无已有场景)",
+      sceneSummaries: sceneSummaries || "(no existing scenes)",
       currentTimestamp,
       sceneCountWarning,
       existingSceneFiles,
@@ -378,13 +378,13 @@ export class SceneExtractor {
     const filenames: string[] = [];
 
     // Inject capacity counter at the top — LLM sees this first
-    lines.push(`**当前场景总数：${index.length} / ${this.maxScenes}**`);
+    lines.push(`**Current scene count: ${index.length} / ${this.maxScenes}**`);
     lines.push("");
 
     for (const entry of index) {
       filenames.push(entry.filename);
       lines.push(`### ${entry.filename}`);
-      lines.push(`**热度**: ${entry.heat} | **更新**: ${entry.updated}`);
+      lines.push(`**Heat**: ${entry.heat} | **Updated**: ${entry.updated}`);
       lines.push(`**summary**: ${entry.summary}`);
       lines.push("");
     }

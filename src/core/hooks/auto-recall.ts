@@ -22,33 +22,32 @@ import type { EmbeddingService, EmbeddingCallOptions } from "../store/embedding.
 import { sanitizeText, escapeXmlTags } from "../../utils/sanitize.js";
 import { redactSecrets } from "../../utils/redact-secrets.js";
 import { kbRecall, type KbRecallResult } from "../kb/retrieval.js";
+import { buildSituationSeeds } from "../kb/situation-cue.js";
+import { assessRecallConfidence } from "../kb/recall-confidence.js";
+import type { SessionSituation } from "./session-situation.js";
 import { loadPrinciples, formatPrinciplesBlock } from "./principles.js";
 import { buildSessionBanner, type SessionBannerTracker } from "./session-banner.js";
+import { latestRecapBlock } from "../continuity/recap-retrieval.js";
+import { captureRolloverRecap } from "../continuity/recap-rollover.js";
+import type { CornerstoneInjectionTracker } from "../distinctiveness/cornerstone-runner.js";
+import { CornerstoneSessionCache } from "../distinctiveness/cornerstone-cache.js";
 import {
-  buildCornerstones,
-  type CornerstoneInjectionTracker,
-} from "../distinctiveness/cornerstone-runner.js";
+  MEMORY_TOOLS_GUIDE,
+  RELEVANT_MEMORIES_HEADER,
+  ACTIVITY_TIME_LABEL,
+} from "./recall-display.js";
 
 const TAG = "[memory-tdai] [recall]";
 
 /**
- * Memory tools usage guide — injected at the end of memory context so the
- * main agent knows how to actively retrieve deeper information.
+ * Inverse of formatMemoryLine: parse a formatted memory line back into its
+ * [type|scene] tag and content, stripping the trailing activity-time suffix.
+ * Built from ACTIVITY_TIME_LABEL so the formatter and this parser stay in
+ * lock-step — translating the label must not silently break metric parsing.
  */
-const MEMORY_TOOLS_GUIDE = `<memory-tools-guide>
-## 记忆工具调用指南
-
-当上方注入的记忆片段不足以回答用户问题时，可主动调用以下工具获取更多信息：
-
-- **tdai_memory_search**：搜索结构化记忆（L1），适用于回忆用户偏好、历史事件节点、规则等关键信息。
-- **tdai_conversation_search**：搜索原始对话（L0），适用于查找具体消息原文、时间线、上下文细节；也可用于补充或校验 memory_search 的结果。
-- **read_file**（Scene Navigation 中的路径）：当已定位到相关情境，且需要该场景的完整画像、事件经过或阶段结论时使用。
-
-### ⚠️ 调用次数限制
-每轮对话中，tdai_memory_search 和 tdai_conversation_search **合计最多调用 3 次**。
-- 首次搜索无结果时，可换关键词或换工具重试，但总调用次数不要超过 3 次。
-- 若 3 次搜索后仍无结果，说明该信息不在记忆中，请直接根据已有信息回复用户，不要继续搜索。
-</memory-tools-guide>`
+const MEMORY_LINE_RE = new RegExp(
+  `^-\\s+\\[([^\\]]+)\\]\\s+(.+?)(?:\\s*\\(${ACTIVITY_TIME_LABEL}:.*\\))?$`,
+);
 
 interface Logger {
   debug?: (message: string) => void;
@@ -56,6 +55,17 @@ interface Logger {
   warn: (message: string) => void;
   error: (message: string) => void;
 }
+
+/**
+ * Budget for the memory SEARCH alone (embedding + vector/FTS lookup). The search
+ * depends on a REMOTE embedding provider (OpenAI); a network/DNS blip makes it
+ * hang or retry. If it exceeds this budget we degrade the search to EMPTY and
+ * still inject the deterministic, LOCAL context (persona/scene/banner). Kept well
+ * under the overall recall timeout (cfg.recall.timeoutMs ?? 5000) so persona/scene
+ * always ship. Root cause: a hung embedding blew the single 5s recall timeout and
+ * silently dropped the WHOLE injection (persona+scene+banner+memories).
+ */
+const DEFAULT_SEARCH_TIMEOUT_MS = 4000;
 
 // ============================
 // RC3 — hybrid recall ranking tuning
@@ -142,6 +152,14 @@ export interface RecallResult {
   recallStrategy?: string;
   /** True when this result includes the session-open banner (caller commits the tracker slot). */
   bannerEmitted?: boolean;
+  /**
+   * Set on a cornerstone cache MISS. Signals the caller to build the cornerstone
+   * block OFF the recall critical path and commit it to the CornerstoneSessionCache,
+   * so the block appears from the NEXT turn. The corpus embed is NOT awaited here:
+   * inline it cost ~5s on the first turn of a session and blew the cc hook's
+   * RECALL_TIMEOUT, silently dropping the entire session-open injection.
+   */
+  cornerstoneMiss?: { key: string };
 }
 
 export async function performAutoRecall(params: {
@@ -169,6 +187,12 @@ export async function performAutoRecall(params: {
    * alongside the heat-ranked scenes at session start.
    */
   cornerstoneTracker?: CornerstoneInjectionTracker;
+  /**
+   * Session-scoped cache so the cornerstone block is computed ONCE per session
+   * (the embed-the-corpus cost stays off the per-turn critical path). Required
+   * alongside cornerstoneTracker for the cornerstone block to be injected.
+   */
+  cornerstoneCache?: CornerstoneSessionCache;
 }): Promise<RecallResult | undefined> {
   const { cfg, logger } = params;
   const timeoutMs = cfg.recall.timeoutMs ?? 5000;
@@ -203,8 +227,9 @@ async function performAutoRecallInner(params: {
   embeddingService?: EmbeddingService;
   bannerTracker?: SessionBannerTracker;
   cornerstoneTracker?: CornerstoneInjectionTracker;
+  cornerstoneCache?: CornerstoneSessionCache;
 }): Promise<RecallResult | undefined> {
-  const { userText, cfg, pluginDataDir, projectName, logger, vectorStore, embeddingService, bannerTracker, cornerstoneTracker } = params;
+  const { userText, cfg, pluginDataDir, projectName, logger, vectorStore, embeddingService, bannerTracker, cornerstoneTracker, cornerstoneCache } = params;
   const tRecallStart = performance.now();
 
   // Search relevant memories (L1 layer) — skip only when userText is empty/undefined
@@ -215,38 +240,75 @@ async function performAutoRecallInner(params: {
   let searchTiming: SearchTiming = { ftsMs: 0, embeddingMs: 0, ftsHits: 0, embeddingHits: 0 };
   if (!userText || userText.length === 0) {
     logger?.debug?.(`${TAG} User text empty/undefined, skipping memory search (persona/scene still injected)`);
-  } else if (cfg.recall.source === "kb") {
-    // ── Phase-4 entity-centric KB recall path (recall.source = "kb") ──
-    // Maps KbRecallResult → the same memoryLines / RecalledMemory shape the L1
-    // path produces, so downstream injection is unchanged. The score injected
-    // here is the CALIBRATED 0-1 relevance from kbRecall (never raw RRF).
-    effectiveStrategy = "kb";
-    const tKb = performance.now();
-    const kbResults = await runKbRecall(userText, cfg, logger, vectorStore, embeddingService);
-    memoryLines = kbResults.map((r) => formatKbRecallLine(r));
-    recalledL1Memories = kbResults.map((r) => ({
-      content: r.text,
-      score: r.score,
-      type: r.owner_kind,
-    }));
-    searchTiming = { ftsMs: 0, embeddingMs: performance.now() - tKb, ftsHits: 0, embeddingHits: kbResults.length };
   } else {
-    effectiveStrategy = cfg.recall.strategy ?? "hybrid";
-    const searchResult = await searchMemories(userText, pluginDataDir, cfg, logger, effectiveStrategy as "keyword" | "embedding" | "hybrid", vectorStore, embeddingService);
-    memoryLines = searchResult.lines;
-    searchTiming = searchResult.timing;
-
-    // Extract structured RecalledMemory from formatted lines for metric reporting
-    recalledL1Memories = memoryLines.map((line) => {
-      const match = line.match(/^-\s+\[([^\]]+)\]\s+(.+?)(?:\s*\(活动时间:.*\))?$/);
-      if (match) {
-        const tag = match[1];
-        const content = match[2].trim();
-        const typePart = tag.includes("|") ? tag.split("|")[0] : tag;
-        return { content, score: 0, type: typePart };
+    // The memory search embeds the query via a REMOTE provider (OpenAI). Bound it
+    // with its own budget: if it exceeds the budget (network/DNS blip, provider
+    // slow), DEGRADE the search to empty and continue — persona/scene/banner
+    // (deterministic, local, no network) must still be assembled and injected.
+    interface SearchOutcome {
+      lines: string[];
+      strategy: string;
+      memories: RecalledMemory[];
+      timing: SearchTiming;
+    }
+    const runSearch = async (): Promise<SearchOutcome> => {
+      if (cfg.recall.source === "kb") {
+        // ── Phase-4 entity-centric KB recall path (recall.source = "kb") ──
+        // Score injected here is the CALIBRATED 0-1 relevance (never raw RRF).
+        const tKb = performance.now();
+        const kbResults = await runKbRecall(userText, cfg, logger, vectorStore, embeddingService, projectName, {
+          sessionKey: params.sessionKey,
+          namespace: "default",
+        });
+        return {
+          lines: kbResults.map((r) => formatKbRecallLine(r)),
+          strategy: "kb",
+          memories: kbResults.map((r) => ({ content: r.text, score: r.score, type: r.owner_kind })),
+          timing: { ftsMs: 0, embeddingMs: performance.now() - tKb, ftsHits: 0, embeddingHits: kbResults.length },
+        };
       }
-      return { content: line, score: 0, type: "unknown" };
-    });
+      const strategy = cfg.recall.strategy ?? "hybrid";
+      const searchResult = await searchMemories(userText, pluginDataDir, cfg, logger, strategy as "keyword" | "embedding" | "hybrid", vectorStore, embeddingService);
+      return {
+        lines: searchResult.lines,
+        strategy,
+        // Extract structured RecalledMemory from formatted lines for metrics.
+        memories: searchResult.lines.map((line) => {
+          const match = line.match(MEMORY_LINE_RE);
+          if (match) {
+            const tag = match[1];
+            const content = match[2].trim();
+            const typePart = tag.includes("|") ? tag.split("|")[0] : tag;
+            return { content, score: 0, type: typePart };
+          }
+          return { content: line, score: 0, type: "unknown" };
+        }),
+        timing: searchResult.timing,
+      };
+    };
+
+    const searchBudgetMs = cfg.recall.searchTimeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS;
+    let searchTimer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race<SearchOutcome | null>([
+      runSearch().finally(() => { if (searchTimer) clearTimeout(searchTimer); }),
+      new Promise<null>((resolve) => {
+        searchTimer = setTimeout(() => {
+          logger?.warn?.(
+            `${TAG} ⚠️ memory search exceeded ${searchBudgetMs}ms (embedding/provider slow or unreachable) — ` +
+              `injecting persona/scene/banner WITHOUT vector memories (degraded, not dropped)`,
+          );
+          resolve(null);
+        }, searchBudgetMs);
+      }),
+    ]);
+    if (outcome) {
+      memoryLines = outcome.lines;
+      effectiveStrategy = outcome.strategy;
+      recalledL1Memories = outcome.memories;
+      searchTiming = outcome.timing;
+    } else {
+      effectiveStrategy = "degraded"; // search timed out → empty memories, persona/scene still injected
+    }
   }
   const tSearchEnd = performance.now();
 
@@ -285,6 +347,22 @@ async function performAutoRecallInner(params: {
   // fresh project has no persona/scene/memory yet — otherwise the binding vision
   // is silently dropped exactly when it matters most (the "forgot the vision" bug).
   const principles = await loadPrinciples(pluginDataDir, projectName);
+
+  // "Cambio della guardia" — capture the PREVIOUS session's recap on the FIRST
+  // turn of a new session, BEFORE the "anything to inject?" gate below. The
+  // capture must NOT depend on the current query returning a hit: it snapshots
+  // the session that just ended (the desktop app fires no reliable session-end).
+  // Local + fast (no LLM/embeddings), idempotent → safe inline. latestRecapBlock
+  // in the banner block surfaces the fresh recap on this same turn.
+  if (vectorStore && params.sessionKey && bannerTracker?.pending(params.sessionId ?? params.sessionKey)) {
+    captureRolloverRecap({
+      store: vectorStore,
+      sessionKey: params.sessionKey,
+      currentSessionId: params.sessionId,
+      now: new Date().toISOString(),
+      logger,
+    });
+  }
 
   if (memoryLines.length === 0 && !personaContent && !sceneNavigation && !principles) {
     const totalMs = performance.now() - tRecallStart;
@@ -331,57 +409,91 @@ async function performAutoRecallInner(params: {
   }
 
   // Idea 5: Distinctiveness Scorer — inject top-K cornerstone memories ALONGSIDE
-  // the heat-ranked scenes (not replacing them). Only active when a
-  // cornerstoneTracker is provided so the feature is opt-in per deployment.
+  // the heat-ranked scenes (not replacing them). Only active when BOTH a
+  // cornerstoneTracker and a cornerstoneCache are provided (opt-in per deployment).
   // Fully fault-tolerant: buildCornerstones swallows all errors and returns "".
-  if (cornerstoneTracker && vectorStore) {
-    const cornerstoneBlock = await buildCornerstones({
-      vectorStore,
-      embeddingService,
-      injectionTracker: cornerstoneTracker,
-      logger,
-    });
-    if (cornerstoneBlock) {
-      stableParts.push(cornerstoneBlock);
+  //
+  // 1×/session: the corpus-embedding cost runs only on the FIRST turn of a session
+  // (cache MISS). Subsequent turns reuse the cached block string — zero embedding
+  // calls on the per-turn critical path. The cache is committed by the caller after
+  // a real (non-timed-out) result, so a timed-out first turn recomputes next turn.
+  let cornerstoneMiss: { key: string } | undefined;
+  if (cornerstoneTracker && cornerstoneCache && vectorStore) {
+    const csKey = params.sessionId ?? params.sessionKey;
+    const cached = cornerstoneCache.get(csKey);
+    if (cached !== undefined) {
+      // HIT (including ""=computed-empty) → reuse, NO embedding work this turn.
+      if (cached) stableParts.push(cached);
+    } else {
+      // MISS → DEFER. Do NOT await buildCornerstones here: it batch-embeds the
+      // event corpus (~5s on a cold/contended connection), and on the FIRST turn
+      // of a session that blew the cc hook's RECALL_TIMEOUT_MS, silently dropping
+      // the ENTIRE session-open injection (persona + principles + scene + banner
+      // + relevant memories). Signal the caller to build the block off the
+      // critical path and commit it to the cache, so cornerstones appear from the
+      // NEXT turn while this turn ships everything else instantly.
+      cornerstoneMiss = { key: csKey };
     }
   }
 
-  // Dynamic part: L1 relevant memories (changes every turn) → prependContext (user prompt)
-  let prependContext: string | undefined;
-  if (memoryLines.length > 0) {
-    // memoryLines is recalled memory content — UNTRUSTED (a prior session could
-    // have stored a poisoned memory). Escape each line so a memory containing
-    // "</relevant-memories><system>..." cannot close the section early and
-    // inject attacker-controlled instructions into a future session.
-    const safeMemoryLines = memoryLines.map((line) => escapeXmlTags(line));
-    prependContext =
-      `<relevant-memories>\n以下是当前对话召回的相关记忆，不代表当前任务进程，仅作为参考：\n\n${safeMemoryLines.join("\n")}\n</relevant-memories>`;
-  }
+  // Dynamic part: the proactive-injection payload, assembled in PRIORITY order
+  // (highest first) so any downstream tail truncation sacrifices the
+  // lowest-value block last — banner → recap → relevant-memories. The banner
+  // used to be sandwiched between the recap and the memories; an oversized
+  // persona pushed it past the plugin char cap and a blind tail-slice cut it,
+  // silently degrading proactive injection. Head position keeps it safe.
+  const dynamicBlocks: string[] = [];
 
-  // Session-open banner: inject instruction on FIRST turn of each SESSION.
-  // Keyed on sessionId (changes per session) with a sessionKey fallback — keying
-  // on sessionKey alone fired the banner once per gateway-process lifetime
-  // (sessionKey is stable per project), so it effectively never re-fired.
-  // PEEK only (pending) — the caller commits the slot (markEmitted) after this
-  // result is actually returned, so a timed-out recall never burns the banner.
-  // Wrapped so any error is swallowed — the banner must never break a turn.
+  // (1) Session-open banner — FIRST turn of each SESSION only. Highest priority:
+  // it is the proof memory is loaded AND the instruction to open the reply with
+  // it. Keyed on sessionId (changes per session) with a sessionKey fallback —
+  // keying on sessionKey alone fired it once per gateway-process lifetime, so it
+  // effectively never re-fired. PEEK only (pending) — the caller commits the slot
+  // (markEmitted) after this result is actually returned, so a timed-out recall
+  // never burns the banner. Wrapped so any error is swallowed — the banner must
+  // never break a turn.
   const bannerKey = params.sessionId ?? params.sessionKey;
   let bannerEmitted = false;
   if (bannerTracker?.pending(bannerKey)) {
     try {
-      const recentEventText = resolveRecentEventText(vectorStore);
+      const recentEventText = resolveRecentEventText(vectorStore, params.sessionKey);
+      const healthWarning = resolveHealthWarning(vectorStore);
       const banner = buildSessionBanner({
         projectName,
         personaLoaded: personaContent !== undefined,
         sceneCount,
         recentEventText,
+        healthWarning,
       });
-      prependContext = prependContext ? `${banner}\n\n${prependContext}` : banner;
+      dynamicBlocks.push(banner);
       bannerEmitted = true;
+
+      // (2) "Dove eravamo" — the previous session's anchored recap for THIS
+      // context, joined on session_key (stable per project; the events'
+      // `project` column is empty). Reconstruction, not a doc dump. Second
+      // priority, right after the banner. Off the critical path: "" on failure.
+      if (vectorStore && params.sessionKey) {
+        const recapBlock = latestRecapBlock({ store: vectorStore, sessionKey: params.sessionKey, logger });
+        if (recapBlock) dynamicBlocks.push(recapBlock);
+      }
     } catch {
       // Banner errors are silently swallowed — memory must never block the turn.
     }
   }
+
+  // (3) L1 relevant memories (changes every turn) — lowest priority of the
+  // dynamic blocks, so it yields first under truncation. memoryLines is recalled
+  // content — UNTRUSTED (a prior session could have stored a poisoned memory).
+  // Escape each line so a memory containing "</relevant-memories><system>..."
+  // cannot close the section early and inject instructions into a future session.
+  if (memoryLines.length > 0) {
+    const safeMemoryLines = memoryLines.map((line) => escapeXmlTags(line));
+    dynamicBlocks.push(
+      `<relevant-memories>\n${RELEVANT_MEMORIES_HEADER}\n\n${safeMemoryLines.join("\n")}\n</relevant-memories>`,
+    );
+  }
+
+  const prependContext = dynamicBlocks.length > 0 ? dynamicBlocks.join("\n\n") : undefined;
 
   // Append memory tools usage guide to the stable part so the agent knows
   // how to actively retrieve deeper context when the injected snippets
@@ -413,6 +525,7 @@ async function performAutoRecallInner(params: {
     recalledL3Persona: personaContent ?? null,
     recallStrategy: effectiveStrategy,
     bannerEmitted,
+    cornerstoneMiss,
   };
 }
 
@@ -429,11 +542,47 @@ async function performAutoRecallInner(params: {
  * returning the value directly). If the method is absent or throws, returns
  * undefined without blocking the turn.
  */
-function resolveRecentEventText(vectorStore?: IMemoryStore): string | undefined {
-  if (!vectorStore?.listRecentEvents) return undefined;
+export function resolveRecentEventText(
+  vectorStore?: IMemoryStore,
+  sessionKey?: string,
+): string | undefined {
+  // Scope by sessionKey — which is PER-PROJECT (plugin: getSessionKey(cwd)).
+  // The old global `listRecentEvents("default")` leaked the last work of ANOTHER
+  // project (e.g. TutorAI's recap surfacing when you open Sofia). session_recap
+  // meta-events are skipped: we want the last REAL work, not the recap of it.
+  // Returns undefined when this project has no events yet → the banner drops
+  // "ultimo" rather than showing a different project's work (no cross-project bleed).
+  if (!vectorStore?.listEventsBySession || !sessionKey) return undefined;
   try {
-    const events = vectorStore.listRecentEvents("default", { limit: 1 });
-    return events[0]?.text || undefined;
+    const events = vectorStore.listEventsBySession(sessionKey);
+    let latest: { ts: string; text: string } | undefined;
+    for (const e of events) {
+      if (e.type === "session_recap" || !e.text) continue;
+      if (!latest || e.ts > latest.ts) latest = { ts: e.ts, text: e.text };
+    }
+    return latest?.text || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The immune-system warning shown in the session-open banner. Returns a short
+ * Italian phrase when a project's extraction has stalled (L0 growing, events
+ * lagging), else undefined (banner stays clean). Best-effort, never throws.
+ */
+export function resolveHealthWarning(vectorStore?: IMemoryStore): string | undefined {
+  const fn = (vectorStore as {
+    getMemoryHealth?: () => { healthy: boolean; stale: Array<{ project: string; lagHours: number }> };
+  })?.getMemoryHealth;
+  if (typeof fn !== "function") return undefined;
+  try {
+    const h = fn.call(vectorStore);
+    if (!h || h.healthy || h.stale.length === 0) return undefined;
+    const top = h.stale[0];
+    const behind = top.lagHours >= 48 ? `${Math.round(top.lagHours / 24)}gg` : `${top.lagHours}h`;
+    const more = h.stale.length > 1 ? ` +${h.stale.length - 1} progetti` : "";
+    return `estrazione ferma: ${top.project} indietro ${behind}${more}`;
   } catch {
     return undefined;
   }
@@ -443,17 +592,58 @@ function resolveRecentEventText(vectorStore?: IMemoryStore): string | undefined 
 // KB recall path (recall.source = "kb")
 // ============================
 
+/** Fraction of the score kept by an event that belongs to ANOTHER project. */
+const OTHER_PROJECT_PENALTY = 0.5;
+
+/**
+ * Down-weight recalled EVENTS that belong to a different project than the current
+ * one, then re-sort. Soft, not a hard filter: a strongly-relevant cross-project
+ * event can still surface. Facts/entities/laws (no per-event project) are neutral.
+ * No projectName or no registry → returns results unchanged (never blocks recall).
+ */
+export function applyProjectScope(
+  results: KbRecallResult[],
+  projectName: string | undefined,
+  store: IMemoryStore,
+): KbRecallResult[] {
+  const getEventProjects = (store as {
+    getEventProjects?: (ids: string[]) => Record<string, string>;
+  }).getEventProjects;
+  if (!projectName || typeof getEventProjects !== "function" || results.length === 0) return results;
+  const eventIds = results.filter((r) => r.owner_kind === "event").map((r) => r.owner_id);
+  if (eventIds.length === 0) return results;
+  let projById: Record<string, string>;
+  try {
+    projById = getEventProjects.call(store, eventIds);
+  } catch {
+    return results;
+  }
+  return results
+    .map((r) => {
+      const p = projById[r.owner_id];
+      return p && p !== projectName ? { ...r, score: r.score * OTHER_PROJECT_PENALTY } : r;
+    })
+    .sort((a, b) => b.score - a.score);
+}
+
 /**
  * Run the Phase-4 entity-centric KB recall and return its results. Fault
  * tolerant: any failure degrades to [] so the recall path never blocks the turn
  * (mirrors searchMemories' try/catch contract).
  */
-async function runKbRecall(
+export async function runKbRecall(
   userText: string,
   cfg: MemoryTdaiConfig,
   logger: Logger | undefined,
   vectorStore?: IMemoryStore,
   embeddingService?: EmbeddingService,
+  projectName?: string,
+  /**
+   * Situation context (associative-first, Incremento A): lets the recall be seeded
+   * by WHERE WE ARE (recent events + fingerprint + recent files), not only by the
+   * query text. Optional — when absent, only the query-cue path runs (old behavior).
+   */
+  sit?: { sessionKey: string; namespace: string; situation?: SessionSituation },
 ): Promise<KbRecallResult[]> {
   if (!vectorStore) {
     logger?.debug?.(`${TAG} [kb] vectorStore unavailable — KB recall skipped`);
@@ -463,14 +653,152 @@ async function runKbRecall(
   try {
     // Redact secrets before the KB recall query is embedded (same egress guard
     // as the L1 search path above).
-    return await kbRecall(redactSecrets(userText), {
+    let results = await kbRecall(redactSecrets(userText), {
       store: vectorStore,
       embeddingService,
       maxResults: cfg.recall.maxResults ?? 5,
       rerank: cfg.recall.rerank ?? false,
       embeddingTimeoutMs: recallEmbeddingTimeoutMs,
+      // System 1 (fast, associative): skip the O(N) global vector scan so the
+      // session-open banner returns within the cc RECALL_TIMEOUT. FTS +
+      // entity-match seed the graph and spreading activation (below) carries the
+      // associative recall. The explicit memory-search tool keeps the vector
+      // source for on-demand deep retrieval (System 2).
+      skipVector: true,
       logger,
     });
+
+    // Project scoping: down-weight EVENTS belonging to OTHER projects so the
+    // current project's work surfaces first. Soft (not a hard filter) — a
+    // strongly-relevant cross-project hit can still appear; laws/entities carry
+    // no project tag → neutral. projectName is the current cwd's project.
+    results = applyProjectScope(results, projectName, vectorStore);
+
+    // Grounded Trust Phase 2 wiring: mark uncertain, high-stakes recalled units as
+    // pending the ask-loop. Best-effort, off the critical path (gateRecalledUnits
+    // swallows its own errors). Trust gates ACTION, not injection — the units stay
+    // in `results` unchanged; only their gate state is written.
+    const gate = (vectorStore as { gateRecalledUnits?: (u: unknown[], now: string) => void })
+      .gateRecalledUnits;
+    if (typeof gate === "function") {
+      gate.call(
+        vectorStore,
+        results.map((r) => ({ owner_id: r.owner_id, owner_kind: r.owner_kind, text: r.text })),
+        new Date().toISOString(),
+      );
+    }
+
+    // Grounded Trust Phase 4: suppress tombstoned (rejected) memories from injection
+    // — a memory Lorenzo declared wrong must never drive action again. Best-effort.
+    let visible = results;
+    const rejectedKeys = (vectorStore as {
+      rejectedOwnerKeys?: (u: Array<{ owner_id: string; owner_kind: string }>) => Set<string>;
+    }).rejectedOwnerKeys;
+    if (typeof rejectedKeys === "function") {
+      const rejected = rejectedKeys.call(
+        vectorStore,
+        results.map((r) => ({ owner_id: r.owner_id, owner_kind: r.owner_kind })),
+      );
+      if (rejected.size > 0) {
+        visible = results.filter((r) => !rejected.has(`${r.owner_kind}:${r.owner_id}`));
+      }
+    }
+
+    // ── The beating heart — ASSOCIATIVE recall (spreading activation) ─────────
+    // Reconstruction, not lookup: from a set of seed entities, activation spreads
+    // over the graph so connected-but-unmatched memories COME to the agent. Purely
+    // additive, best-effort, off the critical path: any failure leaves `visible`
+    // as it was. NO global vector scan, NO embedding — O(neighborhood).
+    const expand = (vectorStore as {
+      associativeExpand?: (seeds: string[], opts?: { hops?: number; maxNodes?: number }) => Array<{
+        owner_id: string; owner_kind: "fact" | "event"; text: string; entity_id: string; activation: number;
+      }>;
+    }).associativeExpand;
+    if (typeof expand === "function") {
+      const seenKeys = new Set(visible.map((r) => `${r.owner_kind}:${r.owner_id}`));
+      const addAssociated = (seeds: string[], maxNodes: number, hops?: number): void => {
+        if (seeds.length === 0) return;
+        for (const a of expand.call(vectorStore, seeds, { maxNodes, hops })) {
+          const key = `${a.owner_kind}:${a.owner_id}`;
+          if (seenKeys.has(key)) continue; // already present — don't duplicate
+          seenKeys.add(key);
+          visible = visible.concat({
+            owner_id: a.owner_id,
+            owner_kind: a.owner_kind,
+            score: a.activation,
+            text: a.text,
+            entity_id: a.entity_id,
+            associative: true,
+          });
+        }
+      };
+
+      // PRIMARY — the SITUATION is the address (associative-first redesign, Incremento A).
+      // Seeds come from WHERE WE ARE (recent events + context fingerprint + recent
+      // files), NOT from the query text — so the session-open recall is rich even when
+      // the user's first message ("Ciao Socio, dove eravamo?") names nothing.
+      let situationSeedIds: string[] = [];
+      if (sit?.sessionKey) {
+        const seeds = buildSituationSeeds(vectorStore, {
+          sessionKey: sit.sessionKey,
+          namespace: sit.namespace,
+          situation: sit.situation,
+          logger,
+        });
+        situationSeedIds = seeds.map((s) => s.id);
+        if (situationSeedIds.length > 0) {
+          addAssociated(situationSeedIds, 8);
+          logger?.debug?.(`${TAG} [kb] situation-seeded associative: seeds=${situationSeedIds.length}`);
+        }
+      }
+
+      // SECONDARY — expand from the query-matched entities too (cue-da-testo). When the
+      // user's text IS meaningful (mid-conversation) it still drives recall.
+      const querySeeds = [
+        ...new Set(visible.filter((r) => !r.associative).map((r) => r.entity_id).filter((x): x is string => !!x)),
+      ];
+      addAssociated(querySeeds, 6);
+
+      // ── B1 — LE DUE MARCE: gate di confidenza → passata profonda "a sforzo" ──
+      // Se la marcia veloce (sopra) è MAGRA, escala a una passata associativa più
+      // profonda (hops=3, vicinato più largo). Resta O(vicinato): NESSUNA scansione
+      // globale, NESSUN embedding. Gated: la marcia profonda gira SOLO quando serve,
+      // così la latenza rimossa dall'Incremento A non torna sul caso comune.
+      const conf = assessRecallConfidence(visible);
+      if (conf.thin) {
+        const deepSeeds = [...new Set([...situationSeedIds, ...querySeeds])];
+        if (deepSeeds.length > 0) {
+          addAssociated(deepSeeds, 16, 3);
+          logger?.debug?.(`${TAG} [kb] recall thin (${conf.reason}) → deeper associative pass (hops=3, maxNodes=16)`);
+        }
+      }
+    }
+
+    // ── B2a — HEBBIAN reinforcement: every recall strengthens what it surfaced ──
+    // The associatively-surfaced memories (they CAME via spreading activation) are
+    // the "un ricordo tira l'altro" hits — reinforce the strongest few so they
+    // resist staleness decay and consolidate (CMA "every access reinforces").
+    // Bounded (top-3) + best-effort: a small synchronous write (NOT the heavy,
+    // turn-starving kind — cf. the cornerstone-scan lesson) that never throws; the
+    // recall result is already built, so a reinforcement failure can't change it.
+    const reinforceOwners = (vectorStore as {
+      reinforceRecalledOwners?: (owners: Array<{ owner_id: string; owner_kind: "fact" | "event" }>, now: string) => number;
+    }).reinforceRecalledOwners;
+    if (typeof reinforceOwners === "function") {
+      try {
+        const topAssoc = visible
+          .filter((r) => r.associative && (r.owner_kind === "fact" || r.owner_kind === "event"))
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 3) // bounded: only the strongest few, to avoid over-reinforcement
+          .map((r) => ({ owner_id: r.owner_id, owner_kind: r.owner_kind as "fact" | "event" }));
+        if (topAssoc.length > 0) {
+          const n = reinforceOwners.call(vectorStore, topAssoc, new Date().toISOString());
+          logger?.debug?.(`${TAG} [kb] hebbian reinforced ${n} associative memory(ies)`);
+        }
+      } catch { /* best-effort: reinforcement never breaks recall */ }
+    }
+
+    return visible;
   } catch (err) {
     logger?.warn?.(`${TAG} [kb] KB recall failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
     return [];
@@ -484,9 +812,17 @@ async function runKbRecall(
  * the calibrated relevance, never raw RRF.
  */
 function formatKbRecallLine(r: KbRecallResult): string {
+  // Associative memories surfaced by spreading activation (not query-matched) carry
+  // a distinct marker so the agent can tell what it recalled from what came to it.
+  if (r.associative) {
+    let line = `- ↳ [${r.owner_kind}·associato] ${r.text} (associazione: ${r.score.toFixed(2)})`;
+    const point = formatTimestamp(r.ts);
+    if (point) line += ` (${ACTIVITY_TIME_LABEL}: ${point})`;
+    return line;
+  }
   let line = `- [${r.owner_kind}] ${r.text} (relevance: ${r.score.toFixed(2)})`;
   const point = formatTimestamp(r.ts);
-  if (point) line += ` (活动时间: ${point})`;
+  if (point) line += ` (${ACTIVITY_TIME_LABEL}: ${point})`;
   return line;
 }
 
@@ -979,17 +1315,17 @@ function formatMemoryLine(m: FormatableMemory): string {
   const point = formatTimestamp(m.timestamp);
 
   if (start && end) {
-    // 段时间: both start and end
-    line += ` (活动时间: ${start} ~ ${end})`;
+    // range: both start and end
+    line += ` (${ACTIVITY_TIME_LABEL}: ${start} ~ ${end})`;
   } else if (start) {
-    // 段时间: only start
-    line += ` (活动时间: ${start}起)`;
+    // range: only start
+    line += ` (${ACTIVITY_TIME_LABEL}: from ${start})`;
   } else if (end) {
-    // 段时间: only end
-    line += ` (活动时间: 至${end})`;
+    // range: only end
+    line += ` (${ACTIVITY_TIME_LABEL}: until ${end})`;
   } else if (point) {
-    // 点时间: single timestamp
-    line += ` (活动时间: ${point})`;
+    // point-in-time: single timestamp
+    line += ` (${ACTIVITY_TIME_LABEL}: ${point})`;
   }
   // If all three are empty → no time info appended (graceful)
 
