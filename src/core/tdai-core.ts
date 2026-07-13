@@ -45,6 +45,8 @@ import {
 import { inferTaskType } from "./hooks/task-type.js";
 import { buildSituationInjection } from "./hooks/fingerprint-injection.js";
 import { canonicalKey } from "./kb/kb-queries.js";
+import { applyKbDelta, type KbWriterStore, type ApplyKbDeltaResult } from "./kb/kb-writer.js";
+import type { KbDelta } from "./kb/extraction-schema.js";
 import { performAutoRecall } from "./hooks/auto-recall.js";
 import { SessionBannerTracker } from "./hooks/session-banner.js";
 import { CornerstoneInjectionTracker, buildCornerstones } from "./distinctiveness/cornerstone-runner.js";
@@ -88,6 +90,28 @@ export interface TdaiCoreOptions {
   sessionFilter?: SessionFilter;
   /** Plugin instance ID for metric reporting. */
   instanceId?: string;
+}
+
+/**
+ * Whether a store implements the KB write/embed primitives required by
+ * {@link TdaiCore.applyDelta}. Mirrors `supportsKbWrite` in pipeline-factory:
+ * `isKbReady()` (when present) must be true and every KB primitive must exist.
+ * A store missing any primitive (non-sqlite backend, or KB tables not ready)
+ * means the deterministic write path is unavailable → the caller returns a 4xx.
+ */
+function isKbWriterStore(store?: IMemoryStore): store is IMemoryStore & KbWriterStore {
+  if (!store) return false;
+  const ready = (store as unknown as { isKbReady?: () => boolean }).isKbReady;
+  if (typeof ready === "function" && !ready.call(store)) return false;
+  return (
+    typeof store.resolveOrCreateEntity === "function" &&
+    typeof store.insertEvent === "function" &&
+    typeof store.upsertFact === "function" &&
+    typeof store.upsertRelation === "function" &&
+    typeof store.queryEntityById === "function" &&
+    typeof store.upsertKbVector === "function" &&
+    typeof store.upsertKbFts === "function"
+  );
 }
 
 // ============================
@@ -512,6 +536,42 @@ export class TdaiCore {
       this.logger?.warn?.(`[memory-tdai][grounded-trust] resolveGatedMemory failed (non-fatal): ${msg}`);
       return { ok: false, text: `Operazione non riuscita: ${msg}` };
     }
+  }
+
+  /**
+   * Deterministic external write path (POST /kb/write). Apply an already-validated
+   * KbDelta straight to the KB store — entities + bi-temporal facts + append-only
+   * events + relations, then embed — reusing the SAME redacting writer
+   * ({@link applyKbDelta}) the background extractor uses. This is the only
+   * non-LLM ingestion route: an external agent (e.g. Argus) supplies the delta,
+   * the core never invents memory. Writes land on the namespace recall reads
+   * (default "default", see {@link NAMESPACE}) so a written fact is immediately
+   * recallable. Unlike recall/capture, this MAY throw: the HTTP handler maps a
+   * failure to a 4xx/5xx rather than silently swallowing (the caller must know
+   * the write did not persist).
+   */
+  async applyDelta(
+    delta: KbDelta,
+    opts: { namespace?: string; project?: string; sessionKey?: string; sessionId?: string } = {},
+  ): Promise<ApplyKbDeltaResult> {
+    await this.storeReady?.catch(() => {});
+    const store = this.vectorStore;
+    if (!isKbWriterStore(store)) {
+      throw new Error(
+        "KB write path unavailable: the store does not implement the KB primitives (kb engine not ready).",
+      );
+    }
+    const now = new Date().toISOString();
+    return applyKbDelta(delta, {
+      store,
+      embeddingService: this.embeddingService,
+      namespace: opts.namespace,
+      project: opts.project,
+      sessionKey: opts.sessionKey ?? "external:kb-write",
+      sessionId: opts.sessionId,
+      now,
+      logger: this.logger,
+    });
   }
 
   /**

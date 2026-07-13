@@ -9,6 +9,7 @@
  *   POST /search/conversations — L0 conversation search
  *   POST /session/end         — Session end + flush
  *   POST /seed               — Batch seed historical conversations (L0 → L1)
+ *   POST /kb/write            - Deterministic external fact write (KbDelta)
  *
  * Built with Node.js native `http` module — no Express/Fastify dependency.
  * Designed to run as a managed sidecar alongside Hermes.
@@ -40,8 +41,12 @@ import type {
   SessionEndResponse,
   SeedRequest,
   SeedResponse,
+  KbWriteRequest,
+  KbWriteResponse,
   GatewayErrorResponse,
 } from "./types.js";
+import { parseKbDelta } from "../core/kb/extraction-schema.js";
+import { buildRawDeltaFromFacts } from "./kb-write-delta.js";
 import type { Logger } from "../core/types.js";
 import { validateAndNormalizeRaw, fillTimestamps, SeedValidationError } from "../core/seed/input.js";
 import { executeSeed } from "../core/seed/seed-runtime.js";
@@ -312,6 +317,8 @@ export class TdaiGateway {
           return await this.handleDigest(req, res);
         case "POST /seed":
           return await this.handleSeed(req, res);
+        case "POST /kb/write":
+          return await this.handleKbWrite(req, res);
         default:
           sendError(res, 404, `Not found: ${method} ${pathname}`);
       }
@@ -501,6 +508,77 @@ export class TdaiGateway {
     const response: CaptureResponse = {
       l0_recorded: result.l0RecordedCount,
       scheduler_notified: result.schedulerNotified,
+    };
+    sendJson(res, 200, response);
+  }
+
+  /**
+   * Deterministic external write: `POST /kb/write`. Accepts EITHER the simplified
+   * `facts` array OR a full `delta`, validates it with parseKbDelta (the same
+   * schema + vocab coercion the background extractor uses), and applies it
+   * straight to the KB store via core.applyDelta. A written fact is immediately
+   * recallable. Fail-loud on this route (400 on bad input, 5xx on store failure)
+   * so the caller knows whether the write persisted — recall/capture stay
+   * best-effort, but a deterministic writer must report the truth.
+   */
+  private async handleKbWrite(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await parseJsonBody<KbWriteRequest>(req);
+
+    // Accept EITHER a full pre-built delta OR the simplified flat-facts form.
+    let rawDelta: unknown;
+    if (Array.isArray(body.facts) && body.facts.length > 0) {
+      rawDelta = buildRawDeltaFromFacts(body.facts, body.language);
+    } else if (body.delta !== undefined && body.delta !== null) {
+      rawDelta = body.delta;
+    } else {
+      sendError(
+        res,
+        400,
+        "Missing input: provide a non-empty `facts` array (simplified) or a `delta` object (full KbDelta).",
+      );
+      return;
+    }
+
+    const validation = parseKbDelta(rawDelta);
+    if (!validation.ok) {
+      sendError(res, 400, `Invalid KbDelta: ${validation.error}`);
+      return;
+    }
+
+    // A structurally-valid but empty delta writes nothing — a caller that sent
+    // no writable content is a client bug, not a silent success.
+    const d = validation.delta;
+    if (
+      d.entities.length === 0 &&
+      d.facts.length === 0 &&
+      d.events.length === 0 &&
+      d.relations.length === 0
+    ) {
+      sendError(res, 400, "Empty delta: nothing to write.");
+      return;
+    }
+
+    const startMs = Date.now();
+    const result = await this.core.applyDelta(validation.delta, {
+      namespace: body.namespace,
+      project: body.project,
+      sessionKey: body.session_key,
+    });
+    const elapsed = Date.now() - startMs;
+
+    this.logger.info(
+      `KB write completed in ${elapsed}ms: entities=${result.entities.length}, ` +
+      `facts=${result.facts.length}, events=${result.events.length}, ` +
+      `relations=${result.relations.length}, embedded=${result.embedded}`,
+    );
+
+    const response: KbWriteResponse = {
+      ok: true,
+      entities_written: result.entities.length,
+      facts_written: result.facts.length,
+      events_written: result.events.length,
+      relations_written: result.relations.length,
+      embedded: result.embedded,
     };
     sendJson(res, 200, response);
   }
