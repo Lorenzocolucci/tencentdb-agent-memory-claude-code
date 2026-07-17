@@ -3609,16 +3609,21 @@ export class VectorStore implements IMemoryStore {
     try {
       const rows = this.db
         .prepare(
-          "SELECT l.session_key sk, MAX(l.recorded_at) l0, " +
+          "SELECT l.session_key sk, MAX(l.recorded_at) l0, MIN(l.recorded_at) l0first, " +
           "(SELECT MAX(e.ts) FROM events e WHERE e.session_key = l.session_key) ev " +
           "FROM l0_conversations l GROUP BY l.session_key",
         )
-        .all() as Array<{ sk: string; l0: string | null; ev: string | null }>;
+        .all() as Array<{ sk: string; l0: string | null; l0first: string | null; ev: string | null }>;
       for (const r of rows) {
         const l0ms = Date.parse(r.l0 ?? "");
         if (!Number.isFinite(l0ms) || nowMs - l0ms > RECENT_L0_MS) continue; // dormant → skip
-        const evms = r.ev ? Date.parse(r.ev) : 0;
-        const lag = l0ms - (Number.isFinite(evms) ? evms : 0);
+        // Extraction baseline: the newest EXTRACTED event, or — when NOTHING was ever extracted for
+        // this session (r.ev is NULL) — the OLDEST un-extracted L0 row, so `lag` measures the real
+        // backlog span. Falling back to 0 here measured a never-extracted session against the Unix
+        // epoch → a ~56-year "indietro 20651gg" garbage lag that leaked into the session-open banner.
+        const evms = r.ev ? Date.parse(r.ev) : Date.parse(r.l0first ?? "");
+        if (!Number.isFinite(evms)) continue; // no usable baseline → cannot judge staleness
+        const lag = l0ms - evms;
         if (lag > LAG_MS) {
           out.stale.push({
             sessionKey: r.sk,

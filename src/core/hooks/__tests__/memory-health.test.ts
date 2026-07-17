@@ -58,6 +58,30 @@ describe("VectorStore.getMemoryHealth", () => {
     // no events at all, but L0 is weeks old → not actively used → not flagged.
     expect(store.getMemoryHealth(NOW).healthy).toBe(true);
   });
+
+  it("recent L0 + ZERO events in a short window → HEALTHY, never the epoch-0 '20651gg' garbage", () => {
+    // The exact shape of the corrupted-banner bug: a fresh session that has raw log but was never
+    // extracted yet. Before the fix, a NULL event baseline fell back to 0 (epoch) → lag ≈ ms-since-
+    // 1970 ≈ 495_600 hours ("indietro 20651gg"). It must read as healthy (backlog span < 36h).
+    store.upsertL0(l0("m4a", "sk-new", "2026-07-05T09:00:00Z"), [norm([1, 1, 0, 0])]);
+    store.upsertL0(l0("m4b", "sk-new", "2026-07-05T11:00:00Z"), [norm([1, 0, 1, 0])]);
+    const h = store.getMemoryHealth(NOW);
+    expect(h.healthy).toBe(true);
+    for (const s of h.stale) expect(s.lagHours).toBeLessThan(1000); // never the ~495k epoch garbage
+  });
+
+  it("recent L0 + ZERO events but a long un-extracted backlog → flagged with a TRUTHFUL bounded lag", () => {
+    // Oldest un-extracted L0 is ~48h before the newest (still recent) → a genuine stalled extraction,
+    // flagged with lag ≈ the real backlog span, NOT a 56-year epoch diff.
+    store.setSessionProject("sk-backlog", "Sofia-AI");
+    store.upsertL0(l0("m5a", "sk-backlog", "2026-07-03T11:00:00Z"), [norm([0, 1, 1, 0])]);
+    store.upsertL0(l0("m5b", "sk-backlog", "2026-07-05T11:00:00Z"), [norm([0, 1, 0, 1])]);
+    const h = store.getMemoryHealth(NOW);
+    expect(h.healthy).toBe(false);
+    expect(h.stale[0].project).toBe("Sofia-AI");
+    expect(h.stale[0].lagHours).toBeGreaterThan(36);
+    expect(h.stale[0].lagHours).toBeLessThan(1000); // truthful backlog span, not epoch garbage
+  });
 });
 
 describe("resolveHealthWarning + banner surfacing", () => {
