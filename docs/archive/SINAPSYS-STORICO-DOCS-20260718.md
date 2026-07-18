@@ -1027,7 +1027,190 @@ export function confirmProvenance(
 }
 ```
 
-(Il piano prosegue in parte 3/3: Task 3 step 3b, Task 4, Task 5, self-review.)
+```
+
+</details>
+
+<details>
+<summary>Contenuto integrale (mai versionato, gitignored — parte 3/3, Task 3 fine + Task 4-5 + self-review)</summary>
+
+```markdown
+## Task 3 (continua): `confirmMemory` on `VectorStore`
+
+- [ ] **Step 3b: Add `confirmMemory` to `VectorStore`**
+
+In `src/core/store/sqlite.ts`, add the import:
+
+```typescript
+import { confirmProvenance } from "../kb/lifecycle-writer.js";
+```
+
+Add this method. The body MUST be wrapped in a BEGIN / COMMIT / ROLLBACK transaction using the EXACT same idiom already used by `reindexAll()` in this same file (begin a transaction on `this.db`, commit at the end, roll back inside a catch on throw), and the whole thing inside the outer try/catch shown here that swallows + warns (memory must never break a turn):
+
+```typescript
+  /**
+   * Confirm a memory as ground truth (Lorenzo said so). Flips its provenance to
+   * trusted + writes the audit trail. When a `factId` is given, raises that fact's
+   * confidence; when a `supersededFactId` is given, closes that older uncertain
+   * fact (sets superseded_by + valid_to so it leaves the HEAD set). One transaction.
+   */
+  confirmMemory(params: {
+    ownerId: string;
+    ownerKind: "fact" | "event";
+    now: string;
+    factId?: string;
+    confidence?: number;
+    supersededFactId?: string;
+  }): void {
+    try {
+      // <begin transaction on this.db — same idiom as reindexAll()>
+      confirmProvenance(this.db, {
+        ownerId: params.ownerId,
+        ownerKind: params.ownerKind,
+        now: params.now,
+      });
+      if (params.factId) {
+        this.db
+          .prepare("UPDATE facts SET confidence = ?, updated_time = ? WHERE id = ?")
+          .run(params.confidence ?? 0.99, params.now, params.factId);
+      }
+      if (params.supersededFactId) {
+        this.db
+          .prepare(
+            "UPDATE facts SET superseded_by = ?, superseded_at = ?, valid_to = ? WHERE id = ?",
+          )
+          .run(params.factId ?? params.ownerId, params.now, params.now, params.supersededFactId);
+      }
+      // <commit transaction; on any throw above, roll back then rethrow into the catch>
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][provenance] confirmMemory failed for ${params.ownerKind} ${params.ownerId} ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+```
+
+> NOTE: `facts` has columns `id`, `confidence`, `superseded_by`, `superseded_at`, `valid_to`, `updated_time` (verified in the `facts` DDL in `src/core/store/sqlite.ts`). Match the real column names from that DDL; do not invent.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run src/core/store/__tests__/confirm-memory.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/core/kb/lifecycle-writer.ts src/core/store/sqlite.ts src/core/store/__tests__/confirm-memory.test.ts
+git commit -m "feat(grounded-trust): confirmMemory upgrade hook + audit trail (Phase 1)"
+```
+
+---
+
+## Task 4: Regression guard — injection is unchanged for unverified memory
+
+**Files:**
+- Test: `src/core/kb/__tests__/provenance-injection-unchanged.test.ts`
+
+This locks the core principle: trust gates ACTION, not INJECTION. An `unverified` stamp must not alter recall output.
+
+- [ ] **Step 1: Write the test**
+
+Create `src/core/kb/__tests__/provenance-injection-unchanged.test.ts` (recall harness mirrors `src/core/hooks/__tests__/auto-recall-escape.test.ts`):
+
+```typescript
+import { describe, it, expect } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { VectorStore } from "../../store/sqlite.js";
+import { performAutoRecall } from "../../hooks/auto-recall.js";
+import { parseConfig } from "../../../config.js";
+import { defaultProvenance } from "../provenance.js";
+import type { EmbeddingService } from "../../store/embedding.js";
+
+const silent = { debug() {}, info() {}, warn() {}, error() {} };
+const vec = new Float32Array([1, 0, 0, 0]);
+const emb = { embed: async () => vec, getDimensions: () => 4 } as unknown as EmbeddingService;
+const cfg = parseConfig({ recall: { strategy: "embedding", maxResults: 5, scoreThreshold: 0.1 } } as never);
+
+function seedOneL1(store: VectorStore, sessionKey: string) {
+  const now = new Date().toISOString();
+  store.upsertL1(
+    { id: "mem-1", content: "Un ricordo qualunque.", type: "episodic", priority: 50,
+      scene_name: "x", source_message_ids: ["m1"], metadata: {}, timestamps: [now],
+      createdAt: now, updatedAt: now, sessionKey, sessionId: "sid" } as never,
+    vec,
+  );
+}
+
+async function recallText(dir: string, store: VectorStore): Promise<string> {
+  const r = await performAutoRecall({
+    userText: "ricordo", actorId: "a", sessionKey: "s", cfg, pluginDataDir: dir,
+    logger: silent, vectorStore: store, embeddingService: emb,
+  });
+  return (r?.prependContext ?? "") + "\n" + (r?.appendSystemContext ?? "");
+}
+
+describe("trust gates action, not injection", () => {
+  it("an unverified stamp does not change recall output", async () => {
+    const dirA = fs.mkdtempSync(path.join(os.tmpdir(), "tdai-inj-a-"));
+    const a = new VectorStore(path.join(dirA, "vectors.db"), 4);
+    a.init({ provider: "openai", model: "text-embedding-3-small" });
+    seedOneL1(a, "s");
+    const baseline = await recallText(dirA, a);
+    a.close(); fs.rmSync(dirA, { recursive: true, force: true });
+
+    const dirB = fs.mkdtempSync(path.join(os.tmpdir(), "tdai-inj-b-"));
+    const b = new VectorStore(path.join(dirB, "vectors.db"), 4);
+    b.init({ provider: "openai", model: "text-embedding-3-small" });
+    seedOneL1(b, "s");
+    b.stampProvenance("mem-1", "fact", defaultProvenance(["m1"]), new Date().toISOString());
+    const stamped = await recallText(dirB, b);
+    b.close(); fs.rmSync(dirB, { recursive: true, force: true });
+
+    expect(stamped).toBe(baseline);
+  });
+});
+```
+
+- [ ] **Step 2: Run it**
+
+Run: `npx vitest run src/core/kb/__tests__/provenance-injection-unchanged.test.ts`
+Expected: PASS. If it FAILS, the stamp leaked into recall — STOP and investigate (the principle is violated); do NOT "adjust the test".
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add src/core/kb/__tests__/provenance-injection-unchanged.test.ts
+git commit -m "test(grounded-trust): lock 'trust gates action, not injection' (Phase 1)"
+```
+
+---
+
+## Task 5: Full verification
+
+- [ ] **Step 1: Build**
+
+Run: `npm run build`
+Expected: `Build complete`.
+
+- [ ] **Step 2: Full test suite**
+
+Run: `npx vitest run`
+Expected: all green EXCEPT the known pre-existing failures. UPDATE 2026-06-30: after this Phase 1 work the count is **7** failed (was 8) — `consolidation-wiring.test.ts` was a STALE assertion (bgTasks 1→3) and was fixed (commit 43c8f3c). The remaining 7 are `daemon.test.ts` (2) + `hook.test.ts` (5): Windows `chmod`/permission + incomplete-mock failures, unrelated to this work. Any NEW failure beyond those 7 is a regression to fix, never the test.
+
+- [ ] **Step 3: Done**
+
+Phase 1 is complete: new memories carry a real provenance stamp (`trust=unverified`), `confirmMemory` upgrades to `trusted` with an audit trail, and injection is provably unchanged. Phase 2 (the "consequential action" stakes policy) can begin on top. No deploy/gateway restart is required for Phase 1 (no live-path behaviour change); the gateway picks up the new code on its next restart.
+
+---
+
+## Self-review notes (author)
+
+- **Spec coverage:** trust model (Task 1) ✓, conservative default via `deriveTrust` (Task 1) ✓, reuse `memory_lifecycle.provenance_json` (Task 2) ✓, `memory_audit` trail (Task 3) ✓, raise `confidence` + `superseded_by` (Task 3) ✓, "trust gates action not injection" (Task 4) ✓, tolerant parse (Task 1) ✓, out-of-scope items NOT built ✓.
+- **Implementation detail to follow (not a placeholder):** the exact insertion spot for the methods in `sqlite.ts` and the transaction idiom — both copy the existing `reindexAll()` pattern in that same file. The `facts` column names come from the verified DDL in `sqlite.ts`.
+- **Eager lifecycle creation:** `stampProvenance` now creates the `memory_lifecycle` row at write time (previously created lazily in consolidation). Safe (defaults match; `ensureLifecycle` is idempotent); Task 2 Step 5 + Task 5 Step 2 guard against regressions.
 ```
 
 </details>
