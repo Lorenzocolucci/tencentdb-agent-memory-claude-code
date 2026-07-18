@@ -2672,4 +2672,34 @@ Script di misura (read-only, gitignored): `b3-backfill-copy/_recall_measure.cjs`
 
 **Fatti da tenere:** nessuno rilevante oggi. Nota: gli script `.sh` gemelli nella stessa cartella (`bugfix-20260423.sh`, `bugfix-20260423-full.sh`) NON sono stati toccati in questa wave (regola: solo file `.md`, zero modifiche a codice/script). Contenuto integrale in git history.
 
+## docs/superpowers/specs/2026-06-24-context-fingerprint-design.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** design spec dell'Idea 1 (Context Fingerprint) — match per situazione (file+errori+task), voce a due livelli forte/media, silenzio sotto-soglia. Interamente implementata: `session-situation.ts`, `task-type.ts`, `fingerprint-similarity.ts`, `fingerprint-injection.ts`, `fingerprint-writer.ts` esistono, tabella `context_fingerprints` viva.
+
+**Fatti da tenere:** la scelta di Lorenzo di iniettare anche i match "medi" (non solo forti) è documentata qui — utile se si ritocca la soglia in futuro. Contenuto integrale in git history.
+
+## docs/superpowers/specs/2026-06-24-track-b-mistake-notebook-design.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** design spec dell'intero arco Mistake Notebook (L3) — B1 clustering cross-sessione, B2 trigger=Context Fingerprint, B3 confidenza su evitamento. Tutto costruito e deployato live (`a3c81c4`/`2a4cc5c`/`e3096ce`/`af13fa5`/`1372d44`). Dorme finché una classe di fallimento non ricorre cross-sessione (0 lezioni oggi = corretto by design, anti-aneddoto).
+
+**Fatti da tenere:** il fix di correttezza "evidence_count" (contava eventi in UN incidente = aneddoto travestito da evidenza) è il cuore del design anti-aneddoto — utile se si tocca `lessons-writer.ts` in futuro. Contenuto integrale in git history.
+
+## docs/superpowers/specs/2026-06-25-distinctiveness-scorer-design.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** design spec dell'Idea 5 (Distinctive Terms/cornerstone) — termRarity + isolation (+ affect pluggable, peso 0 finché non calibrato), harness di test non-circolare vs il benchmark S47-bis. Implementata (`src/core/distinctiveness/*`).
+
+**Fatti da tenere:** follow-up noto NON fixato qui (fuori scope): bug data-persona nel distiller (`scene-person-lorenzo-colucci.md` registra 24-06 invece di 16-06 per il benchmark S47-bis) — tracciato, non corretto in questa wave docs-only. Contenuto integrale in git history.
+
+## docs/superpowers/specs/2026-06-29-grounded-trust-child-and-fire-design.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** design d'apertura del pilastro Grounded Trust ("il bambino col fuoco") — l'analogia e la direzione architetturale (provenienza → grounding → ask-Lorenzo → learning). Tutte e 4 le fasi sono state costruite e deployate (vedi le 3 voci gemelle di questo storico per Fase 1/2/3+4).
+
+**Fatti da tenere:** il principio cardine — "la memoria agisce sempre, ma un'azione importante guidata da un ricordo viene guardata in faccia prima di scattare" — è oggi codificato in `src/core/kb/{provenance,stakes,grounded-trust-ask}.ts`; residuo non-bloccante: mai osservato scattare su un recall organico (solo nei test). Contenuto integrale in git history.
+
+## docs/superpowers/specs/2026-06-29-grounded-trust-phase1-provenance-design.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** design della Fase 1 (fondamenta provenienza/trust) — riusa `memory_lifecycle.provenance_json` + `memory_audit`; principio "trust gates ACTION, not INJECTION". Implementata 2026-06-30 (commit `b805f60`/`e036912`/`afb0c27`/`75a497d`). Piano di implementazione gemello: voce Sezione B di questo stesso storico (full-paste, era gitignored).
+
+**Fatti da tenere:** la verità scomoda documentata qui — al confine L0 non si può distinguere testo DIGITATO da Lorenzo da testo INCOLLATO da terzi, quindi la provenienza è "grezza e a livello di canale", mai perfetta — resta valida per qualunque estensione futura del modello di trust. Contenuto integrale in git history.
+
 ---
