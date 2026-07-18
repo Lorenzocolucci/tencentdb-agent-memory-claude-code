@@ -2630,4 +2630,28 @@ Script di misura (read-only, gitignored): `b3-backfill-copy/_recall_measure.cjs`
 
 **Fatti da tenere:** 5 lezioni dure su Windows/PowerShell/Claude-Code process management (cc uccide i child process al teardown; redirect doppio-handle rompe; em-dash non-ASCII rompe il parsing PowerShell) — riferimento utile per QUALSIASI futuro script Windows di lunga durata in questo repo. Contenuto integrale in git history.
 
+## docs/INVESTIGATION-2026-06-25-memory-reach-and-always-on.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** investigazione chiusa (nessun codice cambiato all'epoca): la memoria raggiunge tutte le sessioni Claude Code interattive (plugin globale) ma NON la routine notturna sofia-qa (gateway non 24/7); cloud/pgvector scartato (privacy); decisione = gateway locale supervisionato (auto-start+auto-restart), non cloud/daemonless. La decisione D2 (gateway supervisionato) risulta poi implementata (`install-autostart.ps1`, citato come esistente nei verdetti di altre voci).
+
+**Fatti da tenere:** un test economico resta non eseguito ("Esegui ora" sulla routine con gateway acceso, per confermare se le Routine desktop-app sparano gli hook plugin) — gap noto, basso valore, non inseguito. Contenuto integrale in git history.
+
+## docs/PHASE2B_EXTRACTION_PROMPT_REDESIGN.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** spec paste-ready per il redesign del prompt di estrazione L1 (fix meta-framing "用户要求AI记住", output-in-lingua-sorgente, cattura fatti tecnici, alza `maxMemoriesPerSession` 10→30 e il cap contenuto 600→1000). Implementata all'epoca; l'intera pipeline L1 è stata poi sostituita dall'estrazione KB a singolo stadio (`kb-extraction.ts`).
+
+**Fatti da tenere:** i few-shot examples (decisione tecnica, bug, fatto di sicurezza) restano un buon riferimento di stile prompt anche per l'attuale `kb-extraction.ts`. Contenuto integrale in git history.
+
+## docs/PHASE2_EXTRACTION_FIX_SPEC.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** spec paste-ready RC1 (merge conservativo dedup), RC4 (estrazione più stretta + few-shot), RC5 (parametri Kimi temp=1/max_tokens=16000); RC2/RC3 solo-codice (rebuild vettori, soglia+recency). Tutto implementato; la pipeline L1 stessa è stata poi ritirata in favore del KB entity-centric a singolo stadio.
+
+**Fatti da tenere:** i 5 root cause (RC1-RC5) sono il diario storico del PERCHÉ l'estrazione L1 falliva — utile se mai si ripresentasse un pattern simile in `kb-extraction.ts`. Contenuto integrale in git history.
+
+## docs/PHASE2_KB_EXTRACTION_SPEC.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO come SPEC (il lavoro descritto è ORA IL CODICE VIVO). **Perché:** spec paste-ready dell'estrazione KB a singolo stadio (schema `KbDelta`, prompt, `kb-writer.applyKbDelta`) che ha sostituito l'imbuto L1 a 5 stadi. Interamente implementata: `kb-extractor.ts`, `extraction-schema.ts`, `kb-writer.ts` esistono e sono live, documentati oggi in `docs/SINAPSYS-ARCHITECTURE.md`.
+
+**Fatti da tenere:** il prompt originale (regole 0-7 + few-shot IT/EN) è la base testuale ancora in uso in `kb-extraction.ts` — utile riferimento se si deve modificare il prompt live. Contenuto integrale in git history.
+
 ---
