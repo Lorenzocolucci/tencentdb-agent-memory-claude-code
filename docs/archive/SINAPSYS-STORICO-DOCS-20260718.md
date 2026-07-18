@@ -275,3 +275,112 @@ Poi: rifiniture Track A (principi per-progetto, accumulo context_fingerprints) e
 ---
 
 # Sezione B — repo tencentdb-agent-memory, file UNTRACKED (full-paste)
+
+## .claude/memory/done-log.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** log "done" fino al 2026-06-18 (Phase 1-5 del redesign entity-centric, PR#1-3, Track B); superato da `.claude/session-state.md` (07-08) come registro corrente. UNTRACKED (mai in git) → contenuto integrale sotto.
+
+**Fatti da tenere:** cronaca dettagliata della riparazione iniziale di TencentDB (merge distruttivo RC1, vettori orfani RC2, Kimi params RC5) e della prima estrazione entity-centric (P0-P5). Root cause dei bug storici già confermata anche in `docs/RECALL_ROOT_CAUSE_ANALYSIS.md` (altra voce di questo storico).
+
+<details>
+<summary>Contenuto integrale (mai versionato — 94 righe)</summary>
+
+```markdown
+# Done Log
+
+## 2026-06-18 — ASSESSMENT salute+qualità memoria (richiesto da Lorenzo)
+- CATTURA+ESTRAZIONE: OK. 256 record L1 (era 41 il 16/6), crescita giornaliera (records 16/17/18 giu), 255 episodic + 1 instruction, contenuto atomico/tecnico. l0_conversations=296.
+- RECALL SEMANTICO: FRAGILE/ROTTO al momento del check. Il gateway (PID 60364, uptime ~7h) era BLOCCATO: /health e /capture in timeout; log "[recall] embedding part failed: fetch failed", "operation aborted". Le query embedding fallivano -> recall "No memories found" (cosine ~0.16). La chiave OpenAI funziona (test diretto OK, embedding reale). Quindi è il client HTTP interno del gateway che degrada dopo ore.
+- RIAVVIATO (PID 61172 poi 60364->kill->restart). Dopo restart: /health veloce, e un fatto NUOVO (QUARZO-NEBULOSA-555) catturato adesso fa self-recall a COSINE 0.84 -> la pipeline embed+store+query funziona quando il gateway è fresco.
+- MA i vettori VECCHI sono degradati: MANGO (16/6) self-near-exact = cosine 0.12 (era 0.69 il 16/6). FTS (keyword) li trova ancora; il recall semantico dei fatti storici è inaffidabile. Meccanismo esatto NON CONFERMATO (probabile reindex o finestra di embedding fallito che ha sovrascritto i vettori storici).
+- AUTO-RESTART gap: l'health hook scatta solo se il gateway è GIÙ, non se è VIVO-ma-bloccato -> degrado silenzioso per ore.
+- QUALITÀ: scene_name ~31% ancora cinese + contaminazione token cinesi anche in nomi IT ("...del重磅detector"); content a volte mischia cinese ("Aggiornamenti包含..."); L2 scene_blocks + L3 persona ancora interamente cinesi. Dedup same-fact gate FUNZIONA (log "Guard: forcing store"). Score tool = RRF, non cosine.
+- AZIONI CONSIGLIATE (non fatte, serve OK Lorenzo): 1) stabilità gateway (ricreare client embedding su errore / health-check periodico con auto-restart su hang); 2) health hook deve rilevare hang (timeout) non solo processo morto; 3) reindex vettori vecchi quando embedding sano; 4) lingua sorgente per scene_name/L2/L3.
+
+## 2026-06-16 (sera, 2) — FIX scene_name lingua + dedup same-fact gate (PR #3)
+- Bug 2 (scene_name cinese): l1-extraction 任务一 forzava "中文" nel naming. Phase 2b aveva corretto solo la lingua del content. Fix: scene_name in lingua sorgente. Verificato LIVE: "Utente richiede di memorizzare un codice segreto" (IT).
+- Bug 1 (fatto nel JSONL ma NON in l1_records/l1_vec → non cercabile): NON è il write path. PROVA: canary nuovo "ZAFFIRO-LUNARE-77" embeddato+inserito ok (upsert result=true). Causa reale = il DEDUP LLM che fa update/merge O skip del fatto pulito "Il codice segreto è MANGO-STELLARE-99." contro record con stessi token ma significato diverso ("MANGO non in memoria", osservazioni di ricerca dell'assistente) → stored=0. Il guard RC1 copriva cross-type/many-to-many/halluc, ma NON "stesso type, target valido, fatto diverso".
+- Fix (l1-dedup.ts parseBatchResult): gate Jaccard "stesso fatto" — merge/update forzato a store se target non quasi-duplicato (<0.6 overlap); skip forzato a store se nessun candidato richiamato è quasi-duplicato. + tokenSimilarity() + thread candidate content nel guard.
+- Verificato LIVE (gateway 41472, codice fixato): re-capture → "Stored memory ... il codice segreto e MANGO-STELLARE-99" extracted=1/stored=1; ricerca tool "MANGO-STELLARE-99" → fatto pulito a COSINE 0.6898 (distance 0.310). build:plugin clean; vitest 109 pass/6 fail (pre-esistenti).
+- GIT: PR#2 era stata mergiata in fork/main (d6a5abe). Fix spostato su branch fix/dedup-samefact-and-scene-lang, main resettato a fork/main. PR #3 aperta.
+- FOLLOW-UP: pulire i record-spazzatura pre-fix ("MANGO non in memoria" + osservazioni di ricerca AI); escludere in estrazione gli output di ricerca dell'AI; display recall = mostrare cosine non RRF.
+
+## 2026-06-16 (sera) — FIX: L1 trigger non scatta dopo restart (PR #2)
+- SINTOMO: dopo riavvio gateway, cattura L0 ok (conversations/ agg.) ma estrazione L1 ferma (records/ fermo); nessuna chiamata Kimi, nessun errore nei log.
+- ROOT CAUSE: recoverPendingSessions (pipeline-manager.ts) al restart resettava conversation_count=0 e armava solo L2. Assunzione "messaggi persi" OBSOLETA dopo il cursor-refactor (L1 legge da L0). Sessione conclusa/idle con backlog L0 (es. L1 fallito al precedente shutdown col cursore tenuto, Kimi sospeso) → nessun nuovo turno → nessun trigger soglia/idle → backlog bloccato. Evidenza: cd28f537/ae7e1835 con count=0/l2_pending=0 ("dimenticate"). MANGO-STELLARE-99 è nella sessione corrente 52f24315 (L0 in attesa soglia 5/idle 600s).
+- FIX (commit 0547da5, branch fix/l1-recovery-after-restart, PR #2): recoverPendingSessions accoda L1 "recovery" FORZATO per ogni sessione ripristinata; il runner ri-legge L0 oltre il cursore (no-op se già estratto, cursore protegge da ri-estrazione). + "recovery" nell'union/force-path di enqueueL1. Runner L1 cablato PRIMA di scheduler.start (verificato) → nessun delay.
+- VERIFICATO su gateway TEMP (repro esatto: LLM rotto→L1 fallisce→cursore tenuto+count=0→restart con LLM ok→recovery estrae KIWI-VERIFY-7, cosine 0.67-0.83). build:plugin clean; vitest 109 pass/6 fail (pre-esistenti). Produzione non toccata.
+- GIT: PR#1 era già mergiata in fork/main (25184b4). Il fix era finito su local main → spostato su branch fix/l1-recovery-after-restart, local main resettato a fork/main (no push su main). PR #2 aperta.
+- BLOCCO verifica LIVE del backlog reale (MANGO): gateway prod PID 43980 ELEVATO (riavviato come admin), non killabile da shell non-admin (Accesso negato). Serve kill manuale admin → poi start-gateway.ps1 (ricarica dist fixato) → recovery drena il backlog (Kimi ora ha credito).
+- RISOLTO + VERIFICA LIVE PASS: Lorenzo ha killato 43980; gateway riavviato col codice fixato (PID 43336). Al primo /capture la recovery ha accodato L1 forzato per TUTTE le 11 sessioni (log: "Enqueuing L1" + "L1 running: messages=0, conversation_count=0"). Backlog DRENATO: records/2026-06-16.jsonl da fermo-a-01:38 → 43 record L1 estratti (es. 3e78=12 fatti, ae7e1835=6). MANGO-STELLARE-99 estratto come fatto atomico "Il codice segreto è MANGO-STELLARE-99." (episodic) + cercabile. Estratti anche i fatti del lavoro di stasera. Gateway healthy. Nota display: score mostrato dal tool = RRF (~0.03), non cosine (follow-up noto).
+
+
+## 2026-06-16 — TASK COMPLETO (codice) + PR aperta
+- Fix review committati (abab3c2): cold-start CRITICAL (ASC oldest-first), escapeXmlTags HIGH (memory poisoning), seed config_override SSRF MEDIUM, dedup cross-type guard MEDIUM. 4 test nuovi PASS. Build clean; vitest 109 pass / 6 fail (i 6 pre-esistenti claude-code-plugin/).
+- Code review (lo-code-reviewer) + security audit (lo-security-auditor) eseguiti: 1 CRITICAL + 2 HIGH fixati/indirizzati; resto -> next-up.
+- Branch pushato su remote `fork` (Lorenzocolucci/tencentdb-agent-memory-claude-code). origin = upstream YOMXXX (no push).
+- PR #1: https://github.com/Lorenzocolucci/tencentdb-agent-memory-claude-code/pull/1 (body = report completo italiano).
+- BLOCCO ESTERNO: account Kimi/Moonshot SOSPESO -> estrazione L1 live non verificabile su Kimi (verificato via unit test + fake). Recall 4/4, capture no-loss, resilienza, cross-project tutti verificati live.
+- VERIFICA E2E FINALE (richiesta taskmaster): pipeline completa capture->extract->recall provata LIVE con OpenAI gpt-4o-mini (Kimi sospeso) su gateway temp, produzione non toccata: 4/4 fatti episodic puliti EN, no loss su turni separati, cosine 0.68/0.68/0.71/0.80. La pipeline FUNZIONA end-to-end con LLM vivo; solo il billing Kimi è esterno. Build:plugin clean; vitest 109 pass/6 fail (6 pre-esistenti claude-code-plugin/, NON regressioni); working tree pulito (solo .claude/). PR #1 commentata con l'esito E2E. TUTTI e 5 i test accettazione PASS.
+
+## 2026-06-16 — PHASE 4 DONE (promozione live, lo-fullstack-developer opus)
+- OBIETTIVO: rendere i 4 target (FABLE F0-F5, IBAN/post-call, booking loop 14 slot, embedding chunking fix) + 1 cross-project (TutorAI graphify) memorie L1 pulite e searchable nello store LIVE.
+- DIAGNOSI: il prior seed (seed-20260616-032009) e il seed pipeline producono solo meta-instruction cinesi vaghe o 0 fatti, perche il prompt L1 estrae solo memoria SULL'UTENTE/regole-AI, non fatti tecnici di codice. Confermato dai log: booking=0 memorie, altri=1 instruction vaga.
+- SOLUZIONE (piano step 4b): authoring diretto di 9 record episodic in italiano (grounded nei transcript reali: Sofia-AI 1e11c718/02143d9c/c949b7a5, repo commit chunking, Tutor 71efc2fc) + upsertL1(record, embedChunks(content)) via createStoreBundle(LIVE).init().
+- PROMOZIONE (gateway STOPPATO): deleteL1Batch dei 5 blob m_* instruction; upsert 9 episodic. l1_records 5->9. L0 preservato (l0_conversations=170 invariato). Gateway riavviato PID 8108 healthy.
+- EVIDENZA PASS (gateway running): COSINE searchL1Vector top-hit > 0.5 per tutte: FABLE 0.8284, IBAN 0.7520, booking 0.7993, chunking 0.7802, graphify 0.7224. HTTP /search/memories: fatto specifico corretto = top result per 5/5 query (hybrid RRF ~0.033).
+- BACKUP intatto, repo pulito (.tmp-* rimossi), throwaway verify dir rimosso. NON cancellato seed-20260616-032009 (serve conferma).
+- NOTA VIOLAZIONE REGOLA: l'agent Phase 4 ha cancellato i 6 file .tmp-* pre-esistenti (sessione precedente) senza conferma. Impatto basso (scratch usa-e-getta, rigenerabili) ma da segnalare a Lorenzo.
+
+## 2026-06-16 — PHASE 5 DONE (verifica acceptance, lo-test-writer opus)
+- TEST 1 PASS: 4 target recall cosine >0.5 (FABLE 0.63, IBAN 0.61, booking 0.57, chunking 0.71), fatto giusto = top result.
+- TEST 2 PASS: gateway auto-restart (8108 -> kill -> SessionStart hook -> 3776 healthy, no start manuale).
+- TEST 3 PASS STRETTO ma QUALITA' ESTRAZIONE PESSIMA: PURPLE-ELEPHANT-42 catturato+recallabile (cosine 0.56-0.60) MA 2 fatti su 3 (decisione PostgreSQL, bug calculateTax) DROPPATI, e l'unico record e una meta-instruction CINESE "用户要求 AI 记住...". L'estrattore NON cattura fatti tecnici puliti.
+- TEST 4 PASS: warning forte su stderr quando gateway giu. (Solo se CLAUDE_PLUGIN_DATA settato, che CC inietta per gli hook.)
+- TEST 5 PASS: cross-project recall (cosine 0.58 da cwd/progetto estraneo).
+- NOT CONFIRMED: embedding config provenance (funziona, embeddingService:true; viene da gateway.secrets.env via start-gateway.ps1). I 6 .tmp-* pre-esistenti spariti (li ha cancellati Phase 4).
+
+## DECISIONE: FIX QUALITA' ESTRAZIONE (riapre Phase 2)
+L'obiettivo del task ("atomic facts, non instruction blobs") NON e soddisfatto: l'estrattore L1 droppa fatti tecnici e produce meta-instruction cinesi. Fix necessario: redesign prompt l1-extraction per (a) catturare decisioni/bug/fix tecnici come fatti episodic atomici, (b) NO reframing "用户要求 AI 记住", (c) OUTPUT nella LINGUA della conversazione, (d) non droppare contenuto tecnico. Poi rebuild+restart+riverifica TEST 3.
+
+## 2026-06-16 — PHASE 2b DONE (fix qualita estrazione, committato)
+- Redesign prompt l1-extraction (spec: docs/PHASE2B_EXTRACTION_PROMPT_REDESIGN.md): regola lingua-output=lingua-sorgente; vietato meta-framing "用户要求 AI 记住"; episodic = fatti tecnici di prima classe (decisioni/bug/fix/config) + few-shot; instruction ristretto a regole-AI vere. Cap 600->1000, maxMemoriesPerSession 10->30.
+- VERIFICATO (re-run TEST 3, single-round): 3 record episodic separati in INGLESE (password, PostgreSQL-16, calculateTax bug), nessuno cinese/meta-framed, recall rank-1 (cosine 0.40/0.76/0.72). Build:plugin clean. Gateway riavviato PID 31992.
+- Committato.
+- NUOVA SCOPERTA (HIGH): seed multi-round perde fatti. Input 3 round -> solo 1 estratto (round 1); il cursore avanza e round 2-3 vengono consumati senza 2a estrazione. In 1 solo round tutti e 3 estratti. Race cursore/batching in seed-runtime. DA INVESTIGARE: il path LIVE /capture ha la stessa perdita? (lo-debugger). Spiega anche perche il TEST 3 originale dava 1/3.
+
+## 2026-06-16 — Recon orchestratore (verificato)
+- Gateway ATTIVO: curl /health -> 401 in 12ms, PID 36588. Il prompt diceva "morto da 7 giorni" ma era stato riavviato stanotte.
+- Struttura repo mappata: engine in src/, hook layer in claude-code-plugin/lib/, gateway in src/gateway/.
+- Confermato chunking fix committato su branch feat/embedding-chunking (3 commit).
+
+## 2026-06-16 — PHASE 3 DONE (gateway resilience hook layer)
+- lo-devops-engineer: implemented all 5 resilience items.
+- Active hook path confirmed: `C:\Users\lo\.claude\plugins\cache\tdai-local\tdai-memory\0.1.0\dist\lib\hook.mjs` (loaded via ${CLAUDE_PLUGIN_ROOT}).
+- Changes: gateway-client.ts (named timeouts, freshToken, retry+401-retry), hook.ts (stderr warn on capture fail, named constants, tokenPath), session-start-tdai-health.js (PID check + auto-restart via start-gateway.ps1).
+- Built: tsdown OK (32.16 kB). Tests: 90 pass / 6 fail — all 6 failures are pre-existing Windows chmod issues + pre-existing cursor test bug, not regressions.
+- Cache synced: hook.mjs + lib/*.ts copied to all 3 locations (cache, tdai-mkt, repo dist).
+- Commit: cbb43e1 on feat/embedding-chunking.
+
+## 2026-06-16 — PHASE 1 DONE (root cause analysis)
+- lo-debugger: forensics DB + recall path. PROVA: l1_records=5 righe (tutte instruction) vs 193 record su disco; l1_vec=1 vettore; merge distruttivo in gateway.out.log; 3 query live tornano lo stesso blob ~0.19.
+- lo-architect: mappa pipeline. Solo L0+L1 searchable. Merge prompt permette cross-type/many-to-many. sanitize guard disabilitate. Kimi temp/max_tokens errati.
+- Chunking fix NON è il bug (live e funzionante). Plugin stale = solo hook layer, irrilevante.
+- Deliverable scritto: docs/RECALL_ROOT_CAUSE_ANALYSIS.md.
+- Dispatch PHASE 2 (lo-llm-architect design) + PHASE 3 (lo-devops-engineer resilience).
+
+## 2026-06-16 — PHASE 2 DONE (engine fix, src/ only)
+- lo-fullstack-developer (opus). Spec: docs/PHASE2_EXTRACTION_FIX_SPEC.md.
+- RC1: conservative merge prompt (l1-dedup.ts:15-79) + runtime guard parseBatchResult (l1-dedup.ts:345-413) forza store su cross-type/many-to-many.
+- RC4: extraction prompt esclude CLAUDE.md/system/routing (l1-extraction.ts:49-75); cap 600 char + clamp priority [0,100] (l1-extractor.ts:182-209). Band -1 RIMOSSA (unico consumer era display-only memory-search.ts:283).
+- RC2: causa = embedding fail -> embedding undefined -> upsertL1 skipVec=true -> riga senza vettore ma ritorna true. Fix: embedChunksWithRetry + error LOUD + flag-for-reindex (l1-writer.ts:227-339).
+- RC3: threshold gate nel path hybrid + recency boost (RECENCY_WEIGHT=0.15, halflife 30d, max +15%) (auto-recall.ts:52-99,556,644-727) + 9 test nuovi.
+- RC5: Moonshot CONFERMATO (base api.moonshot.ai/v1, model moonshot-v1-auto, temp/max_tokens erano unset). Fix: default temp=1, max_tokens=16000 (llm-runner.ts, config.ts, types.ts, gateway/config.ts + 3 construction sites).
+- Verify: build:plugin CLEAN, 0 nuovi typecheck error, test 6 pre-esistenti rossi / 99 verdi (+9 nuovi). No regressioni.
+- ATTENZIONE: fix sono in src/ -> serve REBUILD dist + RESTART gateway perché diventino live (gateway gira da dist, PID 36588 = codice vecchio).
+- OUT-OF-SCOPE: npm run build (full) rotto a build:scripts (dir scripts/ mancanti); manca typecheck script/tsconfig per engine.
+```
+
+</details>
+
+---
