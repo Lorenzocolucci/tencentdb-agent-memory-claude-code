@@ -210,6 +210,18 @@ export function initFoundationsSchema(db: DatabaseSync, logger?: FoundationsLogg
       }
     }
 
+    // ── Brick 8 — contradiction flag (L4 v1 Consolidation Engine) ──────────
+    // Two ACTIVE (HEAD) facts about the SAME (entity_id, attribute) with
+    // DIFFERENT values should never coexist under normal writes — upsertFact's
+    // supersession algorithm collapses them into one HEAD. This column is the
+    // safety net for whatever bypasses that invariant (migration, manual
+    // insert, race). NEVER used to delete/mutate a fact — the consolidation
+    // engine only ever marks/clears this JSON flag. NULL = no known conflict.
+    // Additive + guarded, exactly like Brick 6/7.
+    if (tableExists(db, "memory_lifecycle") && !columnExists(db, "memory_lifecycle", "contradiction_json")) {
+      ddl("ALTER TABLE memory_lifecycle ADD COLUMN contradiction_json TEXT");
+    }
+
     logger?.debug?.(`${TAG} foundations schema ready`);
     return true;
   } catch (err) {

@@ -206,7 +206,7 @@ export function canonicalKey(type: string, name: string): string {
  * carries meaning (e.g. an env var name, a code symbol). Display always uses the
  * original stored value.
  */
-function normalizeFactValue(value: string): string {
+export function normalizeFactValue(value: string): string {
   return value.normalize("NFKC").trim().replace(/\s+/g, " ");
 }
 

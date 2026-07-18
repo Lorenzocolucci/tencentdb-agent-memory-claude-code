@@ -554,7 +554,15 @@ export interface IMemoryStore {
     now: string;
     staleAfterMs?: number;
     namespace?: string;
-  }): { eventsReinforced: number; factsReinforced: number; staled: number };
+  }): {
+    eventsReinforced: number;
+    factsReinforced: number;
+    staled: number;
+    /** Facts newly flagged (or re-flagged) as contradicting an active sibling this pass. */
+    contradictionsFlagged: number;
+    /** Facts whose contradiction flag was cleared because the conflict resolved. */
+    contradictionsCleared: number;
+  };
 
   /**
    * Context Fingerprint (Idea 1) — persist one situation signature

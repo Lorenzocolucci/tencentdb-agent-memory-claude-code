@@ -81,7 +81,8 @@ export function scheduleConsolidation(opts: ScheduleConsolidationOptions): Promi
         const stats = store.consolidateSession!({ sessionKey, now, staleAfterMs });
         opts.logger?.debug?.(
           `${TAG} session=${sessionKey} reinforced events=${stats.eventsReinforced} ` +
-            `facts=${stats.factsReinforced} staled=${stats.staled}`,
+            `facts=${stats.factsReinforced} staled=${stats.staled} ` +
+            `contradictionsFlagged=${stats.contradictionsFlagged} contradictionsCleared=${stats.contradictionsCleared}`,
         );
       } catch (err) {
         opts.logger?.warn(

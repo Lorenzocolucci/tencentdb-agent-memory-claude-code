@@ -3433,7 +3433,15 @@ export class VectorStore implements IMemoryStore {
   }): ConsolidationStats {
     // Unlike the CRUD primitives this never throws: it runs on the session-end
     // path and must degrade to a no-op when the KB is unavailable.
-    if (!this.kbReady) return { eventsReinforced: 0, factsReinforced: 0, staled: 0 };
+    if (!this.kbReady) {
+      return {
+        eventsReinforced: 0,
+        factsReinforced: 0,
+        staled: 0,
+        contradictionsFlagged: 0,
+        contradictionsCleared: 0,
+      };
+    }
     return runConsolidation(this.db, params);
   }
 

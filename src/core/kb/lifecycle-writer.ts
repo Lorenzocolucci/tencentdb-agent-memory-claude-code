@@ -39,6 +39,8 @@ export interface LifecycleRow {
   namespace: string;
   created_time: string;
   updated_time: string;
+  /** Brick 8 (L4 v1): JSON contradiction flag, or null when no known conflict. */
+  contradiction_json?: string | null;
 }
 
 // Two-condition promotion thresholds (short -> long).

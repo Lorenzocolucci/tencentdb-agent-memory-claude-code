@@ -104,6 +104,14 @@ ALTER TABLE relations ADD COLUMN weight REAL NOT NULL DEFAULT 1.0;
 ```
 → Regge: Fase D (constrained spreading activation: propaga lungo gli archi pesati, con limiti hop/fan-out/soglia). NB: si attiva solo dopo che la Fase A densifica il grafo (oggi 0.28 rel/entità).
 
+> NOTA (2026-07-18): il codice ha già superato questo documento — `foundations-schema.ts` include anche Mattone 6 (`lessons` reinforcement: exposure/avoidance) e Mattone 7 (stance track record) mai registrati qui. Aggiungo solo il mattone della mia consegna (L4 v1); un aggiornamento completo del documento è fuori dal perimetro di questo task.
+
+### Mattone 8 — `memory_lifecycle.contradiction_json` (contradiction check, L4 v1 Consolidation Engine)
+```sql
+ALTER TABLE memory_lifecycle ADD COLUMN contradiction_json TEXT;
+```
+→ Regge: il terzo passo del Consolidation Engine (Fase A) — `contradiction-detector.ts`. Due fatti ATTIVI (HEAD) sulla stessa (entity_id, attribute) con valori diversi non dovrebbero mai coesistere sotto scrittura normale (la supersession bi-temporale di `upsertFact` li collassa già in un unico HEAD): questo è un **safety net** per qualunque percorso che aggiri quell'invariante (migrazione, insert manuale, race). Flag/clear, MAI cancellazione del fatto. Ogni cambio di stato specchiato in `memory_audit` (`contradiction_flagged` / `contradiction_resolved`). Idempotente (firma del conflitto confrontata prima di riscrivere). Bounded: `MAX_ACTIVE_FACTS_SCANNED = 10_000` per passata, `scanCapped` esposto nelle stats.
+
 ---
 
 ## 2 — Matrice "ogni piano usa quale fondamenta" (prova che non si demolisce)

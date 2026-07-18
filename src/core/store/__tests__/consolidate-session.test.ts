@@ -58,6 +58,12 @@ describe("VectorStore.consolidateSession", () => {
 
   it("returns zeroed stats for a session with no events", () => {
     const stats = store.consolidateSession!({ sessionKey: "ghost", now: NOW });
-    expect(stats).toEqual({ eventsReinforced: 0, factsReinforced: 0, staled: 0 });
+    expect(stats).toEqual({
+      eventsReinforced: 0,
+      factsReinforced: 0,
+      staled: 0,
+      contradictionsFlagged: 0,
+      contradictionsCleared: 0,
+    });
   });
 });
