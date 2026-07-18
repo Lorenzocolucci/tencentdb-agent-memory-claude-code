@@ -2169,3 +2169,246 @@ git push fork feat/memory-excellence
 </details>
 
 ---
+
+## docs/superpowers/plans/2026-07-07-recall-associative-first-A.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** piano TDD per l'Incremento A del recall associativo-first — costruito e verificato live (`situation-cue.ts` esiste, wiring in `auto-recall.ts` confermato). Ignorato da `.gitignore` (`docs/superpowers/*`), mai stato in git → contenuto integrale sotto, in 2 parti.
+
+**Fatti da tenere:** contiene la misura read-only "Task 0" sui dati LIVE (grafo events=11.693/relations=6.054/entities=9.871) che ha confermato che il design regge sui dati reali PRIMA di costruire — metodo "verify don't assume" applicato in modo esemplare. Superato dal successivo Incremento C (indice HNSW in-house, root `HANDOFF.md` del repo, altra voce di questo storico).
+
+<details>
+<summary>Contenuto integrale (mai versionato, gitignored — parte 1/2, header + Task 0-1)</summary>
+
+```markdown
+# Recall associativo-first — Incremento A — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Rendere la *situazione* (dove eravamo + cornerstone + fingerprint + file recenti) il cue primario che semina lo spreading activation, così il recall di System-1 (banner/auto-recall) è associativo-dalla-situazione, dal vicinato, senza scansione globale né embedding.
+
+**Architecture:** Un solo modulo nuovo — `situation-cue.ts` (dalla situazione ai *semi* = entity ids, puro sui read dello store, best-effort) — più il wiring in `runKbRecall`. Il motore associativo NON è nuovo: si **riusa** `associativeExpand(seedEntityIds, {maxNodes})` (già fa spread→vicinato→memoria-per-entità), stavolta seminato dalla situazione invece che dai risultati della query. Il cue-da-testo (`kbRecall(userText, {skipVector})`) resta come sorgente **secondaria**; i due si fondono per owner-id.
+
+**Tech Stack:** TypeScript (ESM, `.js` import specifiers), `node:sqlite` (sync), tsdown build, vitest. Regole progetto: immutabile (spread), mai throw sul path recall (try/catch → degrada), niente `console.log` (usa `logger`), file piccoli/una responsabilità.
+
+**Spec:** `docs/superpowers/specs/2026-07-07-recall-associative-first-design.md`. Deviazione DRY rispetto allo spec §4.2: il componente N2 `associative-recall.ts` NON è un file nuovo — collassa nel riuso di `associativeExpand` + un piccolo passo di ranking nel wiring.
+
+**Firme verificate (usare queste, non inventarne altre):**
+- `store.listEventsBySession(sessionKey): KbEvent[]` — `KbEvent.entities: string[]`, `KbEvent.session_id`, `KbEvent.ts`, `KbEvent.type`, `KbEvent.project`.
+- `store.associativeExpand(seedEntityIds: string[], opts?: { hops?; maxNodes?; namespace? }): Array<{ owner_id; owner_kind:"fact"|"event"; text; entity_id; activation }>`.
+- `store.queryContextFingerprints(namespace, limit): StoredFingerprint[]` (campo `matchedOwnerIds: string[]`).
+- `store.queryEntityById(id): KbEntity | null`.
+- `resolveFileOwnerId(store, filePath): string | null` (da `src/core/hooks/situation-injection.ts`).
+- `kbRecall(query, { store, embeddingService, maxResults, skipVector:true, logger }): Promise<KbRecallResult[]>` — `KbRecallResult { owner_id, owner_kind, score, text, entity_id? }`.
+- Cornerstone: gli eventi cornerstone provengono da `events` (`cornerstone-runner.ts:134`), quindi un cornerstone→entità = `entities_json` del suo evento.
+
+---
+
+## Task 0 — Misura read-only su dati LIVE (discharge §7, NIENTE modifiche)
+
+Deve rispondere a due domande PRIMA di costruire, sui dati reali (regola "read-only prima, verify don't assume"): (a) gli eventi della sessione precedente espongono `entities_json` non vuoto? (b) quelle entità hanno abbastanza `relations` perché lo spread renda?
+
+**Files:** nessuno (solo lettura DB live via gateway/CLI o `sqlite3`).
+
+- [ ] **Step 1: Trova il path del DB live**
+
+Run: `grep -rn "pluginDataDir\|\.db\b\|foundations.db\|memory.db" src/core/store/factory.ts src/config.ts | head -20`
+Poi conferma il file reale sotto la data dir del gateway (es. `C:/Users/lo/tdai-gateway/data` o la `pluginDataDir` configurata). Annota il path assoluto.
+
+- [ ] **Step 2: Misura entità della sessione precedente (dove eravamo)**
+
+Con un `session_key` reale (es. Sofia), esegui read-only:
+```sql
+-- eventi della sessione più recente per quel session_key, con conteggio entità
+SELECT session_id, type, ts, json_array_length(entities_json) AS n_ent
+FROM events WHERE session_key = :sk ORDER BY ts DESC LIMIT 30;
+```
+Expected: molte righe con `n_ent > 0`. Se quasi tutte `0` → il seme "dove eravamo" da eventi non regge, e Task 1 deve usare il fallback entity-name-match sul testo recap (annota la decisione).
+
+- [ ] **Step 3: Misura densità del grafo attorno a quelle entità**
+
+Prendi 5–10 entity id dallo step 2 ed esegui:
+```sql
+SELECT :eid AS entity, COUNT(*) AS deg FROM relations
+WHERE src_entity_id = :eid OR dst_entity_id = :eid;
+```
+Expected: grado medio ≳ 2 (post-digest relations=6.026/entities=9.843). Se molte entità hanno grado 0 → lo spread non espande; annota che i pesi devono privilegiare le entità con grado>0 e che il fallback text-cue è essenziale.
+
+- [ ] **Step 4: Registra i numeri nel plan**
+
+Scrivi in fondo a questo file una riga "## Task 0 — risultati" con: % eventi con entità, grado medio campione, decisione (procedi come progettato / abilita fallback). NON procedere a Task 1 se entrambe le misure sono degeneri (in quel caso torna allo spec).
+
+---
+
+## Task 1 — `situation-cue.ts`: dalla situazione ai semi (modulo puro, TDD)
+
+Responsabilità unica: raccogliere entity-id-semi pesati dalle sorgenti-situazione, best-effort, mai throw.
+
+**Files:**
+- Create: `src/core/kb/situation-cue.ts`
+- Test: `src/core/kb/__tests__/situation-cue.test.ts`
+
+- [ ] **Step 1: Scrivi il test che fallisce (estrazione + merge + dedup)**
+
+```typescript
+import { describe, it, expect } from "vitest";
+import { buildSituationSeeds } from "../situation-cue.js";
+import type { IMemoryStore, KbEvent } from "../../store/types.js";
+
+const evt = (o: Partial<KbEvent>): KbEvent => ({
+  id: "e", ts: "2026-07-06T10:00:00Z", recorded_at: "", session_key: "sk",
+  session_id: "prev", namespace: "default", project: "p", type: "decision",
+  text: "", language: "und", entities: [], source_message_ids: [], ...o,
+});
+
+function fakeStore(over: Partial<IMemoryStore>): IMemoryStore {
+  return {
+    listEventsBySession: () => [
+      evt({ id: "e1", ts: "2026-07-06T10:00:00Z", entities: ["ent_a", "ent_b"] }),
+      evt({ id: "e2", ts: "2026-07-06T10:01:00Z", entities: ["ent_b"] }),  // ent_b twice → dedup
+    ],
+    queryContextFingerprints: () => [
+      { matchedOwnerIds: ["ent_c"] } as any,
+    ],
+    queryEntityById: (id: string) => ({ id, name: id, type: "concept" } as any),
+    ...over,
+  } as unknown as IMemoryStore;
+}
+
+describe("buildSituationSeeds", () => {
+  it("unions entities of recent events + fingerprint owners, deduped", () => {
+    const seeds = buildSituationSeeds(fakeStore({}), {
+      sessionKey: "sk", namespace: "default",
+    });
+    const ids = seeds.map((s) => s.id).sort();
+    expect(ids).toContain("ent_a");
+    expect(ids).toContain("ent_b");
+    expect(ids).toContain("ent_c");   // from fingerprint
+    // dedup: ent_b appears once, with the MAX weight seen
+    expect(ids.filter((x) => x === "ent_b")).toHaveLength(1);
+  });
+
+  it("returns [] and never throws when every source fails", () => {
+    const store = {
+      listEventsBySession: () => { throw new Error("boom"); },
+    } as unknown as IMemoryStore;
+    expect(buildSituationSeeds(store, { sessionKey: "sk", namespace: "default" })).toEqual([]);
+  });
+
+  it("caps total seeds to MAX_SEEDS, strongest first", () => {
+    const many = Array.from({ length: 100 }, (_, i) => evt({ id: `e${i}`, entities: [`ent_${i}`] }));
+    const store = { listEventsBySession: () => many } as unknown as IMemoryStore;
+    const seeds = buildSituationSeeds(store, { sessionKey: "sk", namespace: "default" });
+    expect(seeds.length).toBeLessThanOrEqual(24);
+  });
+});
+```
+
+- [ ] **Step 2: Esegui il test — deve fallire**
+
+Run: `npx vitest run src/core/kb/__tests__/situation-cue.test.ts`
+Expected: FAIL — `buildSituationSeeds` non esiste.
+
+- [ ] **Step 3: Implementa il modulo minimo**
+
+```typescript
+/**
+ * situation-cue.ts — dalla SITUAZIONE ai semi dello spreading activation.
+ *
+ * Il recall associativo-first parte dalla situazione (dove eravamo + cornerstone
+ * + fingerprint + file recenti), NON dal testo della query. Questo modulo traduce
+ * quella situazione in entity-id-semi pesati. Puro sui read dello store, immutabile,
+ * best-effort: ogni sorgente in try/catch → una che fallisce non azzera le altre;
+ * tutto vuoto → []. Mai throw (il recall non rompe MAI la conversazione).
+ */
+import type { IMemoryStore, KbEvent } from "../store/types.js";
+import type { Logger } from "../types.js";
+import type { SessionSituation } from "../hooks/session-situation.js";
+import { resolveFileOwnerId } from "../hooks/situation-injection.js";
+
+const TAG = "[memory-tdai][situation-cue]";
+const MAX_SEEDS = 24;
+const RECENT_EVENTS = 30;
+
+/** Un seme pesato per lo spreading activation. */
+export interface SituationSeed {
+  readonly id: string;        // entity id
+  readonly weight: number;    // (0,1] — quanto la sorgente descrive "dove siamo ORA"
+  readonly source: "recap" | "cornerstone" | "fingerprint" | "recent-file";
+}
+
+export interface SituationCueContext {
+  readonly sessionKey: string;
+  readonly namespace: string;
+  /** Rolling situation (mid-session). Vuota all'apertura sessione — lì contano recap+fingerprint. */
+  readonly situation?: SessionSituation;
+  readonly logger?: Logger;
+}
+
+/** Peso base per sorgente (tarabile — vedi Task 0). */
+const WEIGHT = { recap: 1.0, cornerstone: 0.7, fingerprint: 0.7, "recent-file": 0.4 } as const;
+
+/**
+ * I K eventi più recenti (per ts) sotto il session_key — la "coda" di ciò che stavamo
+ * facendo, ATTRAVERSO il confine di sessione. Misurato live (Task 0): all'apertura la
+ * sessione corrente è quasi vuota (2 eventi), quindi filtrare per session_id perderebbe
+ * "dove eravamo"; i K-più-recenti-per-ts prendono la coda della sessione precedente.
+ * Sui dati reali 26-27/30 eventi recenti portano entità → semi ricchi.
+ */
+function recentEventsByTs(events: readonly KbEvent[]): readonly KbEvent[] {
+  return [...events].sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0)).slice(0, RECENT_EVENTS);
+}
+
+/** Aggiunge/aggiorna un seme tenendo il peso MASSIMO per entità. */
+function addSeed(map: Map<string, SituationSeed>, id: string, weight: number, source: SituationSeed["source"]): void {
+  if (!id) return;
+  const cur = map.get(id);
+  if (!cur || weight > cur.weight) map.set(id, { id, weight, source });
+}
+
+export function buildSituationSeeds(store: IMemoryStore, ctx: SituationCueContext): SituationSeed[] {
+  const seeds = new Map<string, SituationSeed>();
+
+  // (1) "Dove eravamo" + lavoro recente: entità dei K eventi più recenti sotto il session_key.
+  try {
+    if (typeof store.listEventsBySession === "function") {
+      const recent = recentEventsByTs(store.listEventsBySession(ctx.sessionKey));
+      for (const e of recent) for (const eid of e.entities ?? []) addSeed(seeds, eid, WEIGHT.recap, "recap");
+    }
+  } catch (err) { ctx.logger?.warn?.(`${TAG} recap seeds failed (non-fatal): ${msg(err)}`); }
+
+  // (2) Context Fingerprint: owner risolti a entità.
+  try {
+    const fps = store.queryContextFingerprints?.(ctx.namespace, 5) ?? [];
+    for (const fp of fps) for (const ownerId of fp.matchedOwnerIds ?? []) {
+      const ent = store.queryEntityById?.(ownerId);
+      if (ent) addSeed(seeds, ent.id, WEIGHT.fingerprint, "fingerprint");
+    }
+  } catch (err) { ctx.logger?.warn?.(`${TAG} fingerprint seeds failed (non-fatal): ${msg(err)}`); }
+
+  // (3) File recenti (mid-session): fileKey → entity.
+  try {
+    for (const fileKey of ctx.situation?.fileKeys ?? []) {
+      const id = resolveFileOwnerId(store, fileKey);
+      if (id) addSeed(seeds, id, WEIGHT["recent-file"], "recent-file");
+    }
+  } catch (err) { ctx.logger?.warn?.(`${TAG} recent-file seeds failed (non-fatal): ${msg(err)}`); }
+
+  return [...seeds.values()].sort((a, b) => b.weight - a.weight).slice(0, MAX_SEEDS);
+}
+
+function msg(err: unknown): string { return err instanceof Error ? err.message : String(err); }
+```
+
+> Nota cornerstone (sorgente 4 dello spec): al momento NON è inclusa qui perché al session-open il blocco cornerstone è costruito off-path (`cornerstoneCache`) e non sempre disponibile in `runKbRecall`. Aggiunta rimandata a Task 3 se Task 0 mostra che recap+fingerprint non bastano. Documentato, non silenzioso.
+
+- [ ] **Step 4: Esegui i test — devono passare**
+
+Run: `npx vitest run src/core/kb/__tests__/situation-cue.test.ts`
+Expected: PASS (3/3).
+
+- [ ] **Step 5: (NIENTE commit ancora — attende semaforo Lorenzo per toccare i servizi vivi; vedi §"Gate live")**
+```
+
+</details>
+
+---
