@@ -181,3 +181,47 @@ Italiano, diretto, niente "probabilmente", niente complimenti gratuiti, ironia q
 </details>
 
 ---
+
+## C:\Sinapsys\05-handoff\2026-06-24-night.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** handoff di sessione — ricerca 7/7 ambiti chiusa (ora in `docs/vision/03-research/`), hub costruito (ora unificato in `docs/vision/`), Fase A deterministica (3 commit c69c6dc/bc0fb5e/f6dede2) tutta superata da lavoro successivo (aggancio live 93abfad, poi L4 v1 contradiction-detector 44a1625). Mai versionato → contenuto integrale sotto.
+
+**Fatti da tenere:** i 5 mattoni delle fondamenta (memory_lifecycle, lessons, memory_audit, context_fingerprints, relations.weight) sono nati in questa sessione (commit `c69c6dc`) — oggi documentati in `docs/SINAPSYS_FOUNDATIONS.md` (nel repo). Trappola nota: `db.exec` di node:sqlite = falso positivo del security hook.
+
+<details>
+<summary>Contenuto integrale (mai versionato — 29 righe)</summary>
+
+```markdown
+# Handoff — 24 giugno 2026 (notte)
+
+## In una riga
+Chiuse la **ricerca** (7/7 ambiti, 2 round verificati), costruito l'**hub** C:\Sinapsys, e implementata la **Fase A deterministica** di Sinapsys (fondamenta + consolidamento) — 3 commit, 87 test verdi, su `feat/memory-excellence`.
+
+## Stato verificato
+- **Commit** (branch `feat/memory-excellence`, NIENTE push):
+  - `c69c6dc` fondamenta (5 mattoni: memory_lifecycle, lessons, memory_audit, context_fingerprints, relations.weight)
+  - `bc0fb5e` Fase A·1 — lifecycle access layer + audit (promozione a 2 condizioni)
+  - `f6dede2` Fase A·2 — consolidation runner deterministico (rinforza + decade)
+- **Test:** suite KB 87/87 verde, `tsc --noEmit` pulito.
+- **NON deployato:** lo schema si applica al DB live solo al prossimo build + restart gateway (additivo, sicuro).
+
+## Primo passo prossima sessione
+1. **Aggancio live** di `runConsolidation` a session-end fire-and-forget. Studiare: `src/core/tdai-core.ts` (handleSessionEnd, wirePipelineRunners) + `src/gateway/server.ts` (POST /session/end). Cadenza confermata da Lorenzo: session-end fire-and-forget.
+2. **Fase B** (lezioni): clustering events `bug`/`fix` → `lessons` con LLM, come step 3 del runner. Eval set da costruire dai dati KB reali (recall/canary), NON chiederlo a Lorenzo.
+3. **Deploy**: build + restart gateway.
+
+## Trappole (non ricascarci)
+- ⚠️ Il security hook segnala `db.exec` di node:sqlite come fosse shell (FALSO POSITIVO). Workaround usato: `db.prepare(sql).run()`. Usalo per ogni DDL nuovo.
+- ⚠️ Gateway live gira: non riavviarlo senza l'OK di Lorenzo. Token in `<dataDir>/token`.
+- ⚠️ MAI push su main. MAI spostare il codice fuori dal repo (vedi ADR-0002).
+- Modello verificato `moonshot-v1-auto` (no kimi-k2 EOL). Embeddings = OpenAI 3-small 1536.
+
+## Dove guardare
+- Architettura viva: `C:\Sinapsys\02-architecture\INTERCONNECTION-MAP.md` (sezioni C.1–C.4).
+- Fondamenta: `repo/docs/SINAPSYS_FOUNDATIONS.md`.
+- Memoria agente: schede `sinapsys-*` (vision, build-state, research-findings).
+```
+
+</details>
+
+---
