@@ -384,3 +384,140 @@ L'obiettivo del task ("atomic facts, non instruction blobs") NON e soddisfatto: 
 </details>
 
 ---
+
+## .claude/memory/next-up.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** follow-up del 06-16 (Phase 1-5 dell'epoca); L1 poi sostituito dal KB entity-centric (kb-extraction), item#2 (redazione segreti) coperto da `src/utils/redact-secrets.ts`. UNTRACKED (mai in git) → contenuto integrale sotto.
+
+<details>
+<summary>Contenuto integrale (mai versionato — 10 righe)</summary>
+
+```markdown
+# Next Up
+> Phase 1-5 DONE. PR #1 aperta. Restano solo follow-up.
+
+1. RICARICARE account Kimi/Moonshot, poi verificare TEST 3 end-to-end LIVE (estrazione L1 di una sessione reale -> recall). Il codice è pronto; serve solo l'LLM attivo.
+2. [security HIGH] redaction segreti prima del write/embed L1 (pattern sk-/AKIA/Bearer/hex). Oggi i segreti detti in chat finiscono in chiaro + mandati a OpenAI per embedding. Decisione Lorenzo.
+3. [security MEDIUM] re-abilitare looksLikePromptInjection (sanitize.ts:153, oggi dead code).
+4. [MEDIUM] flushSession: rendere awaitable la coda trailing (pipeline-manager) — non è perdita dati, solo contratto async.
+5. [LOW] reindexAll summary errori embed; rimuovere stmtL0QueryAll/After DESC (dead code dopo cold-start fix); UX: il tool recall mostra score RRF (~0.03), dovrebbe mostrare la COSINE (0.57-0.79).
+6. Merge PR #1 dopo review. npm run build full è rotto a build:scripts (dir scripts/ mancanti) — sistemare o rimuovere gli step; manca uno script typecheck per l'engine.
+7. (Opzionale) Quando Kimi è attivo, ri-estrarre i transcript persi giu 9-16 col pipeline fixed. Oggi i 9 fatti chiave nello store sono authored grounded (recall 0.57-0.79), non estratti.
+```
+
+</details>
+
+---
+
+## .claude/memory/status.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** header datato 07-06 ma contenuto reale è la cronaca Track B di giugno (cutover graduale L1→KB entity-centric); superato da `.claude/session-state.md` (07-08) come registro corrente e da tutto il lavoro successivo (Grounded Trust, Mistake Notebook, recall associativo-first, L4 v1). UNTRACKED (mai in git) → contenuto integrale sotto.
+
+**Fatti da tenere:** cronaca del cutover L1→KB (backfill, proiezioni persona/scene, fix chunk_size vec0 che aveva gonfiato il DB a 8.3GB) — tutto oggi consolidato e descritto in `docs/SINAPSYS-ARCHITECTURE.md`.
+
+<details>
+<summary>Contenuto integrale (mai versionato — 97 righe)</summary>
+
+```markdown
+# Status — TencentDB Memory System
+> Ultimo aggiornamento: 2026-07-06 21:56 (pre-compact auto)
+
+## Progresso Track B (branch feat/memory-excellence)
+- A1 embedding-resilient: b96590e (live verificato).
+- P1 schema/store entity-centric: b498304.
+- P2+P4 write path + retrieval (kbRecall RRF+rerank-flag+calibrazione): c441b99.
+- FIX qualità estrazione: cdc2b6c — coerce-don't-reject (vocab fuori-enum → concept, mai perdita finestra),
+  identifier pattern (codice in fact.value), anti-fabrication (no mixed-script garbage).
+- FIX completezza estrazione: 9b79e8f — regola 2.5 enumera TUTTI i fatti tecnici in finestre dense
+  (42703/idempotency/LEADDOC non più persi); regola 0 lingua top-level = lingua finestra.
+- PROVA E2E (tools/kb-migrate.mts + kb-eval.mts su .kb-scratch, dati reali 06-16+06-17, Kimi+OpenAI reali):
+  RECALL 6/7 gold (canaries MANGO/ZAFFIRO 4/4 rank-1; Sofia idempotency+LEADDOC HIT; solo "42703" literal MISS
+  ma fatto semantico catturato). Diagnosi extraction-vs-retrieval per ogni miss. Live db (4.6GB) INTATTO.
+
+## ✅ RE-TEST PERCORSO REALE (2026-06-19 ~12:35) — testato come lo usa Lorenzo, non coi miei script
+- Backfill coda completato: kb ora 175 entità / 172 fatti / 136 eventi / 42 relazioni (era 129/136/102/42). DB 55MB, l1=281 intatto.
+  Le finestre giganti di QUESTA sessione (meta sul tool) falliscono a 45s → coda 06-19 solo parziale (basso valore).
+- VERIFICATO PERCORSO REALE (la critica chiave di Lorenzo: "tu testi e va, io provo e non va"):
+  * skill memory-status → healthy.
+  * recall via BINARIO plugin (node hook.mjs search-stdin) → "codice segreto"→MANGO score 0.79. È il path reale, non kb-eval.
+  * /recall 0.19s, /capture 0.06s (budget hook 4s/12s — i timeout nel hook.log erano DURANTE la mia manutenzione, non a regime).
+  * PIPELINE LIVE confermata su un turno reale: capture → "Using Phase-2 kb extraction engine" → Applied KbDelta → projected persona+12 scene.
+  * Iniezione (persona+scene) visibile e pulita nei prompt di questa sessione.
+- Pulita pollution di test (fatto "verde acqua" rimosso). Codice tutto committato (HEAD 3276818).
+- CAUSA del "va da te ma non da me": hook recall ha budget 4s; se gateway giù/occupato (es. durante manutenzione) → timeout → nessuna iniezione. A regime 0.19s, ok.
+
+## ✅ TUTTI E 4 I LAVORI DI LORENZO FATTI (2026-06-19 ~03:50) — sistema live, full stack nuovo
+- Lavoro 2 RELATIONS (1772abd): prompt emette relazioni (entity-only, mai event ref) + schema coerce/drop;
+  42 relazioni tipizzate nel kb live (related-to/uses/decided-in/caused/fixed-by/supersedes). Verificato via probe.
+- Lavoro 3 PROIEZIONI persona+scene da kb (519b794): projections.ts/projections-writer.ts deterministiche (no LLM),
+  persona.md = solo attributi allow-list, scene cap top-12 by heat. Flag extraction.kbProjections=true LIVE.
+  tools/kb-project.mts --write per rigenerare. Vecchi scene-extractor/persona-generator NON rimossi (P6).
+- SICUREZZA (3276818): le scene usavano entity.name (auto-iniettato) → leak di codici/credenziali (es. QUARZO-NEBULOSA-555
+  reale era nei vecchi scene file). FIX looksLikeSecret() in projections: scene escludono eventi con entità/token segreti;
+  persona esclude valori-credenziale. 7 vecchi scene file (old LLM extractor, con QUARZO) archiviati in .backup (non cancellati).
+  Verificato: persona.md + 12 scene_blocks = 0 segreti.
+- Lavoro 4 PULIZIA db (519b794): vec0 allocava ~6.29MB PER PARTITION (chunk_size default 1024 + partition key quasi-unica)
+  = ~6MB per vettore → 8.3GB. Fix chunk_size=8 su kb_vec/l1_vec/l0_vec → DB 8.3GB→52MB. NIENTE cancellato (l0/l1 intatti).
+  tools/kb-defrag-vec.mts per ri-defrag se serve. vecSchemaIsLegacy controlla solo chunk_id → nessun reindex al boot.
+- Lavoro 5 ROBUSTEZZA (1772abd): retry 1x + riparazione JSON (virgoletta doppia/virgola finale) in kb-extractor.
+- Backfill kb pulito (wipe+rebuild): 129 entità/136 fatti/102 eventi/42 relazioni. CODA 06-18/06-19 (~16 finestre) NON
+  completata (Kimi lento, killato). Recall live 5/7 gold (canaries 4/4). DA FINIRE: resume tools/kb-backfill-live.mts.
+- Commits sessione: b96590e A1, b498304 P1, c441b99 P2+P4, cdc2b6c+9b79e8f estrazione, fdfc8dc timeout, 1772abd relations+robust, 519b794 proiezioni+chunk_size.
+
+## ✅ CUTOVER COMPLETO E LIVE (2026-06-19 ~01:00) — recall.source=kb attivo, VERIFICATO end-to-end
+- Gateway prod serve recall dal KB entity-centric: POST /search/memories → "strategy":"kb".
+  "codice segreto"→MANGO (0.66), "errore 42703"→bug PostgREST postcall_state (0.54), "ZAFFIRO"→0.72.
+  Log: [kb-recall] (fts+vec+entity→RRF fused), score calibrati 0-1, rerank=false (flag OFF).
+- Live db kb_*: **224 entità, 234 head facts, 152 eventi, 1 relazione, 396 kb_vec/fts**. quick_check=ok. l1_records=281 INTATTO.
+- Backfill storico COMPLETO (tutti i 13 giorni, 65 finestre): backfill-live reso RESUMIBILE (skip finestre già in events per source_message_id → niente eventi duplicati) + timeout per-call configurabile (TDAI_KB_EXTRACT_TIMEOUT_MS, commit fdfc8dc) per fail-fast sulle finestre grandi. 2° run: 31 skip + 31 ok + 3 fail-closed.
+- Eval finale sul db live COMPLETO: 6/7 (canaries 4/4; solo "LEADDOC" literal manca = varianza estrazione).
+- Backup pre-cutover: .backup/vectors-precutover-20260619.db (4.6GB). ROLLBACK: yaml engine=l1+recall=l1 + restart (l1 intatto).
+- Tool dev (untracked): tools/kb-backfill-live.mts (backfill live, rifiuta di girare se gateway up), kb-migrate/kb-eval (KB_EVAL_DB=<path> per live), kb-probe.
+- RESTANO: finire backfill coda; P5 proiezioni L2/L3 da kb; P6 retire l1; opz relations (estrattore ne emette poche).
+
+## CUTOVER GRADUALE (approvato da Lorenzo) — storico step
+- Step 1 FATTO+VERIFICATO: rebuild dist + restart gateway su NUOVO codice. /health ok, embedding openai/1536 ok (zero regressione),
+  "KB schema initialized (kbReady=true)" sul db live 4.6GB (additivo, l0/l1 intatti). Restart non-elevato OK (nessun blocco elevazione).
+- Step 2 FATTO: tdai-gateway.yaml (~/.memory-tencentdb/memory-tdai/) → extraction.engine=kb, recall.source=l1. Gateway riavviato healthy, nessun fallback.
+  Le NUOVE conversazioni vengono catturate dal motore entity-centric. (Conferma runtime end-to-end al prossimo turno reale catturato.)
+- RECALL ANCORA SU l1 = nessuna regressione: il recall di Lorenzo legge i l1_records esistenti come prima.
+- RESTANO (gli step più pesanti, da fare come operazione FOCALIZZATA, ~20-40min scrittura su prod + cambio comportamento recall):
+  Step 3 backfill storico L0→kb nel db live; Step 4 eval sul db pieno; Step 5 flip recall.source=kb + verifica.
+  Poi P5 proiezioni L2/L3 deterministiche, P6 retire l1.
+- REVERSIBILE: per tornare al vecchio comportamento → engine=l1 nello yaml + restart (l1_records intatti).
+- Config gateway: ~/.memory-tencentdb/memory-tdai/tdai-gateway.yaml (embedding + flag). Store live: TDAI_DATA_DIR=.claude/plugins/data/tdai-memory-tdai-local (4.6GB).
+- Tool dev (non committati): tools/kb-migrate.mts + kb-eval.mts (eval gate), kb-probe.mts (probe estrazione). .kb-scratch/ = db prova eval.
+
+## Obiettivo (Lorenzo, 18/6)
+Memoria ECCELLENTE, stile llm-wiki, non solo buona. Basta patch ai sintomi. Approccio approvato: ENTITY-CENTRIC EVOLUTIVO.
+
+## Diagnosi (perché è fallita 10+ volte) — 3 cause strutturali
+1. 5 stadi LLM in serie (extract→dedup→scene→persona) = affidabilità = prodotto → fallimenti ricorrenti.
+2. Dedup LLM DISTRUTTIVO (deleteL1Batch) = perdita dati + 6 guardie = quasi no-op.
+3. Client embedding che marcisce (global fetch, 0 retry, no undici Agent) → recall morto dopo ore.
++ store fatti-piatti (no verità canonica), L2/L3 markdown non rankati, deriva linguistica, zero test e2e/osservabilità.
+
+## Blueprint: docs/ENTITY_CORE_BLUEPRINT.md (schema, merge deterministico, retrieval, migrazione, roadmap, decisioni)
+
+## Stato gateway
+HEALTHY — PID 40524, codice embedding-resilient live. /health onesto (embed ping reale, 503 se degraded).
+Kimi: NON più sospeso (ricaricato). Embedding OpenAI: testato OK; recall fresco a cosine 0.84-0.93.
+
+## Track A (stabilizzazione)
+- A1 FATTO + committato (b96590e su branch feat/memory-excellence): undici Agent + retry su socket fresco + circuit breaker; /health reale; timeout HTTP gateway. Verificato live.
+- A3 (watchdog/restart-on-hang): priorità BASSA ora (il client si auto-ripara). Follow-up.
+- A5 reindex vettori corrotti: assorbito dalla migrazione Track B (re-extract da L0).
+
+## Track B (eccellenza, entity-centric) — ROADMAP (vedi blueprint)
+P0 eval harness | P1 schema+store (IN CORSO, lo-database-architect) | P2 single-extraction+upsert deterministico | P3 migrazione re-extract da L0 | P4 retrieval+rerank | P5 proiezioni L2/L3 deterministiche | P6 cutover+retire L1+maintenance | P7 (opt) cross-encoder locale.
+
+## Decisioni open-questions (prese): namespace globale + tag project; rerank flag default OFF; persona allow-list fissa; L1 read-only 1 release; L0-completeness check in P3; persist source_message_ids.
+
+## Branch: feat/memory-excellence (A1 = b96590e). Backup .backup/vectors-20260616-0241.db INTATTO.
+
+## Regole: backup prima di op distruttive; NON ricompilare vec0.dll; NON push su main (feature branch→PR); SOLO eccellenza.
+```
+
+</details>
+
+---
