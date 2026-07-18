@@ -2581,3 +2581,29 @@ Script di misura (read-only, gitignored): `b3-backfill-copy/_recall_measure.cjs`
 ---
 
 # Sezione C — repo tencentdb-agent-memory, file TRACKED (summary + `git rm`)
+
+## HANDOFF.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** handoff "Incremento C — indice navigabile" (2026-07-08): diagnosi dell'event-loop starvation del banner (colpevole = `cornerstone-build`, scan KNN brute-force 35-95s su ~25k vettori), verdetto sulle librerie ANN pronte su Windows ARM64 (hnswlib-node/usearch/hnswlib-wasm tutte fallite), decisione di costruire un indice navigabile in-house (`navigable-index.ts`). C-1a e C-1b (integrazione in `searchKbVector` con fallback brute-force) risultano FATTI nel documento stesso — oggi superato dal codice live (il modulo esiste, wired, sul branch corrente).
+
+**Fatti da tenere:** il verdetto ARM64 (nessuna libreria HNSW pronta gira su Windows ARM64 in Node) resta valido e non ripetibile a costo zero — utile se si rivaluta la scelta in futuro. Contenuto integrale in git history.
+
+## SKILL.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** skill OpenClaw (cinese) per installare/configurare/verificare il plugin `memory-tencentdb` in ambiente OpenClaw — l'host oggi è Claude Code, non OpenClaw; workflow di setup non più applicabile al progetto Sinapsys/tencentdb-agent-memory in uso. Resta valido come documentazione upstream del progetto fork originale.
+
+**Fatti da tenere:** nessuno specifico a Sinapsys — è documentazione del prodotto upstream OpenClaw. Contenuto integrale in git history.
+
+## SKILL-DIAGNOSTIC-EXPORT.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** skill OpenClaw (cinese) per esportare un pacchetto diagnostico (log + dati memoria + config redatta) per il supporto — specifico al layout dati OpenClaw (`~/.openclaw/memory-tdai/`), non usato nel workflow Sinapsys attuale.
+
+**Fatti da tenere:** la tabella di redazione config (regex su apiKey/token/password/secret/credential) è un riferimento utile se mai servisse uno script di export diagnostico locale. Contenuto integrale in git history.
+
+## SKILL-MIGRATION.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** skill OpenClaw (cinese) per la migrazione una-tantum del nome pacchetto `@tdai/memory-tdai` → `@tencentdb-agent-memory/memory-tencentdb`. Migrazione già avvenuta, procedura esaurita, irrilevante all'host Claude Code attuale.
+
+**Fatti da tenere:** nessuno rilevante oggi. Contenuto integrale in git history.
+
+---
