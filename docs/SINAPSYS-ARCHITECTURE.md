@@ -10,7 +10,11 @@
 > does what, the data model, the request flows, and the six original ideas mapped to
 > code. Generated from the real tree (not memory).
 >
-> **Scale (measured):** 160 source files · ~44,600 LOC · 86 test files · 585 tests.
+> **Scale (measured):** 160 source files · ~44,600 LOC · 135 test files · 585 tests.
+> File counts re-verified 2026-07-18 (`kb/` 31→49, test files 86→135); total
+> source-file-count/LOC/test-count above were NOT re-run this pass (out of
+> scope for this docs-only wave) and may themselves be stale — see
+> `docs/archive/SINAPSYS-STORICO-DOCS-20260718.md` intro.
 > **Status:** all six pillars built, wired, and live; full suite green except 7
 > pre-existing Windows-only daemon/hook env failures.
 
@@ -61,7 +65,7 @@ src/
 │   └── standalone/ ……………………… Gateway/Hermes sidecar ↔ TDAI Core (Vercel AI SDK runner)
 ├── core/
 │   ├── tdai-core.ts ………………… ⚙️ THE ORCHESTRATOR — owns the lifecycle hooks
-│   ├── kb/ (31 files) ……………… 🧠 the entity-centric brain (graph + ideas)
+│   ├── kb/ (49 files) ……………… 🧠 the entity-centric brain (graph + ideas)
 │   ├── store/ (10 files) ……… ⚙️ storage abstraction (SQLite+sqlite-vec / Tencent VDB)
 │   ├── hooks/ (11 files) ……… 📤 capture + recall + proactive injection
 │   ├── distinctiveness/ (7) … 🧠 Idea 5 (cornerstone / von Restorff)
@@ -97,6 +101,7 @@ hanging off them, linked by **relations**. The six ideas live here.
 | `lifecycle-writer.ts` 🗄️ | The "living" state of each memory (reinforcement, tier, gate, provenance) |
 | `lifecycle-decay.ts` 🔬 | The "forget the noise" half of consolidation |
 | `consolidation-runner.ts` · `consolidation-scheduler.ts` | Phase A "sleep-time" pass (reinforce + decay + promote) |
+| **`contradiction-detector.ts`** 🔬 | L4 v1 (added 2026-07-18, commit `44a1625`): 3rd consolidation pass — flags/clears two ACTIVE facts on the same (entity_id, attribute) with different values (a safety net beyond `upsertFact`'s bi-temporal supersession). Deterministic, no LLM, never deletes/mutates a fact row. See "L4 Consolidation Engine (v1)" below. |
 | `memory-audit.ts` 🗄️ | Append-only trail of every automatic mutation (self-evolution without corruption) |
 | `fingerprint-writer.ts` 🗄️ | Idea 1: persist the situation signature of a moment |
 | **Mistake Notebook (Idea 3):** | |
@@ -233,9 +238,25 @@ they are unverified off Windows-ARM.**
 
 ---
 
+## L4 Consolidation Engine (v1) — stub
+
+Reinforcement + staleness decay (`consolidation-runner.ts`, `lifecycle-decay.ts`) were
+already live as the first two passes of the "sleep-time" engine. On 2026-07-18 (commit
+`44a1625`) a 3rd pass was added: **contradiction detection**
+(`src/core/kb/contradiction-detector.ts`). Groups active (HEAD) facts by
+`(entity_id, attribute)`, flags a group where two ACTIVE facts disagree in value (an
+invariant that `upsertFact`'s bi-temporal supersession should already prevent, but
+nothing caught it if that path was ever bypassed — migration, manual insert, race) via
+the additive `memory_lifecycle.contradiction_json` column, clears the flag once resolved,
+mirrors every change into `memory_audit`. Deterministic (no LLM), idempotent (signature
+compared before write), bounded (`MAX_ACTIVE_FACTS_SCANNED = 10_000`, `scanCapped`
+observable in stats). Never deletes/mutates a fact row. Full detail (SQL, invariant,
+matrix of which phase uses which foundation): `docs/SINAPSYS_FOUNDATIONS.md` (Mattone 8).
+
 ## Test coverage
 
-585 tests across 86 files. Pure modules (🔬) are unit-tested in isolation; store
+585 tests across 135 files (file count re-verified 2026-07-18; total test-count
+not re-run this pass, may itself be stale). Pure modules (🔬) are unit-tested in isolation; store
 methods are tested against a real SQLite. 7 failures are pre-existing
 Windows-environment daemon/hook mock issues, not Sinapsys logic.
 
