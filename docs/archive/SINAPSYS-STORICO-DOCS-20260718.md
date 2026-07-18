@@ -2702,4 +2702,34 @@ Script di misura (read-only, gitignored): `b3-backfill-copy/_recall_measure.cjs`
 
 **Fatti da tenere:** la verità scomoda documentata qui — al confine L0 non si può distinguere testo DIGITATO da Lorenzo da testo INCOLLATO da terzi, quindi la provenienza è "grezza e a livello di canale", mai perfetta — resta valida per qualunque estensione futura del modello di trust. Contenuto integrale in git history.
 
+## docs/superpowers/specs/2026-06-29-session-continuity-dove-eravamo-design.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** design "Dove eravamo" — recap extractive (mai abstractive, ogni riga ancorata), iniettato solo al primo turno. Implementato (`src/core/continuity/*`). Piano di implementazione gemello: voce Sezione B di questo stesso storico (full-paste, era gitignored).
+
+**Fatti da tenere:** la scelta "approccio B — fatti + frasi reali" (invece di un riassunto LLM astrattivo) nasce esplicitamente per evitare il difetto noto "date sbagliate" del distiller — principio di design da rispettare se si tocca di nuovo il recap. Contenuto integrale in git history.
+
+## docs/superpowers/specs/2026-06-30-grounded-trust-phase2-stakes-design.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** design della Fase 2 (gate "azione conseguente") — tassonomia one-way-doors operativa (pagamento/credenziali/distruttivo/prod/exfil) + branch "vision" (type=decision AND distinctiveness≥τ). Implementata (`stakes.ts`, commit `e665cfc`).
+
+**Fatti da tenere:** la tassonomia dei 5 domini operativi + il branch vision-decision sono la specifica ESATTA di cosa fa scattare l'ask-loop di Grounded Trust — riferimento diretto se si deve calibrare la soglia τ o aggiungere un dominio. Contenuto integrale in git history.
+
+## docs/superpowers/specs/2026-06-30-grounded-trust-phase3-4-ask-loop-and-learning-design.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** design Fase 3+4 — loop INTERRUPT (mark→ask→re-bind) + learning (confirm chiude il gate, reject fa da lapide). Implementato+deployato live (`8018dd1`/`5614fc2`/`437b5c4`/`f76594c`); ha corretto un bug reale (confirm non chiudeva il gate → ri-chiesto per sempre).
+
+**Fatti da tenere:** residuo non-bloccante — mai osservato scattare su un recall ORGANICO (solo nei test full-loop). Se in futuro si indaga "perché Grounded Trust non ha mai chiesto nulla a Lorenzo", questo è il punto di partenza. Contenuto integrale in git history.
+
+## docs/superpowers/specs/2026-06-30-implicit-priming-design.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** design dell'Idea 2 (Implicit Priming) — ricordi sotto-soglia che ri-pesano i candidati connessi via co-occorrenza (non solo `relations` esplicite, troppo sparse). Implementato+deployato (`aa16d10`).
+
+**Fatti da tenere:** il grafo esplicito misurato all'epoca (0.35 rel/entità, 59% entità isolate) rendeva il priming un no-op sulle sole `relations` — da qui la scelta di densificare via co-occorrenza (eventi che condividono entità). Sostrato verificato; un cambio di rank su una query organica non ancora osservato. Contenuto integrale in git history.
+
+## docs/superpowers/specs/2026-06-30-mistake-notebook-b3-avoidance-design.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** design B3 — la confidenza di una lezione cresce anche sull'evitamento riuscito (non solo sulla recidiva), con switch esplicito→implicito a soglia τ=3. Implementato+deployato (`1372d44`).
+
+**Fatti da tenere:** non può fiorire finché non esiste una lezione (0 oggi, corretto by design anti-aneddoto) — la macchina B3 è verificata dai test, il suo effetto organico attende la prima lezione distillata. Contenuto integrale in git history.
+
 ---
