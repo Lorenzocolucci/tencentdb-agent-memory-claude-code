@@ -2606,4 +2606,28 @@ Script di misura (read-only, gitignored): `b3-backfill-copy/_recall_measure.cjs`
 
 **Fatti da tenere:** nessuno rilevante oggi. Contenuto integrale in git history.
 
+## docs/ENTITY_CORE_BLUEPRINT.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** blueprint originale del redesign entity-centric del KB (schema entities/facts/events/relations, single-extraction stage, retrieval RRF, roadmap fasata P0-P7). Tutte le fasi risultano shippate e superate — l'implementazione reale vive oggi in `src/core/kb/*` ed è documentata in modo source-grounded in `docs/SINAPSYS-ARCHITECTURE.md`.
+
+**Fatti da tenere:** le decisioni "owner" originali restano valide e non riscritte altrove: namespace v1 globale + tag `project`; rerank dietro flag (default OFF); persona allow-list fissa (mai valori-credenziale, solo location); L1 tenuto read-only 1 release poi ritirato. Contenuto integrale in git history.
+
+## docs/HANDOFF-2026-06-24-trackB.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** handoff di sessione con l'ordine di lavoro deciso da Lorenzo (Finding 2 persona-che-mente prima di tutto, poi Finding 3 drift-sotto-carico, poi Finding 1 memorie-distintive, poi B2b Track-B wiring, poi UX "sul pezzo") — tutti gli item sono stati poi costruiti (distinctiveness, Grounded Trust, Mistake Notebook B2b, session-open banner).
+
+**Fatti da tenere:** qui si scopre per la prima volta che il blocco `<user-persona>` alternava fra la proiezione deterministica (accurata) e una narrativa cinese allucinata del vecchio plugin OpenClaw — bug di attribuzione poi risolto dalle proiezioni deterministiche P5. Contenuto integrale in git history.
+
+## docs/HANDOFF-2026-06-25.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** handoff di sessione — chiusura del silo storico chat (29.548 messaggi ingeriti, 435 segreti redatti, 0 falliti), distinctiveness scorer bloccato da test truccato (poi corretto), Voice Anchor (Idea 6 originale, non Grounded Trust) parcheggiata. Tutto superato dal lavoro successivo (reindex completato, distinctiveness live, Grounded Trust costruito su un'idea diversa/più ampia).
+
+**Fatti da tenere:** "non compiacermi" risultava il segnale #1 di standing-correction di Lorenzo (56 occorrenze nel corpus 2 anni) — dato di colore utile per capire il tono di lavoro atteso. Contenuto integrale in git history.
+
+## docs/HANDOFF-2026-06-26.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** handoff di sessione — fix del banner per-session-id (f88fd6f, deployato+verificato), saga del reindex embeddings (flag `--resume`, Scheduled Task Windows per aggirare cc che uccide i processi figli in background). Reindex poi completato, distinctiveness scorer poi corretto sui vettori reali.
+
+**Fatti da tenere:** 5 lezioni dure su Windows/PowerShell/Claude-Code process management (cc uccide i child process al teardown; redirect doppio-handle rompe; em-dash non-ASCII rompe il parsing PowerShell) — riferimento utile per QUALSIASI futuro script Windows di lunga durata in questo repo. Contenuto integrale in git history.
+
 ---
