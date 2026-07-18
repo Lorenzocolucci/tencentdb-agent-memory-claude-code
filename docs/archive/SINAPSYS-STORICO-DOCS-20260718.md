@@ -734,7 +734,300 @@ git commit -m "feat(grounded-trust): provenance trust model (Phase 1)"
 - Modify: `src/core/kb/kb-writer.ts` (add `stampProvenance` to `KbWriterStore`; call it in `applyKbDelta`)
 - Test: `src/core/kb/__tests__/provenance-write-stamp.test.ts`
 
-(Task 2 steps continue in parte 2/3 di questo storico — omesso qui solo per lunghezza del batch di scrittura, NON per contenuto realmente mancante: il piano integrale prosegue nella parte successiva.)
+```
+
+</details>
+
+<details>
+<summary>Contenuto integrale (mai versionato, gitignored — parte 2/3, Task 2-3)</summary>
+
+```markdown
+## Task 2 (continua): Stamp provenance at write time
+
+- [ ] **Step 1: Write the failing test**
+
+Create `src/core/kb/__tests__/provenance-write-stamp.test.ts`. This drives the REAL `applyKbDelta` against a real temp `VectorStore` and asserts the lifecycle row for each new event carries `trust=unverified`.
+
+```typescript
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { VectorStore } from "../../store/sqlite.js";
+import { applyKbDelta } from "../kb-writer.js";
+import { getLifecycle } from "../lifecycle-writer.js";
+import { parseProvenance } from "../provenance.js";
+
+const silent = { debug() {}, info() {}, warn() {}, error() {} };
+
+describe("provenance is stamped at KB write time", () => {
+  let dir: string;
+  let store: VectorStore;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "tdai-prov-stamp-"));
+    store = new VectorStore(path.join(dir, "vectors.db"), 4);
+    store.init({ provider: "openai", model: "text-embedding-3-small" });
+    expect(store.isDegraded()).toBe(false);
+  });
+  afterEach(() => {
+    try { store.close(); } catch { /* ignore */ }
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  it("a freshly written event is stamped conversation/unverified", async () => {
+    const result = await applyKbDelta(
+      {
+        language: "it",
+        entities: [{ ref: "e1", type: "person", name: "Lorenzo" }],
+        events: [{ ref: "ev1", type: "decision", ts: "2026-06-29T10:00:00.000Z",
+                   text: "Decisione presa insieme.", entity_refs: ["e1"],
+                   source_message_ids: ["l0_m1"] }],
+        facts: [],
+        relations: [],
+      } as never,
+      { store: store as never, namespace: "default", sessionKey: "s1",
+        now: "2026-06-29T10:00:00.000Z", logger: silent },
+    );
+
+    const ev = result.events[0]!;
+    const life = getLifecycle((store as never as { db: never }).db, ev.id, "event");
+    expect(life, "lifecycle row must exist for the new event").not.toBeNull();
+    const prov = parseProvenance(life!.provenance_json);
+    expect(prov.origin).toBe("conversation");
+    expect(prov.trust).toBe("unverified");
+    expect(prov.source_message_ids).toEqual(["l0_m1"]);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run src/core/kb/__tests__/provenance-write-stamp.test.ts`
+Expected: FAIL — the lifecycle row is null (not created at write time) / `stampProvenance` is not a function.
+
+- [ ] **Step 3a: Add `stampProvenance` to `VectorStore`**
+
+In `src/core/store/sqlite.ts`, add the imports (top of file, with the other imports):
+
+```typescript
+import { ensureLifecycle } from "../kb/lifecycle-writer.js";
+import { serializeProvenance, type ProvenanceStamp } from "../kb/provenance.js";
+```
+
+Add this method to the `VectorStore` class (near the other KB write methods; uses the existing `this.db`):
+
+```typescript
+  /**
+   * Stamp a memory unit's provenance at write time by creating its
+   * memory_lifecycle row WITH the stamp (idempotent: if the row already exists it
+   * is left untouched, so consolidation's later ensureLifecycle never clobbers it).
+   * Off the critical path: failures are swallowed + logged, never thrown.
+   */
+  stampProvenance(
+    ownerId: string,
+    ownerKind: "fact" | "event",
+    provenance: ProvenanceStamp,
+    now: string,
+    namespace = "default",
+  ): void {
+    try {
+      ensureLifecycle(this.db, {
+        ownerId,
+        ownerKind,
+        now,
+        namespace,
+        provenance: JSON.parse(serializeProvenance(provenance)),
+      });
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][provenance] stamp failed for ${ownerKind} ${ownerId} (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+```
+
+- [ ] **Step 3b: Extend `KbWriterStore` and call the stamp in `applyKbDelta`**
+
+In `src/core/kb/kb-writer.ts`:
+
+Add the import near the top:
+
+```typescript
+import { defaultProvenance } from "./provenance.js";
+```
+
+Add to the `KbWriterStore` interface (after `upsertKbFts`):
+
+```typescript
+  stampProvenance(
+    ownerId: string,
+    ownerKind: "fact" | "event",
+    provenance: import("./provenance.js").ProvenanceStamp,
+    now: string,
+    namespace?: string,
+  ): void;
+```
+
+In `applyKbDelta`, after the event is inserted (right after `events.push(inserted);`, inside the events loop):
+
+```typescript
+    store.stampProvenance(
+      inserted.id,
+      "event",
+      defaultProvenance(ev.source_message_ids ?? []),
+      now,
+      namespace,
+    );
+```
+
+And after the fact is upserted (right after `facts.push(fact);`, inside the facts loop):
+
+```typescript
+    store.stampProvenance(fact.id, "fact", defaultProvenance(), now, namespace);
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run src/core/kb/__tests__/provenance-write-stamp.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Run the broader store + kb suites to confirm no regression**
+
+Run: `npx vitest run src/core/kb src/core/store`
+Expected: PASS (pre-existing unrelated failures, if any, must match the baseline — do NOT fix here).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/core/store/sqlite.ts src/core/kb/kb-writer.ts src/core/kb/__tests__/provenance-write-stamp.test.ts
+git commit -m "feat(grounded-trust): stamp provenance at KB write time (Phase 1)"
+```
+
+---
+
+## Task 3: The `confirmMemory` upgrade hook
+
+**Files:**
+- Modify: `src/core/kb/lifecycle-writer.ts` (add `confirmProvenance`)
+- Modify: `src/core/store/sqlite.ts` (add `confirmMemory` method orchestrating lifecycle + facts)
+- Test: `src/core/store/__tests__/confirm-memory.test.ts`
+
+- [ ] **Step 1: Write the failing test**
+
+Create `src/core/store/__tests__/confirm-memory.test.ts`:
+
+```typescript
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { VectorStore } from "../sqlite.js";
+import { getLifecycle } from "../../kb/lifecycle-writer.js";
+import { parseProvenance, defaultProvenance } from "../../kb/provenance.js";
+
+describe("confirmMemory upgrades trust and records the trail", () => {
+  let dir: string;
+  let store: VectorStore;
+  const now = "2026-06-29T12:00:00.000Z";
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "tdai-confirm-"));
+    store = new VectorStore(path.join(dir, "vectors.db"), 4);
+    store.init({ provider: "openai", model: "text-embedding-3-small" });
+    // Seed: a lifecycle row for an event, stamped unverified.
+    store.stampProvenance("ev-1", "event", defaultProvenance(["l0_1"]), now);
+  });
+  afterEach(() => {
+    try { store.close(); } catch { /* ignore */ }
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  it("flips provenance to trusted and writes exactly one audit row (actor=user)", () => {
+    const db = (store as never as { db: never }).db;
+
+    store.confirmMemory({ ownerId: "ev-1", ownerKind: "event", now: "2026-06-29T13:00:00.000Z" });
+
+    const life = getLifecycle(db, "ev-1", "event");
+    const prov = parseProvenance(life!.provenance_json);
+    expect(prov.origin).toBe("lorenzo_confirmed");
+    expect(prov.trust).toBe("trusted");
+    expect(prov.confirmed_by).toBe("lorenzo");
+    expect(prov.confirmed_at).toBe("2026-06-29T13:00:00.000Z");
+
+    const audit = (db as unknown as {
+      prepare: (s: string) => { all: (...a: unknown[]) => unknown[] };
+    })
+      .prepare("SELECT operation, actor FROM memory_audit WHERE owner_id = ? AND owner_kind = ?")
+      .all("ev-1", "event") as Array<{ operation: string; actor: string }>;
+    const confirmRows = audit.filter((r) => r.operation === "confirm");
+    expect(confirmRows).toHaveLength(1);
+    expect(confirmRows[0]!.actor).toBe("user");
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run src/core/store/__tests__/confirm-memory.test.ts`
+Expected: FAIL — `store.confirmMemory is not a function`.
+
+- [ ] **Step 3a: Add `confirmProvenance` to `lifecycle-writer.ts`**
+
+Add to `src/core/kb/lifecycle-writer.ts` (it already imports `recordAudit`; add the provenance import at the top):
+
+```typescript
+import { parseProvenance, serializeProvenance, deriveTrust } from "./provenance.js";
+
+export interface ConfirmProvenanceParams {
+  ownerId: string;
+  ownerKind: string;
+  now: string;
+}
+
+/**
+ * Flip a memory unit's provenance stamp to lorenzo_confirmed/trusted and write one
+ * audit row (operation="confirm", actor="user"). Creates the lifecycle row first if
+ * missing. Returns the updated row, or null if absent after.
+ */
+export function confirmProvenance(
+  db: DatabaseSync,
+  p: ConfirmProvenanceParams,
+): LifecycleRow | null {
+  const cur = ensureLifecycle(db, { ownerId: p.ownerId, ownerKind: p.ownerKind, now: p.now });
+  const before = parseProvenance(cur.provenance_json);
+  const after = {
+    ...before,
+    origin: "lorenzo_confirmed" as const,
+    trust: deriveTrust("lorenzo_confirmed"),
+    confirmed_by: "lorenzo" as const,
+    confirmed_at: p.now,
+  };
+  db.prepare(
+    `UPDATE memory_lifecycle SET provenance_json = ?, updated_time = ?
+       WHERE owner_id = ? AND owner_kind = ?`,
+  ).run(serializeProvenance(after), p.now, p.ownerId, p.ownerKind);
+
+  recordAudit(
+    db,
+    {
+      ownerId: p.ownerId,
+      ownerKind: p.ownerKind,
+      operation: "confirm",
+      actor: "user",
+      before: { trust: before.trust, origin: before.origin },
+      after: { trust: after.trust, origin: after.origin },
+      reason: "confirmed by Lorenzo",
+      namespace: cur.namespace,
+    },
+    p.now,
+  );
+  return getLifecycle(db, p.ownerId, p.ownerKind);
+}
+```
+
+(Il piano prosegue in parte 3/3: Task 3 step 3b, Task 4, Task 5, self-review.)
 ```
 
 </details>
