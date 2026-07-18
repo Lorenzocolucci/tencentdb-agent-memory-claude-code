@@ -2411,4 +2411,173 @@ Expected: PASS (3/3).
 
 </details>
 
+<details>
+<summary>Contenuto integrale (mai versionato, gitignored — parte 2/2, Task 2-3 + gate live + risultati Task 0)</summary>
+
+```markdown
+## Task 2 — Wiring: la situazione semina il recall primario (TDD sull'integrazione)
+
+Responsabilità: in `runKbRecall`, costruire i semi-situazione, farne il recall associativo **primario** via `associativeExpand`, e fonderlo col cue-da-testo — **senza** scansione globale.
+
+**Files:**
+- Modify: `src/core/hooks/auto-recall.ts` — `runKbRecall` (righe ~628–730) + il chiamante `performAutoRecallInner` (~256) che deve passare `sessionKey`, `namespace`, `situation`.
+- Test: `src/core/hooks/__tests__/auto-recall-situation-seed.test.ts`
+
+- [ ] **Step 1: Scrivi il test che fallisce (il ribaltamento: nessun vettore, il ricordo non-nominato emerge dalla situazione)**
+
+```typescript
+import { describe, it, expect, vi } from "vitest";
+// Costruisci uno store fake in cui:
+//  - listEventsBySession ritorna eventi della sessione precedente con entities=["ent_sit"]
+//  - associativeExpand, dato ["ent_sit"], ritorna una memoria owner "fact_assoc" che il
+//    saluto NON nomina mai
+//  - searchKbVector è una spy che DEVE restare a 0 chiamate
+// Poi invoca il path System-1 (runKbRecall via performAutoRecall con userText="Ciao Socio")
+// ATTESO: i risultati contengono "fact_assoc"; searchKbVector NON chiamato (vec=0).
+```
+(Il test concreto seguirà la forma dei fake già usati in `auto-recall-recent-event.test.ts` e `retrieval.test.ts`; asserisce: `expect(vectorSpy).not.toHaveBeenCalled()` e `expect(ids).toContain("fact_assoc")`.)
+
+- [ ] **Step 2: Esegui — deve fallire**
+
+Run: `npx vitest run src/core/hooks/__tests__/auto-recall-situation-seed.test.ts`
+Expected: FAIL — oggi i semi vengono da `visible` (query), non dalla situazione; `fact_assoc` non emerge dal saluto.
+
+- [ ] **Step 3: Implementa il wiring in `runKbRecall`**
+
+Estendi la firma con il contesto-situazione e semina l'associativo dalla situazione PRIMA (primario), poi fondi col cue-da-testo:
+```typescript
+// firma: aggiungi ctx situazione
+async function runKbRecall(
+  userText: string, cfg: MemoryTdaiConfig, logger: Logger | undefined,
+  vectorStore?: IMemoryStore, embeddingService?: EmbeddingService, projectName?: string,
+  sit?: { sessionKey: string; namespace: string; situation?: SessionSituation },
+): Promise<KbRecallResult[]> {
+  if (!vectorStore) return [];
+  try {
+    // Cue-da-testo (SECONDARIO), invariato: FTS + entity-match, niente scansione globale.
+    let results = await kbRecall(redactSecrets(userText), {
+      store: vectorStore, embeddingService,
+      maxResults: cfg.recall.maxResults ?? 5, rerank: cfg.recall.rerank ?? false,
+      embeddingTimeoutMs: cfg.embedding?.recallTimeoutMs ?? cfg.embedding?.timeoutMs,
+      skipVector: true, logger,
+    });
+    let visible = /* ...mapping esistente in KbRecallResult[]... */ results;
+
+    const expand = (vectorStore as { associativeExpand?: Function }).associativeExpand;
+    const seenKeys = new Set(visible.map((r) => `${r.owner_kind}:${r.owner_id}`));
+
+    // ── PRIMARIO: la SITUAZIONE è l'indirizzo ──────────────────────────────
+    if (typeof expand === "function" && sit?.sessionKey) {
+      const seeds = buildSituationSeeds(vectorStore, {
+        sessionKey: sit.sessionKey, namespace: sit.namespace, situation: sit.situation, logger,
+      });
+      if (seeds.length > 0) {
+        const assoc = expand.call(vectorStore, seeds.map((s) => s.id), { maxNodes: 8 }) as
+          Array<{ owner_id: string; owner_kind: "fact"|"event"; text: string; entity_id: string; activation: number }>;
+        for (const a of assoc) {
+          const key = `${a.owner_kind}:${a.owner_id}`;
+          if (seenKeys.has(key)) continue;
+          seenKeys.add(key);
+          visible = visible.concat({
+            owner_id: a.owner_id, owner_kind: a.owner_kind, score: a.activation,
+            text: a.text, entity_id: a.entity_id, associative: true,
+          } as KbRecallResult);
+        }
+        logger?.debug?.(`${TAG} [kb] situation-seeded associative: seeds=${seeds.length} added=${assoc.length}`);
+      }
+    }
+
+    // ── SECONDARIO (invariato): espandi anche dai match della query ─────────
+    if (typeof expand === "function") {
+      const querySeeds = [...new Set(visible.filter((r) => !r.associative).map((r) => r.entity_id).filter(Boolean))];
+      if (querySeeds.length > 0) {
+        const assoc2 = expand.call(vectorStore, querySeeds, { maxNodes: 6 }) as any[];
+        for (const a of assoc2) {
+          const key = `${a.owner_kind}:${a.owner_id}`;
+          if (seenKeys.has(key)) continue;
+          seenKeys.add(key);
+          visible = visible.concat({ owner_id: a.owner_id, owner_kind: a.owner_kind, score: a.activation, text: a.text, entity_id: a.entity_id, associative: true } as KbRecallResult);
+        }
+      }
+    }
+
+    // Riordino locale: attivazione/score decrescente, poi top-K.
+    visible.sort((x, y) => (y.score ?? 0) - (x.score ?? 0));
+    return visible.slice(0, (cfg.recall.maxResults ?? 5) + 4);
+  } catch (err) {
+    logger?.warn?.(`${TAG} [kb] KB recall failed (non-fatal): ${msg(err)}`);
+    return [];
+  }
+}
+```
+E nel chiamante (`performAutoRecallInner`, dentro `runSearch`), passa il contesto:
+```typescript
+const sit = { sessionKey: params.sessionKey, namespace: "default",
+              situation: params.sessionKey ? sessionSituationByKey?.get(params.sessionKey) : undefined };
+const kbResults = await runKbRecall(userText, cfg, logger, vectorStore, embeddingService, projectName, sit);
+```
+> Verifica al primo step: `performAutoRecallInner` ha accesso alla rolling `SessionSituation`? Oggi vive in `tdai-core` (`sessionSituationByKey`). Se NON è passata all'hook, per l'incremento A si passa `situation: undefined` (i semi vengono da recap+fingerprint, corretto al session-open) e il threading della situation si rimanda a Task 3. Confermare con: `grep -n "sessionSituationByKey\|performAutoRecall(" src/core/tdai-core.ts`.
+
+- [ ] **Step 4: Esegui il test — deve passare, con `searchKbVector` a 0 chiamate**
+
+Run: `npx vitest run src/core/hooks/__tests__/auto-recall-situation-seed.test.ts`
+Expected: PASS; asserzione `vectorSpy` non chiamata verde.
+
+- [ ] **Step 5: Regressione — nessun test rotto**
+
+Run: `npx vitest run src/core/kb src/core/hooks`
+Expected: verdi (inclusi i 7 `retrieval` + i ~113 hook). Se il cue-da-testo cambia forma output, adegua i test esistenti SOLO se la forma è legittima; in dubbio, FERMATI e chiedi a Lorenzo (regola: si fixa il codice, non i test).
+
 ---
+
+## Task 3 — (condizionale) Cornerstone come 4ª sorgente + threading della rolling situation
+
+Solo se Task 0 mostra che recap+fingerprint non bastano a far emergere ricordi buoni. Aggiunge: (a) la 4ª sorgente cornerstone in `situation-cue.ts` (dai cornerstone-event → `entities_json`), (b) il passaggio della rolling `SessionSituation` da `tdai-core` all'hook. TDD come Task 1/2. Dettaglio rimandato all'esito di Task 0 per non speculare.
+
+---
+
+## Gate live (porta a senso unico — richiede semaforo di Lorenzo)
+
+Costruzione documenti/test = autonoma. **Toccare i servizi vivi NO senza ok di Lorenzo:**
+1. `npm run build` (tsdown) → verde.
+2. Gateway: `C:\Users\lo\tdai-gateway\stop-gateway.ps1` poi `start-gateway.ps1`.
+3. Verifica live: `/recall` su una sessione reale (Sofia `session_key`) → banner **completo** + **<4s**, log `[kb-recall] … vec=0` + `situation-seeded associative: seeds=N added=M` con M>0, ≥1 ricordo associativo non nominato dal saluto.
+4. Solo allora: commit sul branch `feat/memory-excellence` (MAI main) + aggiorna scheda memoria `sinapsys-recall-redesign`.
+
+## Definition of done (Incremento A)
+Test verdi (situation-cue unit + integrazione anti-scan + regressione) **e** verifica live (banner<4s, vec=0, seeds=situazione, ≥1 ricordo associativo). Poi si progetta B (due marce + Hebbian).
+
+## Self-review (fatto)
+- **Copertura spec:** §4.2 N1 → Task 1; N2 (collassato in riuso `associativeExpand`) → Task 2; M1 wiring → Task 2; §6 test → Task 1/2; §7 → Task 0; cornerstone (4ª sorgente) → Task 3 condizionale (deviazione documentata, non silenziosa).
+- **Placeholder:** nessun TBD; il codice-integrazione di Task 2 riusa il mapping esistente (indicato con commento `/* ...mapping esistente... */` perché è codice GIÀ presente da preservare, non da inventare).
+- **Coerenza tipi:** `SituationSeed`, `buildSituationSeeds`, `associativeExpand`, `KbRecallResult` usati coerenti tra i task; firme allineate alle "Firme verificate".
+
+---
+
+## Task 0 — risultati (ESEGUITO read-only, 2026-07-07, DB live `tdai-memory-tdai-local/vectors.db` 1,8 GB)
+
+Totali grafo: **events=11.693, relations=6.054, entities=9.871** (coerente col digest ×14).
+
+| Misura | Sofia (`3e78aebfa57691fb`) | Sinapsys (`cd28f537622ba8f8`) |
+|---|---|---|
+| Eventi recenti (30) con `entities_json` non vuoto | **27/30** | **26/30** |
+| Semi-entità distinti dai 30 eventi recenti | 26 | 53 |
+| Grado medio del campione semi | 43,25 (hub `Sofia AI`=218) | 4,20 |
+| Entità nuove raggiunte a **1 hop** da ~20 semi | **728** | **39** |
+| `session_recap` con entità | — | **0 / 41 (tutti vuoti)** |
+
+**Decisioni ancorate ai dati (non ipotesi):**
+1. **§7 #1 confermato:** i 41 `session_recap` hanno 0 entità → seminare dagli **eventi recenti**, non dal recap. (Riflesso in Task 1: `recentEventsByTs`.)
+2. **§7 #2 confermato:** semi ricchi (26-53) e raggiungibilità reale (39-728 a 1 hop) → il recall associativo-dalla-situazione **funziona sui dati veri**. Procedi come progettato.
+3. **Hub fan-out reale** (nodi progetto grado 44-218): i cap esistenti `topKPerNode:8`/`maxNodes` lo controllano. Tuning futuro (Incremento B): down-weight dei semi ad altissimo grado (nodi globali = cue poco specifici). NON in A.
+4. **Fallback text-cue essenziale** per le entità isolate (grado 0, ~8/20 in Sofia): già previsto come sorgente secondaria. Confermato necessario.
+5. **`session_key` = questo progetto (`cd28f537622ba8f8`)** ha `session_id` corrente `add6f9a2-…` con soli 2 eventi all'apertura → conferma perché NON filtrare per `session_id`.
+
+Script di misura (read-only, gitignored): `b3-backfill-copy/_recall_measure.cjs`, `_recall_measure2.cjs`.
+```
+
+</details>
+
+---
+
+# Sezione C — repo tencentdb-agent-memory, file TRACKED (summary + `git rm`)
