@@ -225,3 +225,53 @@ Chiuse la **ricerca** (7/7 ambiti, 2 round verificati), costruito l'**hub** C:\S
 </details>
 
 ---
+
+## C:\Sinapsys\05-handoff\2026-06-24.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** handoff di sessione — Proactive Injection (Track A) chiusa end-to-end + Fase A live, tutto su `main` del fork all'epoca; superato da tutto il lavoro successivo (Grounded Trust, Mistake Notebook B1-B3, Implicit Priming, recall associativo-first, L4 v1). Mai versionato → contenuto integrale sotto.
+
+**Fatti da tenere:** qui nasce il fix critico "i ricordi rilevanti venivano scartati al confine HTTP" (proactive injection di fatto spenta) — poi `composeRecallContext` in `recall-context.ts`. 3 known-issues aperti all'epoca (redazione segreti pre-embed, looksLikePromptInjection, build:scripts rotto) — tutti poi chiusi (vedi Grounded Trust + sanitize.ts).
+
+<details>
+<summary>Contenuto integrale (mai versionato — 32 righe)</summary>
+
+```markdown
+# Handoff — 24 giugno 2026 (sessione lunga)
+
+## In una riga
+Costruita la **Proactive Injection** (Track A, la memoria che ti viene incontro) end-to-end + chiusa la **Fase A live**, tutto su `main` del fork. Sinapsys ora si auto-protegge dall'errore che l'ha ispirato (inietta i propri principi).
+
+## Stato verificato (tutto LIVE + PUSHATO)
+- **GitHub:** `fork/main` = `main` locale = commit `0f9f913` (17 commit, fast-forward, secret-scan pulito). Remoti: `fork`=tuo (target), `origin`=YOMXXX e `tencent`=upstream → NON pushare lì.
+- **Gateway live** (PID 8708, /health 200) col codice nuovo. Suite motore **199/199 verde**.
+- **Fatto e verificato live:**
+  - Fase A·3 — consolidamento agganciato a session-end (commit 93abfad).
+  - Track A·1 — il gateway consegna i ricordi rilevanti su /recall (413ddbb).
+  - Track A·2 — principi vincolanti iniettati in cima a ogni sessione (4d6f273).
+  - Track A·3+4 — proactive injection per SITUAZIONE: tocchi un file → arrivano i ricordi su quel file, silenzio se nulla di rilevante (0f9f913). **Endpoint /observe verificato; il hook PostToolUse si attiva alla PROSSIMA sessione CC.**
+
+## Prossimo passo (deciso insieme)
+Sessione NUOVA e pulita → affrontare i 3 "known issues" reali, **segreti per primi**. Lista triata in `sinapsys-known-issues`:
+1. [SECURITY HIGH] redazione segreti prima di write/embed L1.
+2. [SECURITY MEDIUM] riaccendere `looksLikePromptInjection` (sanitize.ts:153).
+3. [DX] sistemare `build:scripts` rotto + script typecheck engine.
+Poi: rifiniture Track A (principi per-progetto, accumulo context_fingerprints) e **Track B** (Mistake Notebook profondo — ridisegno, vedi `sinapsys-phase-b-direction`).
+
+## Trappole (non ricascarci)
+- ⚠️ `db.exec` di node:sqlite = falso positivo del security hook → usa `db.prepare(sql).run()`.
+- ⚠️ Test JSON con path Windows nella shell: i `\\` collassano → JSON invalido. Costruisci con `String.fromCharCode(92)`+`JSON.stringify`. Il vero hook è sempre valido.
+- ⚠️ I riavvii gateway backgrounded a volte non ricaricano: kill esplicito del PID sulla porta, poi start.
+- ⚠️ `npm run build` completo è rotto a build:scripts → usa solo `npm run build:plugin`.
+- ⚠️ Mai push su `origin`/`tencent`. Bypass hook push-main: refspec `feat/...:main`.
+
+## Dove guardare
+- Direzione viva: schede `sinapsys-dual-track-direction`, `sinapsys-phase-b-direction`, `sinapsys-known-issues`, `sinapsys-build-state-verified`.
+- Mappa codice: `C:\Sinapsys\02-architecture\INTERCONNECTION-MAP.md` (sezioni C.4–C.6).
+- File Fase B su disco (untracked, da tenere): `repo/src/core/kb/lessons-*.ts` (+ test).
+```
+
+</details>
+
+---
+
+# Sezione B — repo tencentdb-agent-memory, file UNTRACKED (full-paste)
