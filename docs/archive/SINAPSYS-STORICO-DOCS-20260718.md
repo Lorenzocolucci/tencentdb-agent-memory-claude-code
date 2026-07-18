@@ -2076,4 +2076,96 @@ git commit -m "feat(continuity): inject 'Dove eravamo' recap on session open"
 
 </details>
 
+<details>
+<summary>Contenuto integrale (mai versionato, gitignored — parte 4/4, Task 10-11 + self-review)</summary>
+
+```markdown
+## Task 10: Non-circular eval against real handoffs
+
+**Files:**
+- Create: `src/core/continuity/__tests__/recap-eval.integration.test.ts`
+
+**Purpose:** prove the recap's extracted next-step is meaningful by comparing against the hand-written `docs/HANDOFF-*.md` next-steps (independent ground truth). This is a *measurement*, not a pass/fail gate on exact text — assert overlap, and `console.log` the comparison for human judgment.
+
+- [ ] **Step 1: Write the eval test**
+
+```ts
+import { describe, it, expect } from "vitest";
+import { existsSync, readFileSync } from "node:fs";
+import { buildRecapText } from "../recap-builder.js";
+import { selectThread } from "../recap-selector.js";
+// Open the REAL vectors.db (read-only) exactly like distinctiveness-real-vectors.integration.test.ts
+// (DatabaseSync with { open: true }, no extension needed for the events table).
+
+const VECTORS_DB = "C:/Users/lo/.claude/plugins/data/tdai-memory-tdai-local/vectors.db";
+const HANDOFF = "docs/HANDOFF-2026-06-26.md";
+
+describe.runIf(existsSync(VECTORS_DB) && existsSync(HANDOFF))("recap eval vs handoff", () => {
+  it("a recent session's thread overlaps the handoff's next-step vocabulary", () => {
+    // 1. pick the most recent session_key from events
+    // 2. selectThread(its events) → buildRecapText
+    // 3. tokenize handoff 'NEXT' lines + recap; assert non-trivial token overlap
+    // log both for human inspection
+    expect(true).toBe(true); // replace with real overlap assertion once tokens computed
+  });
+});
+```
+
+- [ ] **Step 2: Flesh out the real query + overlap metric** (open db, `SELECT session_key FROM events ORDER BY ts DESC LIMIT 1`, gather that session's events, build recap, compute Jaccard overlap of lowercased word-sets vs the handoff NEXT section; assert overlap > 0.1 and log the numbers). Follow the DB-open pattern from `distinctiveness-real-vectors.integration.test.ts`.
+
+- [ ] **Step 3: Run**
+
+Run: `npx vitest run src/core/continuity/__tests__/recap-eval.integration.test.ts`
+Expected: PASS (or SKIP if the db/handoff is absent), with the comparison logged.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/core/continuity/__tests__/recap-eval.integration.test.ts
+git commit -m "test(continuity): non-circular recap eval vs real handoff next-steps"
+```
+
+---
+
+## Task 11: Full verification + live deploy
+
+- [ ] **Step 1: Full build + full continuity suite**
+
+Run: `npm run build && npx vitest run src/core/continuity`
+Expected: Build complete; all continuity tests PASS.
+
+- [ ] **Step 2: Regression — run the broader recall/store suites**
+
+Run: `npx vitest run src/core/hooks src/core/store src/utils/__tests__/sanitize* `
+Expected: no regressions.
+
+- [ ] **Step 3: Deploy live** (Lorenzo authorizes gateway restart per autonomy mandate)
+
+```bash
+# stop + restart the independent gateway so the new dist is loaded
+powershell.exe -ExecutionPolicy Bypass -File C:/Users/lo/tdai-gateway/stop-gateway.ps1
+powershell.exe -ExecutionPolicy Bypass -File C:/Users/lo/tdai-gateway/start-gateway.ps1
+```
+Verify `/health` returns `status:ok`, `embedding:ok`.
+
+- [ ] **Step 4: Live smoke test** — end a session, then open a new session in this project; confirm a `<session-recap>` "Dove eravamo" block appears on the first turn. Verify it shows anchored thread lines, not a no-op.
+
+- [ ] **Step 5: Push**
+
+```bash
+git push fork feat/memory-excellence
+```
+
+---
+
+## Self-Review (done at plan-write time)
+
+- **Spec coverage:** capture (Task 6+8), injection (Task 4+9), first-class atom (Task 6), anchored/omit-unanchored (Task 2), deterministic retrieval no-embeddings (Task 5+7), off-critical-path/error-swallowed (Tasks 6,7,8,9), sanitize allow-list (Task 4), non-circular eval (Task 10). Git facts = explicitly Phase 2 (out of scope, stated). ✓
+- **Refinement logged:** injection moved from `stableParts` (spec §4) to the first-turn branch — strictly better (no per-turn cost, no cache-bust). ✓
+- **Type consistency:** `RecapInput`/`ThreadItem` defined Task 1, used Tasks 2/3/6; `buildRecapText` (T2), `selectThread` (T3), `buildSessionRecapBlock` (T4), `captureSessionRecap` (T6), `latestRecapBlock` (T7), store `listEventsBySession`/`latestEventByProjectType` (T5) — names consistent across tasks. ✓
+- **Known soft spots (honest):** Task 5 test must copy the real `VectorStore` init harness from a sibling store test (not invented); Task 10 step 2 must be fleshed with the real overlap metric. Both flagged inline.
+```
+
+</details>
+
 ---
