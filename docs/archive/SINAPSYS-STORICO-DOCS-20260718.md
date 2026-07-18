@@ -1769,4 +1769,311 @@ git commit -m "feat(store): listEventsBySession + latestEventByProjectType queri
 
 </details>
 
+<details>
+<summary>Contenuto integrale (mai versionato, gitignored — parte 3/4, Task 6-9)</summary>
+
+```markdown
+## Task 6: recap-capture (session-end glue)
+
+**Files:**
+- Create: `src/core/continuity/recap-capture.ts`
+- Test: `src/core/continuity/__tests__/recap-capture.test.ts`
+
+- [ ] **Step 1: Write the failing test (fake store, no real DB)**
+
+```ts
+import { describe, it, expect, vi } from "vitest";
+import { captureSessionRecap } from "../recap-capture.js";
+import type { KbEvent, KbEventInput } from "../../store/types.js";
+
+function evt(p: Partial<KbEvent>): KbEvent {
+  return { id: "e", ts: "2026-06-29T10:00:00.000Z", recorded_at: "r", session_key: "s1",
+    session_id: "sid", namespace: "default", project: "proj", type: "decision",
+    text: "chose B", language: "it", entities: [], source_message_ids: ["m1"], ...p };
+}
+
+describe("captureSessionRecap", () => {
+  it("inserts a session_recap event built from the session's thread", () => {
+    const inserted: KbEventInput[] = [];
+    const store = {
+      listEventsBySession: () => [evt({}), evt({ id: "e2", type: "task", text: "next", source_message_ids: ["m2"], ts: "2026-06-29T10:05:00.000Z" })],
+      insertEvent: (e: KbEventInput) => { inserted.push(e); return evt({}); },
+    } as any;
+    captureSessionRecap({ store, sessionKey: "s1", now: "2026-06-29T11:00:00.000Z" });
+    expect(inserted).toHaveLength(1);
+    expect(inserted[0].type).toBe("session_recap");
+    expect(inserted[0].project).toBe("proj");
+    expect(inserted[0].text).toContain("chose B");
+    expect(inserted[0].sourceMessageIds).toEqual(expect.arrayContaining(["m1", "m2"]));
+  });
+  it("does NOT insert when there is no thread (only observations)", () => {
+    const insert = vi.fn();
+    const store = { listEventsBySession: () => [evt({ type: "observation" })], insertEvent: insert } as any;
+    captureSessionRecap({ store, sessionKey: "s1", now: "2026-06-29T11:00:00.000Z" });
+    expect(insert).not.toHaveBeenCalled();
+  });
+  it("never throws when the store lacks listEventsBySession", () => {
+    expect(() => captureSessionRecap({ store: {} as any, sessionKey: "s1", now: "n" })).not.toThrow();
+  });
+});
+```
+
+- [ ] **Step 2: Run test, verify it fails**
+
+Run: `npx vitest run src/core/continuity/__tests__/recap-capture.test.ts`
+Expected: FAIL — cannot find module `../recap-capture.js`.
+
+- [ ] **Step 3: Implement**
+
+```ts
+/**
+ * recap-capture — session-end glue that turns a finished session into a
+ * first-class `session_recap` KbEvent. Reads the session's own events, selects
+ * the anchored thread, builds the recap text, and inserts it.
+ *
+ * Off the critical path: every failure is swallowed (memory must never break
+ * the conversation). No-ops when the store lacks the required capabilities.
+ */
+import type { IMemoryStore } from "../store/types.js";
+import { selectThread } from "./recap-selector.js";
+import { buildRecapText } from "./recap-builder.js";
+
+const TAG = "[memory-tdai] [continuity]";
+const RECAP_TYPE = "session_recap";
+
+interface Logger { debug?: (m: string) => void; warn?: (m: string) => void; }
+
+export function captureSessionRecap(params: {
+  store: IMemoryStore;
+  sessionKey: string;
+  now: string;
+  logger?: Logger;
+}): void {
+  const { store, sessionKey, now, logger } = params;
+  try {
+    if (!sessionKey) return;
+    if (typeof store.listEventsBySession !== "function" || typeof store.insertEvent !== "function") {
+      logger?.debug?.(`${TAG} store lacks recap capabilities — skipping capture`);
+      return;
+    }
+    const events = store.listEventsBySession(sessionKey);
+    if (events.length === 0) return;
+
+    const input = selectThread(events, now);
+    const text = buildRecapText(input);
+    if (!text) {
+      logger?.debug?.(`${TAG} no anchored thread for session=${sessionKey} — no recap`);
+      return;
+    }
+
+    const provenance = new Set<string>();
+    for (const item of input.thread) for (const id of item.sourceMessageIds) provenance.add(id);
+    if (input.nextStep) for (const id of input.nextStep.sourceMessageIds) provenance.add(id);
+
+    store.insertEvent({
+      ts: now,
+      sessionKey,
+      project: input.project,
+      type: RECAP_TYPE,
+      text,
+      sourceMessageIds: [...provenance],
+    });
+    logger?.debug?.(`${TAG} session_recap captured for project=${input.project} session=${sessionKey}`);
+  } catch (err) {
+    logger?.warn?.(`${TAG} recap capture failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+```
+
+- [ ] **Step 4: Run test, verify it passes**
+
+Run: `npx vitest run src/core/continuity/__tests__/recap-capture.test.ts`
+Expected: PASS (3 tests).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/core/continuity/recap-capture.ts src/core/continuity/__tests__/recap-capture.test.ts
+git commit -m "feat(continuity): capture session_recap event at session end"
+```
+
+---
+
+## Task 7: recap-retrieval (latest recap → block)
+
+**Files:**
+- Create: `src/core/continuity/recap-retrieval.ts`
+- Test: `src/core/continuity/__tests__/recap-retrieval.test.ts`
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+import { describe, it, expect } from "vitest";
+import { latestRecapBlock } from "../recap-retrieval.js";
+import type { KbEvent } from "../../store/types.js";
+
+function recapEvt(text: string): KbEvent {
+  return { id: "r", ts: "2026-06-29T11:00:00.000Z", recorded_at: "r", session_key: "s",
+    session_id: "sid", namespace: "default", project: "proj", type: "session_recap",
+    text, language: "it", entities: [], source_message_ids: [] };
+}
+
+describe("latestRecapBlock", () => {
+  it("returns a <session-recap> block for the latest recap of the project", () => {
+    const store = { latestEventByProjectType: (p: string, t: string) =>
+      p === "proj" && t === "session_recap" ? recapEvt("DOVE ERAVAMO — proj\n- (decision) x [anchor: msg m1]") : undefined } as any;
+    const out = latestRecapBlock({ store, project: "proj" });
+    expect(out).toContain("<session-recap>");
+    expect(out).toContain("DOVE ERAVAMO — proj");
+  });
+  it("returns '' when no recap exists or project is empty", () => {
+    const store = { latestEventByProjectType: () => undefined } as any;
+    expect(latestRecapBlock({ store, project: "proj" })).toBe("");
+    expect(latestRecapBlock({ store, project: "" })).toBe("");
+  });
+  it("returns '' and never throws when store lacks the method", () => {
+    expect(latestRecapBlock({ store: {} as any, project: "proj" })).toBe("");
+  });
+});
+```
+
+- [ ] **Step 2: Run test, verify it fails**
+
+Run: `npx vitest run src/core/continuity/__tests__/recap-retrieval.test.ts`
+Expected: FAIL — cannot find module `../recap-retrieval.js`.
+
+- [ ] **Step 3: Implement**
+
+```ts
+/**
+ * recap-retrieval — fetch the latest session_recap for a project and format it
+ * for injection. Off the critical path: returns "" on any failure.
+ */
+import type { IMemoryStore } from "../store/types.js";
+import { buildSessionRecapBlock } from "./recap-injection.js";
+
+const RECAP_TYPE = "session_recap";
+
+interface Logger { debug?: (m: string) => void; warn?: (m: string) => void; }
+
+export function latestRecapBlock(params: {
+  store: IMemoryStore;
+  project: string;
+  logger?: Logger;
+}): string {
+  const { store, project, logger } = params;
+  try {
+    if (!project) return "";
+    if (typeof store.latestEventByProjectType !== "function") return "";
+    const recap = store.latestEventByProjectType(project, RECAP_TYPE);
+    if (!recap) return "";
+    return buildSessionRecapBlock(recap.text);
+  } catch (err) {
+    logger?.warn?.(`[memory-tdai] [continuity] recap retrieval failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    return "";
+  }
+}
+```
+
+- [ ] **Step 4: Run test, verify it passes**
+
+Run: `npx vitest run src/core/continuity/__tests__/recap-retrieval.test.ts`
+Expected: PASS (3 tests).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/core/continuity/recap-retrieval.ts src/core/continuity/__tests__/recap-retrieval.test.ts
+git commit -m "feat(continuity): retrieve latest recap block for a project"
+```
+
+---
+
+## Task 8: Wire capture into `handleSessionEnd`
+
+**Files:**
+- Modify: `src/core/tdai-core.ts` (`handleSessionEnd`, after `scheduleConsolidation` block at :439-446)
+
+- [ ] **Step 1: Add the capture call (fire-and-forget, tracked in bgTasks, after the flush)**
+
+In `handleSessionEnd`, AFTER the `scheduleConsolidation({...})` call and BEFORE the per-session state cleanup (`this.injectedFilesBySession.delete(...)`), add. Import `captureSessionRecap` at the top of the file.
+
+```ts
+    // "Dove eravamo" — capture this session into a first-class session_recap
+    // event (Sinapsys session-continuity). Deferred to a macrotask so the
+    // /session/end response flushes first; tracked in bgTasks so destroy()
+    // drains it before the DB closes. Errors are swallowed inside.
+    if (this.vectorStore) {
+      const store = this.vectorStore;
+      const task = new Promise<void>((resolve) => {
+        setImmediate(() => {
+          try {
+            captureSessionRecap({ store, sessionKey, now: new Date().toISOString(), logger: this.logger });
+          } finally {
+            resolve();
+          }
+        });
+      });
+      this.bgTasks.add(task);
+      void task.then(() => this.bgTasks.delete(task));
+    }
+```
+
+- [ ] **Step 2: Build to verify it compiles**
+
+Run: `npm run build`
+Expected: "Build complete" (the pre-existing `build:scripts` tsconfig error is unrelated and may still appear AFTER "Build complete").
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add src/core/tdai-core.ts
+git commit -m "feat(continuity): capture session_recap on session end (fire-and-forget)"
+```
+
+---
+
+## Task 9: Wire injection into `performAutoRecall` (first-turn only)
+
+**Files:**
+- Modify: `src/core/hooks/auto-recall.ts` (first-turn banner branch around :368-384; params/destructure around :205-207)
+
+- [ ] **Step 1: Ensure `vectorStore` and `projectName` are in scope (they already are — see :207) and import `latestRecapBlock`**
+
+Add at the top with the other continuity imports:
+```ts
+import { latestRecapBlock } from "../continuity/recap-retrieval.js";
+```
+
+- [ ] **Step 2: Inject the recap inside the first-turn branch, right after the banner is built (after line 380 `bannerEmitted = true;`, still inside the `if (bannerTracker?.pending(bannerKey))` try block)**
+
+```ts
+      // "Dove eravamo" — on the first turn, prepend the previous session's
+      // anchored recap for THIS project (reconstruction, not a doc dump).
+      // Off the critical path: latestRecapBlock returns "" on any failure.
+      if (projectName && vectorStore) {
+        const recapBlock = latestRecapBlock({ store: vectorStore, project: projectName, logger });
+        if (recapBlock) {
+          prependContext = prependContext ? `${recapBlock}\n\n${prependContext}` : recapBlock;
+        }
+      }
+```
+
+- [ ] **Step 3: Build + run the continuity suite + the auto-recall suite**
+
+Run: `npm run build`
+Expected: "Build complete".
+Run: `npx vitest run src/core/continuity src/core/hooks/__tests__/auto-recall`
+Expected: all PASS, no regressions.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/core/hooks/auto-recall.ts
+git commit -m "feat(continuity): inject 'Dove eravamo' recap on session open"
+```
+```
+
+</details>
+
 ---
