@@ -128,3 +128,56 @@ Partire dal blueprint (`MEMORIA-BLUEPRINT.md`), verificare lo stato della Fase 0
 </details>
 
 ---
+
+## C:\Sinapsys\05-handoff\2026-06-23.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** handoff di sessione (effimero per natura), stato "prossimo passo = Sinapsys Fase A" — Fase A è stata costruita e superata da tempo (vedi `docs/vision/02-architecture/INTERCONNECTION-MAP.md` sez. C.1-C.4). Mai versionato → contenuto integrale sotto.
+
+**Fatti da tenere:** prima volta che si decide "Sinapsys si costruisce sopra TencentDB, niente rewrite" (poi ADR-0001) e branch `feat/memory-excellence` (poi migrato a `feat/sinapsys-l4-consolidation`). Trappole operative Windows (portproxy fantasma su 8421, jest-orphan-reaper) risolte da tempo.
+
+<details>
+<summary>Contenuto integrale (mai versionato — 37 righe)</summary>
+
+```markdown
+# 🤝 HANDOFF — sessione 23 giugno 2026 (Lorenzo + Claude/Socio)
+> Apri una sessione NUOVA di Claude Code, dammi questo file, e ripartiamo freschi.
+> Regola: tratta tutto qui come contesto DA VERIFICARE contro la realtà, non verità assolute.
+
+## 1. In una riga
+Riparata e resa stabile la memoria TencentDB, **ucciso il bug della finestra che lampeggiava** (non era il gateway!), e scritto il piano tecnico di **Sinapsys**. Prossimo passo: costruire Sinapsys **Fase A**.
+
+## 2. Stato VERIFICATO adesso (non a memoria)
+- **Gateway memoria:** sano, stabile da 15h+, `recall.source=kb`, DB **52 MB**. Recall reale funziona (es. "codice segreto"→MANGO 0.79).
+- **Memoria entity-centric:** live. Entità+fatti+**relazioni**+eventi, ricerca ibrida (FTS+vettori+entity→RRF), proiezioni persona/scene a inizio sessione (con filtro anti-segreti). Recall 6/7 sui test, canaries 4/4.
+- **Finestra lampeggiante:** ✅ RISOLTA. Vera causa = task pianificato **`jest-orphan-reaper`** (PowerShell Interactive ogni 10 min). Fix: lanciato via `wscript` nascosto (`C:\Users\lo\jest-reaper-hidden.vbs`). Confermato da Lorenzo: non compare più.
+
+## 3. Decisioni prese (non ridiscutere senza motivo)
+- Memoria resta **LOCALE** (no Supabase). Daemonless rimandato: la fragilità è già risolta, non urge.
+- Sinapsys si costruisce **sopra TencentDB** (è già ~metà fatto). Niente rewrite.
+- Branch: **`feat/memory-excellence`**. **MAI push su main.** Commit chiave: b96590e→15fabee.
+
+## 4. TRAPPOLE — cosa NON rifare (la parte più preziosa)
+- ❌ **NON incolpare/toccare il gateway per la finestra** — abbiamo perso 3 sessioni così. Il colpevole erano task pianificati + MCP a shim `cmd`/`npx`.
+- ❌ **NON `taskkill` su svchost/iphlpsvc** (servizi di sistema).
+- ⚠️ **Fantasma di rete:** una regola `netsh portproxy 0.0.0.0:8421→127.0.0.1:8421` (servizio iphlpsvc) bloccava il restart. Rimossa con `netsh interface portproxy delete v4tov4 listenport=8421 listenaddress=0.0.0.0` (serve admin). Se il gateway non riparte: **controlla `netsh interface portproxy show all`**.
+- ⚠️ Kimi gira a **temperatura=1**: variazioni nell'estrazione sono normali, non bug.
+- ⚠️ Backfill: le finestre giganti di meta-lavoro su questo tool falliscono a 45s → basso valore, non inseguirle.
+- ⚠️ Firebase MCP rimosso da `.cursor/mcp.json` e `.claude.json` (backup `.bak-20260623`) perché flashava via Cursor. Augment è SACRO, deve funzionare.
+
+## 5. Prossimo passo
+**Sinapsys Fase A** = Consolidation Engine (L4) + Mistake Notebook (L3, adottando il design **MNL** — codice su GitHub). Piano completo: `C:\Users\lo\Downloads\SINAPSYS-PLAN.md`.
+- Azione preliminare: **verificare `TDAI_LLM_MODEL`** del gateway — i `kimi-k2-*` legacy sono EOL 25/05/2026 (eventualmente passare a K2.5/K2.6).
+
+## 6. File da leggere all'inizio (verifica, non fidarti)
+- `C:\Users\lo\Downloads\SINAPSYS-PLAN.md` — il piano tecnico (cosa adottare vs costruire, fasi, costi ~0-5€/mese).
+- `C:\Users\lo\Downloads\MEMORIA-BLUEPRINT.md` — il blueprint originale (16/06).
+- `C:\Users\lo\tencentdb-agent-memory\.claude\memory\status.md` — stato del progetto memoria.
+- Repo: `C:\Users\lo\tencentdb-agent-memory` (branch `feat/memory-excellence`).
+
+## 7. Come parla il Socio con Lorenzo
+Italiano, diretto, niente "probabilmente", niente complimenti gratuiti, ironia quando ci sta. Mai push su main. Test che conta = quello che fa Lorenzo dal vivo, non i miei script. Comandi PowerShell con `cd` iniziale e `;`.
+```
+
+</details>
+
+---
