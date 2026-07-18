@@ -521,3 +521,222 @@ P0 eval harness | P1 schema+store (IN CORSO, lo-database-architect) | P2 single-
 </details>
 
 ---
+
+## docs/superpowers/plans/2026-06-29-grounded-trust-phase1-provenance.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** piano-checklist TDD per Grounded Trust Fase 1 (provenance/trust model) — eseguito per intero (commit `b805f60`/`e036912`/`afb0c27`/`75a497d`); `provenance.ts` esiste, Fase 1 confermata IMPLEMENTED nel design doc gemello (altra voce di questo storico). Ignorato da `.gitignore` (`docs/superpowers/*`), mai stato in git → contenuto integrale sotto, in 3 parti.
+
+**Fatti da tenere:** il piano task-by-task (checkbox) copre: modello di trust (`provenance.ts`), stamping a write-time in `applyKbDelta`, hook `confirmMemory` (upgrade a "trusted" + audit trail), e un test di regressione che blocca ogni futura modifica che faccia "trust gate injection" invece di "trust gate action" — il principio cardine del pilastro Grounded Trust.
+
+<details>
+<summary>Contenuto integrale (mai versionato, gitignored — parte 1/3, Task 1-2)</summary>
+
+```markdown
+# Grounded Trust — Phase 1: Provenance & Trust foundation — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Stamp every conversation-extracted memory unit (fact/event) with a provenance + trust mark (default `unverified`) at write time, and provide a `confirmMemory` upgrade hook — without changing any recall/injection behaviour.
+
+**Architecture:** Reuse the existing "living layer" `memory_lifecycle.provenance_json` (today always `'{}'`) as the home for the stamp, and `memory_audit` for the upgrade trail. A new pure module `provenance.ts` owns the trust model. `applyKbDelta` (the single KB write path) stamps each new fact/event via a new store primitive `stampProvenance`. A `confirmMemory` primitive flips the stamp to `trusted`, raises the fact's confidence, optionally supersedes the uncertain fact, and writes one audit row. Trust gates ACTION (later phases), never INJECTION.
+
+**Tech Stack:** TypeScript, Node `node:sqlite` (`DatabaseSync`), Zod v4, Vitest. Spec: `docs/superpowers/specs/2026-06-29-grounded-trust-phase1-provenance-design.md`.
+
+---
+
+## File structure
+
+- **Create** `src/core/kb/provenance.ts` — the trust model: `ProvenanceStamp` type, Zod schema, `defaultProvenance()`, `deriveTrust()`, `parseProvenance()` (tolerant), `serializeProvenance()`. Pure, no DB.
+- **Create** `src/core/kb/__tests__/provenance.test.ts` — unit tests for the model.
+- **Modify** `src/core/kb/lifecycle-writer.ts` — add `confirmProvenance(db, params)` (flip stamp → trusted + audit row).
+- **Modify** `src/core/store/sqlite.ts` — add two `VectorStore` methods: `stampProvenance(...)` (write-time stamp via `ensureLifecycle` with provenance) and `confirmMemory(...)` (orchestrate the upgrade across `memory_lifecycle` + `facts`).
+- **Modify** `src/core/kb/kb-writer.ts` — add `stampProvenance` to the `KbWriterStore` interface and call it for every inserted event/fact inside `applyKbDelta`.
+- **Create** `src/core/kb/__tests__/provenance-write-stamp.test.ts` — real-DB test: a freshly written fact/event has `trust=unverified`.
+- **Create** `src/core/store/__tests__/confirm-memory.test.ts` — real-DB test: `confirmMemory` flips to trusted, writes one audit row, raises confidence, supersedes when asked.
+- **Create** `src/core/kb/__tests__/provenance-injection-unchanged.test.ts` — regression: injection unchanged for an unverified memory.
+
+---
+
+## Task 1: The trust model (`provenance.ts`)
+
+**Files:**
+- Create: `src/core/kb/provenance.ts`
+- Test: `src/core/kb/__tests__/provenance.test.ts`
+
+- [ ] **Step 1: Write the failing test**
+
+Create `src/core/kb/__tests__/provenance.test.ts`:
+
+```typescript
+import { describe, it, expect } from "vitest";
+import {
+  defaultProvenance,
+  deriveTrust,
+  parseProvenance,
+  serializeProvenance,
+  type ProvenanceStamp,
+} from "../provenance.js";
+
+describe("provenance model", () => {
+  it("defaultProvenance is conversation/unverified and carries source ids", () => {
+    const p = defaultProvenance(["l0_a", "l0_b"]);
+    expect(p.origin).toBe("conversation");
+    expect(p.trust).toBe("unverified");
+    expect(p.confirmed_by).toBeNull();
+    expect(p.source_message_ids).toEqual(["l0_a", "l0_b"]);
+    expect(p.schema).toBe(1);
+  });
+
+  it("deriveTrust: only lorenzo_confirmed and authoritative_source are trusted", () => {
+    expect(deriveTrust("conversation")).toBe("unverified");
+    expect(deriveTrust("tool_output")).toBe("unverified");
+    expect(deriveTrust("lorenzo_confirmed")).toBe("trusted");
+    expect(deriveTrust("authoritative_source")).toBe("trusted");
+  });
+
+  it("parseProvenance tolerates legacy '{}' → conversation/unverified", () => {
+    const p = parseProvenance("{}");
+    expect(p.origin).toBe("conversation");
+    expect(p.trust).toBe("unverified");
+  });
+
+  it("parseProvenance tolerates garbage → conversation/unverified (never throws)", () => {
+    const p = parseProvenance("not json at all");
+    expect(p.origin).toBe("conversation");
+    expect(p.trust).toBe("unverified");
+  });
+
+  it("serialize → parse round-trips a trusted stamp", () => {
+    const stamp: ProvenanceStamp = {
+      origin: "lorenzo_confirmed",
+      trust: "trusted",
+      confirmed_by: "lorenzo",
+      confirmed_at: "2026-06-29T10:00:00.000Z",
+      source_message_ids: ["l0_x"],
+      schema: 1,
+    };
+    const back = parseProvenance(serializeProvenance(stamp));
+    expect(back).toEqual(stamp);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run src/core/kb/__tests__/provenance.test.ts`
+Expected: FAIL — `Cannot find module '../provenance.js'`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+Create `src/core/kb/provenance.ts`:
+
+```typescript
+/**
+ * provenance.ts — the trust model for Grounded Trust (Phase 1).
+ *
+ * Every memory unit (fact/event) carries a provenance stamp in
+ * memory_lifecycle.provenance_json. Trust is DERIVED from origin and defaults to
+ * "unverified" (conservative: unknown origin = untrusted). Trust gates ACTION in
+ * later phases, never injection. Parsing is tolerant: a legacy "{}" or any
+ * malformed value degrades to conversation/unverified and NEVER throws into a
+ * turn.
+ */
+import { z } from "zod";
+
+export type ProvenanceOrigin =
+  | "conversation"
+  | "tool_output"
+  | "lorenzo_confirmed"
+  | "authoritative_source";
+
+export type TrustLevel = "unverified" | "trusted";
+
+export interface ProvenanceStamp {
+  origin: ProvenanceOrigin;
+  trust: TrustLevel;
+  confirmed_by: "lorenzo" | null;
+  confirmed_at: string | null;
+  source_message_ids: string[];
+  schema: 1;
+}
+
+/** Origins that earn trust. Everything else is unverified (conservative default). */
+const TRUSTED_ORIGINS: ReadonlySet<ProvenanceOrigin> = new Set([
+  "lorenzo_confirmed",
+  "authoritative_source",
+]);
+
+export function deriveTrust(origin: ProvenanceOrigin): TrustLevel {
+  return TRUSTED_ORIGINS.has(origin) ? "trusted" : "unverified";
+}
+
+const STAMP_SCHEMA = z.object({
+  origin: z.enum(["conversation", "tool_output", "lorenzo_confirmed", "authoritative_source"]),
+  trust: z.enum(["unverified", "trusted"]),
+  confirmed_by: z.union([z.literal("lorenzo"), z.null()]).default(null),
+  confirmed_at: z.union([z.string(), z.null()]).default(null),
+  source_message_ids: z.array(z.string()).default([]),
+  schema: z.literal(1).default(1),
+});
+
+/** A fresh stamp for conversation-extracted memory: conversation / unverified. */
+export function defaultProvenance(sourceMessageIds: string[] = []): ProvenanceStamp {
+  return {
+    origin: "conversation",
+    trust: deriveTrust("conversation"),
+    confirmed_by: null,
+    confirmed_at: null,
+    source_message_ids: [...sourceMessageIds],
+    schema: 1,
+  };
+}
+
+export function serializeProvenance(stamp: ProvenanceStamp): string {
+  return JSON.stringify(stamp);
+}
+
+/**
+ * Parse a provenance_json string. Tolerant by design: legacy "{}", missing
+ * fields, or non-JSON all degrade to conversation/unverified. Never throws.
+ */
+export function parseProvenance(json: string | null | undefined): ProvenanceStamp {
+  if (!json) return defaultProvenance();
+  try {
+    const raw = JSON.parse(json) as unknown;
+    const parsed = STAMP_SCHEMA.safeParse(raw);
+    if (!parsed.success) return defaultProvenance();
+    // Re-derive trust from origin so a tampered/legacy trust value can't lie.
+    return { ...parsed.data, trust: deriveTrust(parsed.data.origin) };
+  } catch {
+    return defaultProvenance();
+  }
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run src/core/kb/__tests__/provenance.test.ts`
+Expected: PASS (5/5).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/core/kb/provenance.ts src/core/kb/__tests__/provenance.test.ts
+git commit -m "feat(grounded-trust): provenance trust model (Phase 1)"
+```
+
+---
+
+## Task 2: Stamp provenance at write time
+
+**Files:**
+- Modify: `src/core/store/sqlite.ts` (add `stampProvenance` method on `VectorStore`)
+- Modify: `src/core/kb/kb-writer.ts` (add `stampProvenance` to `KbWriterStore`; call it in `applyKbDelta`)
+- Test: `src/core/kb/__tests__/provenance-write-stamp.test.ts`
+
+(Task 2 steps continue in parte 2/3 di questo storico — omesso qui solo per lunghezza del batch di scrittura, NON per contenuto realmente mancante: il piano integrale prosegue nella parte successiva.)
+```
+
+</details>
+
+---
