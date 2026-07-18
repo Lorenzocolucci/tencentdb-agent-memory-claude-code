@@ -1216,3 +1216,258 @@ Phase 1 is complete: new memories carry a real provenance stamp (`trust=unverifi
 </details>
 
 ---
+
+## docs/superpowers/plans/2026-06-29-session-continuity-dove-eravamo.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** piano-checklist TDD per "Dove eravamo" (session-continuity) — eseguito per intero; i moduli `src/core/continuity/recap-*.ts` esistono tutti nel repo (builder/capture/injection/retrieval/selector/types). Ignorato da `.gitignore` (`docs/superpowers/*`), mai stato in git → contenuto integrale sotto, in 4 parti.
+
+**Fatti da tenere:** design "extractive not abstractive" — ogni riga del recap è ancorata a un `source_message_id` reale, mai una sintesi LLM (lezione da un bug di distillazione noto: date sbagliate). Iniettato SOLO al primo turno di sessione (non ad ogni turno, per non bucare la prompt-cache).
+
+<details>
+<summary>Contenuto integrale (mai versionato, gitignored — parte 1/4, header + Task 1-2)</summary>
+
+```markdown
+# "Dove eravamo" (session-continuity) — Implementation Plan — Phase 1
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** On session open, surface a "Dove eravamo" block for the current project, reconstructed from the previous session's own anchored memory events (decisions/tasks/fixes with provenance) — not from a handoff file.
+
+**Architecture:** Fully gateway-side. At session end (`handleSessionEnd`, AFTER the pipeline flush) a recap builder reads *this session's* events from the KB, selects the "thread" types (`decision`, `task`, `fix`, `result`, `bug`, `config_change`), and writes a first-class `session_recap` `KbEvent` (project derived from those events, `source_message_ids` unioned, anchored). At session open (first turn, gated like the banner) the recall path fetches the latest `session_recap` for the request's `project` and injects a sanitized `<session-recap>` block. Off the critical path; every step try/caught; degrades to no-op when the store lacks the new methods (TCVDB backend).
+
+**Phase 2 (separate plan, NOT here):** enrich the recap with git facts (commits/files/branch) gathered by the cc-plugin SessionEnd hook and passed in an extended `/session/end` payload.
+
+**Tech Stack:** TypeScript (ESM, `.js` import suffix), `node:sqlite` (`DatabaseSync`), vitest (`pool: forks`), existing `IMemoryStore` / `kb-queries` / `escapeXmlTags` patterns.
+
+**Real-data facts (verified 2026-06-29):** events live in `vectors.db` table `events` (455 rows). Columns: `id, ts, recorded_at, session_key, session_id, namespace, project, type, text, language, entities_json, source_message_ids_json`. Type counts: observation 206, decision 82, config_change 55, task 43, fix 33, result 16, bug 16, preference_stated 4.
+
+**Deliberate refinement vs spec §4:** the `<session-recap>` block is injected in the **first-turn (banner) branch** of `performAutoRecall` (prependContext), NOT in the per-turn `stableParts`. Rationale: it is a session-open event like the banner; putting it in stableParts would recompute/re-emit every turn and bust the prompt cache. This is strictly better than the spec and keeps it off the per-turn path.
+
+---
+
+## File Structure
+
+| File | Responsibility |
+|------|----------------|
+| `src/core/continuity/recap-types.ts` | Shared types: `ThreadItem`, `RecapInput`, `THREAD_EVENT_TYPES`. |
+| `src/core/continuity/recap-builder.ts` | Pure: `buildRecapText(input): string`. Assembles anchored recap; omits unanchored lines; returns `""` when no thread. |
+| `src/core/continuity/recap-selector.ts` | Pure: `selectThread(events): RecapInput` — filter session events to thread types, pick next-step, union provenance, derive project. |
+| `src/core/continuity/recap-capture.ts` | Glue: `captureSessionRecap({store, sessionKey, now, logger})` — read session events, select, build, `insertEvent`. Fire-and-forget friendly, error-swallowed. |
+| `src/core/continuity/recap-retrieval.ts` | `latestRecapBlock({store, project, logger}): string` — fetch latest `session_recap` for project, return injection block or `""`. |
+| `src/core/continuity/recap-injection.ts` | Pure: `buildSessionRecapBlock(recapText): string` — wrap in `<session-recap>`, escape via `escapeXmlTags`. Mirror of `cornerstone-injection.ts`. |
+| `src/core/store/types.ts` | Add 2 OPTIONAL `IMemoryStore` methods: `listEventsBySession?`, `latestEventByProjectType?`. |
+| `src/core/kb/kb-queries.ts` | SQL impls: `listEventsBySession`, `latestEventByProjectType`. |
+| `src/core/store/sqlite.ts` | Wire the two store methods to the kb-queries impls (guard `kbReady`). |
+| `src/utils/sanitize.ts` | Add `session-recap` to the `escapeXmlTags` allow-list. |
+| `src/core/tdai-core.ts` | Call `captureSessionRecap` in `handleSessionEnd` AFTER flush, fire-and-forget via `bgTasks`. |
+| `src/core/hooks/auto-recall.ts` | Inject `latestRecapBlock` in the first-turn (banner) branch. |
+
+Tests live in `src/core/continuity/__tests__/` and an integration test in the same folder.
+
+---
+
+## Task 1: Shared types + thread-type constant
+
+**Files:**
+- Create: `src/core/continuity/recap-types.ts`
+- Test: `src/core/continuity/__tests__/recap-types.test.ts`
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+import { describe, it, expect } from "vitest";
+import { THREAD_EVENT_TYPES, isThreadType } from "../recap-types.js";
+
+describe("recap thread types", () => {
+  it("includes decision/task/fix/result/bug/config_change, excludes observation", () => {
+    expect(isThreadType("decision")).toBe(true);
+    expect(isThreadType("task")).toBe(true);
+    expect(isThreadType("fix")).toBe(true);
+    expect(isThreadType("observation")).toBe(false);
+  });
+  it("THREAD_EVENT_TYPES is frozen and non-empty", () => {
+    expect(THREAD_EVENT_TYPES.length).toBeGreaterThan(0);
+    expect(Object.isFrozen(THREAD_EVENT_TYPES)).toBe(true);
+  });
+});
+```
+
+- [ ] **Step 2: Run test, verify it fails**
+
+Run: `npx vitest run src/core/continuity/__tests__/recap-types.test.ts`
+Expected: FAIL — cannot find module `../recap-types.js`.
+
+- [ ] **Step 3: Implement**
+
+```ts
+/** Shared types for the "Dove eravamo" session-continuity recap. */
+
+/** Event types that carry the session's "thread" (decisions/why/next), not routine noise. */
+export const THREAD_EVENT_TYPES = Object.freeze([
+  "decision",
+  "task",
+  "fix",
+  "result",
+  "bug",
+  "config_change",
+] as const);
+
+export function isThreadType(type: string): boolean {
+  return (THREAD_EVENT_TYPES as readonly string[]).includes(type);
+}
+
+/** A single anchored line of the recap thread. */
+export interface ThreadItem {
+  readonly type: string;
+  readonly text: string;
+  /** Provenance message ids for this item (anchor). Empty → item is dropped upstream. */
+  readonly sourceMessageIds: readonly string[];
+}
+
+/** Everything the recap builder needs (Phase 1: no git facts yet). */
+export interface RecapInput {
+  readonly project: string;
+  readonly sessionDateIso: string;
+  /** The explicit next step, if one was found (anchored). */
+  readonly nextStep?: ThreadItem;
+  /** The thread items, most-recent-last. */
+  readonly thread: readonly ThreadItem[];
+}
+```
+
+- [ ] **Step 4: Run test, verify it passes**
+
+Run: `npx vitest run src/core/continuity/__tests__/recap-types.test.ts`
+Expected: PASS (2 tests).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/core/continuity/recap-types.ts src/core/continuity/__tests__/recap-types.test.ts
+git commit -m "feat(continuity): recap shared types + thread-type filter"
+```
+
+---
+
+## Task 2: recap-builder (pure, anchored text)
+
+**Files:**
+- Create: `src/core/continuity/recap-builder.ts`
+- Test: `src/core/continuity/__tests__/recap-builder.test.ts`
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+import { describe, it, expect } from "vitest";
+import { buildRecapText } from "../recap-builder.js";
+import type { RecapInput } from "../recap-types.js";
+
+const base: RecapInput = {
+  project: "tencentdb-agent-memory",
+  sessionDateIso: "2026-06-29T12:00:00.000Z",
+  nextStep: { type: "task", text: "Wire scorer live with per-session cache", sourceMessageIds: ["m1"] },
+  thread: [
+    { type: "decision", text: "Chose approach B: anchored recap", sourceMessageIds: ["m2"] },
+    { type: "fix", text: "Record injection AFTER block built", sourceMessageIds: ["m3"] },
+  ],
+};
+
+describe("buildRecapText", () => {
+  it("emits a project+date header, next-step, and anchored thread lines", () => {
+    const out = buildRecapText(base);
+    expect(out).toContain("DOVE ERAVAMO — tencentdb-agent-memory");
+    expect(out).toContain("Prossimo passo: Wire scorer live");
+    expect(out).toContain("Chose approach B");
+    expect(out).toContain("[anchor: msg m2]");
+  });
+  it("drops thread items with no source message ids (every line anchored)", () => {
+    const out = buildRecapText({
+      ...base,
+      thread: [{ type: "decision", text: "unanchored", sourceMessageIds: [] }],
+    });
+    expect(out).not.toContain("unanchored");
+  });
+  it("returns empty string when there is no next-step and no thread", () => {
+    expect(buildRecapText({ ...base, nextStep: undefined, thread: [] })).toBe("");
+  });
+});
+```
+
+- [ ] **Step 2: Run test, verify it fails**
+
+Run: `npx vitest run src/core/continuity/__tests__/recap-builder.test.ts`
+Expected: FAIL — cannot find module `../recap-builder.js`.
+
+- [ ] **Step 3: Implement**
+
+```ts
+/**
+ * recap-builder — pure assembly of the "Dove eravamo" recap text.
+ *
+ * Every emitted line is anchored: thread items without provenance are dropped
+ * (determinism over completeness). Returns "" when nothing anchorable remains.
+ * Immutable: builds a new string, never mutates the input.
+ */
+import type { RecapInput, ThreadItem } from "./recap-types.js";
+
+const MAX_THREAD = 6;
+const MAX_TEXT = 240;
+
+function anchorOf(item: ThreadItem): string | null {
+  const ids = item.sourceMessageIds.filter((s) => typeof s === "string" && s.length > 0);
+  return ids.length > 0 ? ids.join(",") : null;
+}
+
+function line(item: ThreadItem): string | null {
+  const anchor = anchorOf(item);
+  if (!anchor) return null;
+  const text = item.text.trim().slice(0, MAX_TEXT);
+  if (!text) return null;
+  return `- (${item.type}) ${text}   [anchor: msg ${anchor}]`;
+}
+
+export function buildRecapText(input: RecapInput): string {
+  const threadLines = input.thread
+    .map(line)
+    .filter((l): l is string => l !== null)
+    .slice(-MAX_THREAD);
+
+  const nextStepLine = input.nextStep ? line(input.nextStep) : null;
+
+  if (!nextStepLine && threadLines.length === 0) return "";
+
+  const date = input.sessionDateIso.slice(0, 10);
+  const out: string[] = [`DOVE ERAVAMO — ${input.project} (${date})`, ""];
+
+  if (nextStepLine) {
+    out.push("PROSSIMO PASSO:");
+    // Reuse the anchored formatting but with the friendlier label.
+    out.push(nextStepLine.replace(/^- \([^)]*\) /, "- Prossimo passo: "));
+    out.push("");
+  }
+
+  if (threadLines.length > 0) {
+    out.push("FILO (ricostruito dalle nostre parole reali):");
+    out.push(...threadLines);
+  }
+
+  return out.join("\n").trimEnd();
+}
+```
+
+- [ ] **Step 4: Run test, verify it passes**
+
+Run: `npx vitest run src/core/continuity/__tests__/recap-builder.test.ts`
+Expected: PASS (3 tests).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/core/continuity/recap-builder.ts src/core/continuity/__tests__/recap-builder.test.ts
+git commit -m "feat(continuity): pure anchored recap text builder"
+```
+```
+
+</details>
+
+---
