@@ -2732,4 +2732,32 @@ Script di misura (read-only, gitignored): `b3-backfill-copy/_recall_measure.cjs`
 
 **Fatti da tenere:** non può fiorire finché non esiste una lezione (0 oggi, corretto by design anti-aneddoto) — la macchina B3 è verificata dai test, il suo effetto organico attende la prima lezione distillata. Contenuto integrale in git history.
 
----
+## docs/superpowers/specs/2026-06-30-spreading-activation-associative-recall-design.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** design del "cuore associativo" — spreading activation pesata/decadente/convergente sul grafo `relations` (stile ACT-R), superficie di ricordi connessi-ma-non-matchati marcati "·associato". Implementato+deployato (`39558b0`+`8ac4b5e`); la verifica live ha scoperto e corretto un bug reale (attributi-rumore come `line_count` che comparivano come "fatto più confident").
+
+**Fatti da tenere:** questo è il modulo `spreading-activation.ts` che TUTTI gli altri pilastri (Implicit Priming, recall associativo-first) riusano — è il vero "cuore" del sistema, da trattare con la massima cautela in future modifiche. Contenuto integrale in git history.
+
+## docs/superpowers/specs/2026-07-01-behavioral-notebook-design.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** design del "taccuino dei modi d'uso" — due percorsi distinti (A: leggi esplicite dette da Lorenzo, cattura-nel-momento, no clustering; B: tendenze implicite, clustering semantico + gate di precisione LLM). Costruito e live (A1→A2→B1→B2→A3, tutti i commit citati nel doc). Residuo: B3 (backfill storico dei 29.548 messaggi chat) gated sull'OK esplicito di Lorenzo per la spesa LLM — non ancora lanciato.
+
+**Fatti da tenere:** il finding live che ha reso A3 (gate LLM) OBBLIGATORIO e non opzionale — a soglia pulita 0 cluster, sotto soglia solo rumore, nessuna soglia separa bene segnale da rumore — è la prova empirica che "clustering dà recall, serve un filtro di precisione separato". Principio riusabile per futuri classificatori. Contenuto integrale in git history.
+
+## docs/superpowers/specs/2026-07-01-pilastro-b-track-record-design.md (archiviato 2026-07-18)
+
+**Verdetto:** DA_FARE nel verdetto originale (Slice 2 "genuinamente aperto"), ma **RI-VERIFICATO in questa wave (2026-07-18): risulta COSTRUITO.** Il design descrive lo Slice 1 (cervello puro, `stance-track-record.ts`+`stance-severity.ts`, 12 test) FATTO e lo Slice 2 (wiring live: colonne `stance_fire_count`/`stance_confirmed_count`/`stance_rejected_count`/`stance_willingness` su `lessons` + cattura del segnale confirm/reject) come "DA COSTRUIRE, prossima sessione". Verifica di questa wave: `grep stance_fire_count src/core/kb/foundations-schema.ts` → le 4 colonne CI SONO (righe ~198-208), e `lessons-writer.ts` le usa. `git log` mostra il commit dedicato `e170039 feat(pilastro-b): Slice 2 — wire the stance track record LIVE (Strada A)`, già nella storia del branch. **Il verdetto "Slice 2 aperto" nei verdicts di questa wave era STALE — segnalato, non altrimenti corretto qui (task docs-only).**
+
+**Fatti da tenere:** il "DELTA" concettuale documentato qui resta valido: B3 (lesson-reinforcement) misura "il bug è tornato?", Pilastro B misura "l'interrupt aveva ragione o era falso allarme?" — due assi distinti che regolano rispettivamente confidenza-del-bug e willingness-to-fire-della-stance. Contenuto integrale in git history.
+
+## docs/superpowers/specs/2026-07-01-pilastro-c-fase2-distillazione-design.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** design Pilastro C Fase 2 — distilla cluster maturi di NON-fallimento (decisioni/preferenze ricorrenti) in atomi `principle` ad alta salienza (conservativo: distilla, non cancella). Costruito+deployato 2026-07-01, verificato su dati vivi (3 principi reali scritti in `vectors.db`). Ha corretto un bug critico del trigger: la distillazione era agganciata SOLO a `handleSessionEnd`, che nella desktop-app non scatta mai (Track B era morto alla nascita) — fix: distillazione anche al primo turno di sessione.
+
+**Fatti da tenere:** residuo noto NON fixato qui (fuori scope): 1 principio su 3 è uscito in cinese (mojibake Kimi, ignora l'istruzione same-language) — bug di output-language tracciato, non un blocco. Contenuto integrale in git history.
+
+## docs/superpowers/specs/2026-07-07-recall-associative-first-design.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO come SPEC di dettaglio (la VISIONE resta valida, "l'arco completo A→B→C" citato anche in `docs/vision/`). **Perché:** design completo A→B→C ("la situazione è l'indirizzo") — Incremento A costruito+verificato live (`situation-cue.ts`, wiring in `auto-recall.ts`); B1+B2a shippati; C (embedding locale + HNSW) superato dal lavoro successivo (indice navigabile in-house, `HANDOFF.md` radice del repo, altra voce di questo storico).
+
+**Fatti da tenere:** i 5 principi north-star (situazione=indirizzo, due marce S1/S2, non-dimentica, ogni-richiamo-rinforza, proattivo/grounded-trust) sono ripresi nell'header aggiunto oggi a `docs/vision/02-architecture/INTERCONNECTION-MAP.md` — sono la bussola di design tuttora valida per qualunque lavoro futuro sul recall. Contenuto integrale in git history.
