@@ -531,7 +531,7 @@ P0 eval harness | P1 schema+store (IN CORSO, lo-database-architect) | P2 single-
 <details>
 <summary>Contenuto integrale (mai versionato, gitignored — parte 1/3, Task 1-2)</summary>
 
-```markdown
+````markdown
 # Grounded Trust — Phase 1: Provenance & Trust foundation — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -734,14 +734,14 @@ git commit -m "feat(grounded-trust): provenance trust model (Phase 1)"
 - Modify: `src/core/kb/kb-writer.ts` (add `stampProvenance` to `KbWriterStore`; call it in `applyKbDelta`)
 - Test: `src/core/kb/__tests__/provenance-write-stamp.test.ts`
 
-```
+````
 
 </details>
 
 <details>
 <summary>Contenuto integrale (mai versionato, gitignored — parte 2/3, Task 2-3)</summary>
 
-```markdown
+````markdown
 ## Task 2 (continua): Stamp provenance at write time
 
 - [ ] **Step 1: Write the failing test**
@@ -1027,14 +1027,14 @@ export function confirmProvenance(
 }
 ```
 
-```
+````
 
 </details>
 
 <details>
 <summary>Contenuto integrale (mai versionato, gitignored — parte 3/3, Task 3 fine + Task 4-5 + self-review)</summary>
 
-```markdown
+````markdown
 ## Task 3 (continua): `confirmMemory` on `VectorStore`
 
 - [ ] **Step 3b: Add `confirmMemory` to `VectorStore`**
@@ -1211,7 +1211,7 @@ Phase 1 is complete: new memories carry a real provenance stamp (`trust=unverifi
 - **Spec coverage:** trust model (Task 1) ✓, conservative default via `deriveTrust` (Task 1) ✓, reuse `memory_lifecycle.provenance_json` (Task 2) ✓, `memory_audit` trail (Task 3) ✓, raise `confidence` + `superseded_by` (Task 3) ✓, "trust gates action not injection" (Task 4) ✓, tolerant parse (Task 1) ✓, out-of-scope items NOT built ✓.
 - **Implementation detail to follow (not a placeholder):** the exact insertion spot for the methods in `sqlite.ts` and the transaction idiom — both copy the existing `reindexAll()` pattern in that same file. The `facts` column names come from the verified DDL in `sqlite.ts`.
 - **Eager lifecycle creation:** `stampProvenance` now creates the `memory_lifecycle` row at write time (previously created lazily in consolidation). Safe (defaults match; `ensureLifecycle` is idempotent); Task 2 Step 5 + Task 5 Step 2 guard against regressions.
-```
+````
 
 </details>
 
@@ -1226,7 +1226,7 @@ Phase 1 is complete: new memories carry a real provenance stamp (`trust=unverifi
 <details>
 <summary>Contenuto integrale (mai versionato, gitignored — parte 1/4, header + Task 1-2)</summary>
 
-```markdown
+````markdown
 # "Dove eravamo" (session-continuity) — Implementation Plan — Phase 1
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -1466,14 +1466,14 @@ Expected: PASS (3 tests).
 git add src/core/continuity/recap-builder.ts src/core/continuity/__tests__/recap-builder.test.ts
 git commit -m "feat(continuity): pure anchored recap text builder"
 ```
-```
+````
 
 </details>
 
 <details>
 <summary>Contenuto integrale (mai versionato, gitignored — parte 2/4, Task 3-5)</summary>
 
-```markdown
+````markdown
 ## Task 3: recap-selector (session events → RecapInput)
 
 **Files:**
@@ -1765,14 +1765,14 @@ Expected: PASS (2 tests).
 git add src/core/store/types.ts src/core/kb/kb-queries.ts src/core/store/sqlite.ts src/core/continuity/__tests__/recap-store.integration.test.ts
 git commit -m "feat(store): listEventsBySession + latestEventByProjectType queries"
 ```
-```
+````
 
 </details>
 
 <details>
 <summary>Contenuto integrale (mai versionato, gitignored — parte 3/4, Task 6-9)</summary>
 
-```markdown
+````markdown
 ## Task 6: recap-capture (session-end glue)
 
 **Files:**
@@ -2072,14 +2072,14 @@ Expected: all PASS, no regressions.
 git add src/core/hooks/auto-recall.ts
 git commit -m "feat(continuity): inject 'Dove eravamo' recap on session open"
 ```
-```
+````
 
 </details>
 
 <details>
 <summary>Contenuto integrale (mai versionato, gitignored — parte 4/4, Task 10-11 + self-review)</summary>
 
-```markdown
+````markdown
 ## Task 10: Non-circular eval against real handoffs
 
 **Files:**
@@ -2164,7 +2164,7 @@ git push fork feat/memory-excellence
 - **Refinement logged:** injection moved from `stableParts` (spec §4) to the first-turn branch — strictly better (no per-turn cost, no cache-bust). ✓
 - **Type consistency:** `RecapInput`/`ThreadItem` defined Task 1, used Tasks 2/3/6; `buildRecapText` (T2), `selectThread` (T3), `buildSessionRecapBlock` (T4), `captureSessionRecap` (T6), `latestRecapBlock` (T7), store `listEventsBySession`/`latestEventByProjectType` (T5) — names consistent across tasks. ✓
 - **Known soft spots (honest):** Task 5 test must copy the real `VectorStore` init harness from a sibling store test (not invented); Task 10 step 2 must be fleshed with the real overlap metric. Both flagged inline.
-```
+````
 
 </details>
 
@@ -2179,7 +2179,7 @@ git push fork feat/memory-excellence
 <details>
 <summary>Contenuto integrale (mai versionato, gitignored — parte 1/2, header + Task 0-1)</summary>
 
-```markdown
+````markdown
 # Recall associativo-first — Incremento A — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -2407,14 +2407,14 @@ Run: `npx vitest run src/core/kb/__tests__/situation-cue.test.ts`
 Expected: PASS (3/3).
 
 - [ ] **Step 5: (NIENTE commit ancora — attende semaforo Lorenzo per toccare i servizi vivi; vedi §"Gate live")**
-```
+````
 
 </details>
 
 <details>
 <summary>Contenuto integrale (mai versionato, gitignored — parte 2/2, Task 2-3 + gate live + risultati Task 0)</summary>
 
-```markdown
+````markdown
 ## Task 2 — Wiring: la situazione semina il recall primario (TDD sull'integrazione)
 
 Responsabilità: in `runKbRecall`, costruire i semi-situazione, farne il recall associativo **primario** via `associativeExpand`, e fonderlo col cue-da-testo — **senza** scansione globale.
@@ -2574,7 +2574,7 @@ Totali grafo: **events=11.693, relations=6.054, entities=9.871** (coerente col d
 5. **`session_key` = questo progetto (`cd28f537622ba8f8`)** ha `session_id` corrente `add6f9a2-…` con soli 2 eventi all'apertura → conferma perché NON filtrare per `session_id`.
 
 Script di misura (read-only, gitignored): `b3-backfill-copy/_recall_measure.cjs`, `_recall_measure2.cjs`.
-```
+````
 
 </details>
 
