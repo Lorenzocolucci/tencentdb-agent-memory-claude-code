@@ -2654,4 +2654,22 @@ Script di misura (read-only, gitignored): `b3-backfill-copy/_recall_measure.cjs`
 
 **Fatti da tenere:** il prompt originale (regole 0-7 + few-shot IT/EN) è la base testuale ancora in uso in `kb-extraction.ts` — utile riferimento se si deve modificare il prompt live. Contenuto integrale in git history.
 
+## docs/RECALL_ROOT_CAUSE_ANALYSIS.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** root-cause analysis del recall semantico 0/4 (giugno 2026): RC1 merge LLM distruttivo che cancellava fatti, RC2 vettori orfani post-merge, RC3 nessuna soglia di recall, RC4 CLAUDE.md che finiva nelle memorie come istruzione priority-95, RC5 parametri Kimi sbagliati (temp/max_tokens). Tutti e 5 fixati (vedi `docs/PHASE2_EXTRACTION_FIX_SPEC.md`, altra voce di questo storico) — root cause storica, non più un problema vivo.
+
+**Fatti da tenere:** l'evidenza (l1_records=5 righe tutte instruction vs 193 record su disco) è l'esempio da manuale del "merge distruttivo" che ha guidato tutta la riprogettazione entity-centric successiva. Contenuto integrale in git history.
+
+## docs/SINAPSYS-RECALL-REDESIGN-HANDOFF.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** handoff "vivo" del redesign del recall (2026-07-06/08): Incremento A (recall associativo-first seminato dalla situazione) + B1 (due marce/quality-gate) + B2a (rinforzo Hebbian) costruiti e verificati live; Incremento C (banner-starvation → indice HNSW navigabile) diagnosticato e pianificato. L'Incremento C è poi stato completato (vedi `HANDOFF.md` radice, altra voce di questo storico, e il codice live `navigable-index.ts` su HEAD).
+
+**Fatti da tenere:** i 5 principi north-star del nuovo recall ("la situazione è l'indirizzo", "due marce S1/S2", "non dimentica", "ogni richiamo rinforza", "proattivo/grounded-trust") restano la bussola di design valida anche oggi — sono ripresi nell'header di `docs/vision/02-architecture/INTERCONNECTION-MAP.md`. Contenuto integrale in git history.
+
+## scripts/bugfix-20260423/BUGFIX-20260423-SOP.md (archiviato 2026-07-18)
+
+**Verdetto:** SUPERATO. **Perché:** SOP (cinese) per un patch one-time OpenClaw 2026.4.23 (Issue #73806, Zod `.strict()` che rifiutava `hooks.allowConversationAccess`). Fix datato aprile 2026, non ricorrente, runbook esaurito.
+
+**Fatti da tenere:** nessuno rilevante oggi. Nota: gli script `.sh` gemelli nella stessa cartella (`bugfix-20260423.sh`, `bugfix-20260423-full.sh`) NON sono stati toccati in questa wave (regola: solo file `.md`, zero modifiche a codice/script). Contenuto integrale in git history.
+
 ---
