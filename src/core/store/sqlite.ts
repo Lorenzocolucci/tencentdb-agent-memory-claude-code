@@ -2606,10 +2606,101 @@ export class VectorStore implements IMemoryStore {
     }
   }
 
+  /**
+   * Embed `items` with bounded concurrency, then persist each result via `write`.
+   *
+   * WHY: reindexAll/reindexKb were strictly sequential (`for … await embedFn`),
+   * so total wall-time = Σ per-record network latency. Against a remote embedding
+   * host (DeepInfra Qwen3) that latency dominates (~0.5–15s/call), making a full
+   * reindex take many hours. Here the network-bound embed() calls run in waves of
+   * `concurrency`, while the SQLite writes stay STRICTLY SERIAL (SQLite is a
+   * single-writer store) — so we parallelize only the part that is safe to
+   * parallelize. `concurrency=1` reproduces the original sequential behaviour
+   * exactly, which is the default everywhere except the reindex CLI.
+   *
+   * A failed embed (or a failed write) does not abort the wave: the item is
+   * reported to `onEach` with the error so the caller can log+skip it, matching
+   * the per-record try/catch the sequential loops used.
+   */
+  private async embedInWaves<T>(
+    items: readonly T[],
+    getText: (it: T) => string,
+    embedFn: (text: string) => Promise<Float32Array | Float32Array[]>,
+    write: (it: T, chunkVectors: Float32Array[]) => void,
+    concurrency: number,
+    onEach: (it: T, err?: unknown) => void,
+  ): Promise<void> {
+    const width = Math.max(1, Math.floor(concurrency));
+    for (let i = 0; i < items.length; i += width) {
+      const wave = items.slice(i, i + width);
+      // Network-bound: embed the whole wave concurrently.
+      const settled = await Promise.allSettled(wave.map((it) => embedFn(getText(it))));
+      // DB-bound: write results one at a time (single-writer), preserving order.
+      for (let k = 0; k < wave.length; k++) {
+        const it = wave[k];
+        const s = settled[k];
+        if (s.status === "fulfilled") {
+          try {
+            write(it, VectorStore.toChunkVectors(s.value));
+            onEach(it);
+          } catch (err) {
+            onEach(it, err);
+          }
+        } else {
+          onEach(it, s.reason);
+        }
+      }
+    }
+  }
+
+  /**
+   * Batched sibling of {@link embedInWaves}: embeds `items` in groups of
+   * `batchSize` via ONE `embedMany` call per group (which packs every item's
+   * chunks into as few provider requests as possible), then persists each item's
+   * vectors via `write`. Writes stay strictly serial (single-writer store). A
+   * group whose embed call throws is reported per-item to `onEach` with the error
+   * so the caller can log+skip — the resume loop re-embeds those on a later pass;
+   * one failed group never aborts the rest.
+   */
+  private async embedWriteBatched<T>(
+    items: readonly T[],
+    getText: (it: T) => string,
+    embedMany: (texts: string[]) => Promise<Float32Array[][]>,
+    write: (it: T, chunkVectors: Float32Array[]) => void,
+    batchSize: number,
+    onEach: (it: T, err?: unknown) => void,
+  ): Promise<void> {
+    const size = Math.max(1, Math.floor(batchSize));
+    for (let i = 0; i < items.length; i += size) {
+      const batch = items.slice(i, i + size);
+      let grouped: Float32Array[][];
+      try {
+        grouped = await embedMany(batch.map(getText));
+      } catch (err) {
+        for (const it of batch) onEach(it, err);
+        continue;
+      }
+      for (let k = 0; k < batch.length; k++) {
+        const it = batch[k];
+        try {
+          write(it, VectorStore.toChunkVectors(grouped[k]));
+          onEach(it);
+        } catch (err) {
+          onEach(it, err);
+        }
+      }
+    }
+  }
+
   async reindexAll(
     embedFn: (text: string) => Promise<Float32Array | Float32Array[]>,
     onProgress?: (done: number, total: number, layer: "L1" | "L0") => void,
-    opts?: { resume?: boolean },
+    opts?: {
+      resume?: boolean;
+      concurrency?: number;
+      batchSize?: number;
+      embedMany?: (texts: string[]) => Promise<Float32Array[][]>;
+    },
   ): Promise<{ l1Count: number; l0Count: number }> {
     if (this.degraded || !this.vecTablesReady) {
       if (this.degraded) this.logger?.warn(`${TAG} reindexAll skipped: VectorStore is in degraded mode`);
@@ -2633,75 +2724,110 @@ export class VectorStore implements IMemoryStore {
       }
     };
 
+    // concurrency=1 → original strictly-sequential behaviour (default). The
+    // reindex CLI raises it so network-bound embeds overlap; writes stay serial.
+    const concurrency = Math.max(1, Math.floor(opts?.concurrency ?? 1));
+    // Batched fast path (reindex CLI): one embedMany call packs many records'
+    // chunks per provider request — the decisive lever vs per-record round-trips.
+    const embedMany = opts?.embedMany;
+    const batchSize = Math.max(1, Math.floor(opts?.batchSize ?? 1));
+    const useBatched = typeof embedMany === "function" && batchSize > 1;
+    // Transaction control via prepared statements (BEGIN/COMMIT/ROLLBACK) — same
+    // effect as a raw multi-statement call, kept here so each per-record write
+    // stays atomic (no orphan vectors).
+    const txBegin = () => { this.db.prepare("BEGIN").run(); };
+    const txCommit = () => { this.db.prepare("COMMIT").run(); };
+    const txRollback = () => { try { this.db.prepare("ROLLBACK").run(); } catch { /* ignore */ } };
+
+    // One dispatcher over both embed strategies so each layer's write/onEach
+    // closures are written once. BATCHED when available, else per-item waves.
+    const runEmbed = <T>(
+      items: readonly T[],
+      getText: (it: T) => string,
+      write: (it: T, chunkVectors: Float32Array[]) => void,
+      onEach: (it: T, err?: unknown) => void,
+    ): Promise<void> =>
+      useBatched
+        ? this.embedWriteBatched(items, getText, embedMany!, write, batchSize, onEach)
+        : this.embedInWaves(items, getText, embedFn, write, concurrency, onEach);
+
     try {
       // ── Re-embed L1 ──
       const l1Rows = this.getAllL1Texts();
       const embeddedL1 = buildEmbeddedSet("l1_vec");
-      let l1Done = 0;
-      for (const { record_id, content, updated_time } of l1Rows) {
-        if (embeddedL1?.has(record_id)) { l1Done++; onProgress?.(l1Done, l1Rows.length, "L1"); continue; }
-        try {
-          const chunkVectors = VectorStore.toChunkVectors(await embedFn(content));
-          // Wrap delete+insert in a transaction to prevent orphan vectors.
-          // Delete-all-chunks-then-insert-N → idempotent on re-run.
-          this.db.exec("BEGIN");
+      const l1Pending = embeddedL1 ? l1Rows.filter((r) => !embeddedL1.has(r.record_id)) : l1Rows.slice();
+      let l1Done = l1Rows.length - l1Pending.length;
+      onProgress?.(l1Done, l1Rows.length, "L1");
+      await runEmbed(
+        l1Pending,
+        (r) => r.content,
+        (r, chunkVectors) => {
+          // Delete-all-chunks-then-insert-N in one tx → idempotent on re-run.
+          txBegin();
           try {
-            this.stmtDeleteVec!.run(record_id);
+            this.stmtDeleteVec!.run(r.record_id);
             for (let i = 0; i < chunkVectors.length; i++) {
               this.stmtInsertVec!.run(
-                VectorStore.chunkId(record_id, i),
-                record_id,
+                VectorStore.chunkId(r.record_id, i),
+                r.record_id,
                 Buffer.from(chunkVectors[i].buffer),
-                updated_time,
+                r.updated_time,
               );
             }
-            this.db.exec("COMMIT");
+            txCommit();
           } catch (txErr) {
-            try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
+            txRollback();
             throw txErr;
           }
-        } catch (err) {
-          this.logger?.warn?.(
-            `${TAG} reindex L1 skip ${record_id}: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-        l1Done++;
-        onProgress?.(l1Done, l1Rows.length, "L1");
-      }
+        },
+        (r, err) => {
+          if (err) {
+            this.logger?.warn?.(
+              `${TAG} reindex L1 skip ${r.record_id}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          l1Done++;
+          onProgress?.(l1Done, l1Rows.length, "L1");
+        },
+      );
 
       // ── Re-embed L0 ──
       const l0Rows = this.getAllL0Texts();
       const embeddedL0 = buildEmbeddedSet("l0_vec");
-      let l0Done = 0;
-      for (const { record_id, message_text, recorded_at } of l0Rows) {
-        if (embeddedL0?.has(record_id)) { l0Done++; onProgress?.(l0Done, l0Rows.length, "L0"); continue; }
-        try {
-          const chunkVectors = VectorStore.toChunkVectors(await embedFn(message_text));
-          // Wrap delete+insert in a transaction to prevent orphan vectors.
-          this.db.exec("BEGIN");
+      const l0Pending = embeddedL0 ? l0Rows.filter((r) => !embeddedL0.has(r.record_id)) : l0Rows.slice();
+      let l0Done = l0Rows.length - l0Pending.length;
+      onProgress?.(l0Done, l0Rows.length, "L0");
+      await runEmbed(
+        l0Pending,
+        (r) => r.message_text,
+        (r, chunkVectors) => {
+          txBegin();
           try {
-            this.stmtL0DeleteVec!.run(record_id);
+            this.stmtL0DeleteVec!.run(r.record_id);
             for (let i = 0; i < chunkVectors.length; i++) {
               this.stmtL0InsertVec!.run(
-                VectorStore.chunkId(record_id, i),
-                record_id,
+                VectorStore.chunkId(r.record_id, i),
+                r.record_id,
                 Buffer.from(chunkVectors[i].buffer),
-                recorded_at,
+                r.recorded_at,
               );
             }
-            this.db.exec("COMMIT");
+            txCommit();
           } catch (txErr) {
-            try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
+            txRollback();
             throw txErr;
           }
-        } catch (err) {
-          this.logger?.warn?.(
-            `${TAG} reindex L0 skip ${record_id}: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-        l0Done++;
-        onProgress?.(l0Done, l0Rows.length, "L0");
-      }
+        },
+        (r, err) => {
+          if (err) {
+            this.logger?.warn?.(
+              `${TAG} reindex L0 skip ${r.record_id}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          l0Done++;
+          onProgress?.(l0Done, l0Rows.length, "L0");
+        },
+      );
 
       this.logger?.info(
         `${TAG} Reindex complete: L1=${l1Done}/${l1Rows.length}, L0=${l0Done}/${l0Rows.length}`,
@@ -2728,25 +2854,42 @@ export class VectorStore implements IMemoryStore {
   async reindexKb(
     embedFn: (text: string) => Promise<Float32Array | Float32Array[]>,
     onProgress?: (done: number, total: number) => void,
+    opts?: {
+      concurrency?: number;
+      batchSize?: number;
+      embedMany?: (texts: string[]) => Promise<Float32Array[][]>;
+    },
   ): Promise<{ kbCount: number }> {
     if (this.degraded || !this.kbVecReady) {
       this.logger?.warn(`${TAG} reindexKb skipped: kb_vec not ready`);
       return { kbCount: 0 };
     }
+    const concurrency = Math.max(1, Math.floor(opts?.concurrency ?? 1));
+    const embedMany = opts?.embedMany;
+    const batchSize = Math.max(1, Math.floor(opts?.batchSize ?? 1));
+    const useBatched = typeof embedMany === "function" && batchSize > 1;
     const rows = this.getAllKbTexts();
-    let done = 0;
-    for (const { owner_id, owner_kind, content, updated_time } of rows) {
-      try {
-        if (content && content.trim().length > 0) {
-          this.upsertKbVector(owner_id, owner_kind, await embedFn(content), updated_time);
-        }
-      } catch (err) {
+    // Empty-content owners were no-ops in the sequential path; skip them up-front
+    // so they don't occupy a batch/wave slot, and still count them as "done".
+    const pending = rows.filter((r) => r.content && r.content.trim().length > 0);
+    let done = rows.length - pending.length;
+    onProgress?.(done, rows.length);
+    const write = (r: { owner_id: string; owner_kind: string; content: string; updated_time: string }, chunkVectors: Float32Array[]) => {
+      this.upsertKbVector(r.owner_id, r.owner_kind, chunkVectors, r.updated_time);
+    };
+    const onEach = (r: { owner_id: string; owner_kind: string }, err?: unknown) => {
+      if (err) {
         this.logger?.warn?.(
-          `${TAG} reindexKb skip ${owner_kind} ${owner_id}: ${err instanceof Error ? err.message : String(err)}`,
+          `${TAG} reindexKb skip ${r.owner_kind} ${r.owner_id}: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
       done++;
       onProgress?.(done, rows.length);
+    };
+    if (useBatched) {
+      await this.embedWriteBatched(pending, (r) => r.content, embedMany!, write, batchSize, onEach);
+    } else {
+      await this.embedInWaves(pending, (r) => r.content, embedFn, write, concurrency, onEach);
     }
     this.logger?.info(`${TAG} KB reindex complete: ${done}/${rows.length} owners`);
     return { kbCount: done };

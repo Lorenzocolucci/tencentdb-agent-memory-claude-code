@@ -180,6 +180,31 @@ export async function runReindexCommand(opts: ReindexCommandOptions, ctx: SeedCl
   console.log(`\n🔁 Reindexing vectors in: ${dbPath}`);
   console.log('   (long texts are split into overlapping chunks; this re-runs safely)\n');
 
+  // Embed concurrency: the reindex is network-bound on a remote embedding host,
+  // so overlapping embed() calls (writes stay serial) cuts wall-time ~N×. Opt-in
+  // via env so only the CLI parallelises; the live init() path keeps its default
+  // sequential behaviour (concurrency=1). Clamp to a sane range.
+  const reindexConcurrency = Math.min(
+    32,
+    Math.max(1, Math.floor(Number(process.env.TDAI_REINDEX_CONCURRENCY) || 1)),
+  );
+  // Batched embedding: pack many records' chunks per provider request. Default 1
+  // (off) keeps the live init() path unchanged; the reindex CLI sets it high. The
+  // provider batch cap (256 chunks/call) still applies inside embedManyChunked.
+  const reindexBatchSize = Math.min(
+    256,
+    Math.max(1, Math.floor(Number(process.env.TDAI_REINDEX_BATCH) || 1)),
+  );
+  const embedMany =
+    typeof embeddingService.embedManyChunked === 'function'
+      ? (texts: string[]) => embeddingService.embedManyChunked!(texts)
+      : undefined;
+  if (reindexBatchSize > 1 && embedMany) {
+    console.log(`   (embedding batch size: ${reindexBatchSize} records/call)`);
+  } else if (reindexConcurrency > 1) {
+    console.log(`   (embedding concurrency: ${reindexConcurrency})`);
+  }
+
   let lastLayer: 'L1' | 'L0' | '' = '';
   const { l1Count, l0Count } = await vectorStore.reindexAll(
     // Chunk-returning embed function: one vector per chunk, all linked to the
@@ -193,7 +218,7 @@ export async function runReindexCommand(opts: ReindexCommandOptions, ctx: SeedCl
       const pct = total > 0 ? ((done / total) * 100).toFixed(0) : '100';
       process.stdout.write(`\r  [${layer}] ${done}/${total} ${pct}%    `);
     },
-    { resume: opts.resume === true },
+    { resume: opts.resume === true, concurrency: reindexConcurrency, batchSize: reindexBatchSize, embedMany },
   );
 
   // ── KB recall layer (kb_vec) ──────────────────────────────────────────────
@@ -210,6 +235,7 @@ export async function runReindexCommand(opts: ReindexCommandOptions, ctx: SeedCl
         const pct = total > 0 ? ((done / total) * 100).toFixed(0) : '100';
         process.stdout.write(`\r  [KB] ${done}/${total} ${pct}%    `);
       },
+      { concurrency: reindexConcurrency, batchSize: reindexBatchSize, embedMany },
     );
     kbCount = kb.kbCount;
   }
