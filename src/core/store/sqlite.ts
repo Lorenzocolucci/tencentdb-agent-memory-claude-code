@@ -24,6 +24,7 @@ import { createRequire } from "node:module";
 import type { DatabaseSync, StatementSync } from "node:sqlite";
 import type { MemoryRecord } from "../record/l1-writer.js";
 import { initFoundationsSchema } from "../kb/foundations-schema.js";
+import { ensureMergedIntoColumn } from "../kb/entity-merge.js";
 import { runConsolidation, type ConsolidationStats } from "../kb/consolidation-runner.js";
 import {
   insertFingerprint as kbInsertFingerprint,
@@ -3390,6 +3391,13 @@ export class VectorStore implements IMemoryStore {
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_ent_ns_type ON entities(namespace, type)");
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_ent_canonical ON entities(namespace, canonical_key)");
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_ent_updated ON entities(updated_time)");
+      // merged_into (Cura #2 entity reconciliation): additive + idempotent, so
+      // the read-path can always follow it (resolveOrCreateEntity) and recall can
+      // always filter it (queryEntitiesByTokens/listEntities) — even on a DB
+      // where no merge has run yet. prepare().run() (not db.exec) dodges the
+      // child_process.exec lint false-positive on node:sqlite.
+      ensureMergedIntoColumn(this.db);
+      this.db.prepare("CREATE INDEX IF NOT EXISTS idx_ent_merged ON entities(merged_into)").run();
 
       // ── facts ──
       // HEAD fact = (entity_id, attribute) WHERE superseded_by IS NULL AND valid_to IS NULL.
