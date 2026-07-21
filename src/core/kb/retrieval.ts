@@ -106,6 +106,15 @@ export interface KbRecallOptions {
    * source. First step of the associative-first recall redesign, NOT a DB patch.
    */
   skipVector?: boolean;
+  /**
+   * Ablation flag (default false). When true, kbRecall runs as a FLAT hybrid
+   * retriever: only the FTS + vector candidate sources fuse via RRF, with the
+   * entity-name graph source (Source C) AND Implicit Priming / spreading
+   * activation DISABLED. This is the "what a normal RAG memory does" baseline
+   * used by the LongMemEval harness to isolate Sinapsys's associative edge
+   * (full − flat). Not used by any live path; default keeps full behavior.
+   */
+  flat?: boolean;
   logger?: Logger;
 }
 
@@ -465,6 +474,7 @@ export async function kbRecall(
     rerank = false,
     embeddingTimeoutMs,
     skipVector = false,
+    flat = false,
     logger,
   } = options;
 
@@ -490,7 +500,11 @@ export async function kbRecall(
     skipVector
       ? Promise.resolve<RankedCandidate[]>([])
       : recallVector(store, embeddingService, cleanQuery, candidateLimit, embeddingCallOpts, logger),
-    Promise.resolve(recallEntityMatch(store, cleanQuery, namespace, candidateLimit, logger)),
+    // Source C (entity-name graph match) is the associative seed. `flat` disables
+    // it so the ablation baseline is pure FTS+vector hybrid RRF.
+    flat
+      ? Promise.resolve<RankedCandidate[]>([])
+      : Promise.resolve(recallEntityMatch(store, cleanQuery, namespace, candidateLimit, logger)),
   ]);
 
   if (
@@ -542,7 +556,8 @@ export async function kbRecall(
   // ── Implicit Priming (Idea 2): BEFORE the cut, let sub-threshold candidates amplify
   //    graph-connected ones (co-occurrence ∪ relations) so a weak-but-connected memory
   //    can cross into the top-K — the primer stays invisible. Best-effort, fail-open.
-  primeRankings(reweighted, store, namespace, logger);
+  //    Disabled under `flat` (ablation baseline = no associative amplification).
+  if (!flat) primeRankings(reweighted, store, namespace, logger);
 
   reweighted.sort((a, b) => b.ranking - a.ranking);
 

@@ -377,4 +377,34 @@ describe("kbRecall (temp DB, deterministic fake embedding)", () => {
     const results = await kbRecall("a", { store, embeddingService: embedding, maxResults: 5 });
     expect(results).toEqual([]);
   });
+
+  it("flat=true disables the entity-graph source (Source C): an alias-only hit is reachable in full recall but absent when flat", async () => {
+    // Entity with a DISTINCTIVE alias that does NOT appear in any fact's rendered
+    // text. Its fact is reachable ONLY via the entity-name/alias match (Source C):
+    //   - FTS indexes "Widget — color: red" (canonical name), never the alias.
+    //   - We pass NO embeddingService, so the vector source is empty too.
+    // → full recall finds it via Source C; flat recall (Source C disabled) cannot.
+    const entity = store.resolveOrCreateEntity({
+      type: "gadget",
+      name: "Widget",
+      aliases: ["Xylophone9"],
+      now: "2026-06-01T00:00:00Z",
+    });
+    const fact = store.upsertFact({
+      entityId: entity.id,
+      attribute: "color",
+      value: "red",
+      validFrom: "2026-06-01T00:00:00Z",
+      now: "2026-06-01T00:00:00Z",
+    });
+    const text = `${entity.name} — ${fact.attribute}: ${fact.value}`;
+    store.upsertKbFts({ ownerId: fact.id, ownerKind: "fact", content: text, entityType: "gadget", attribute: "color" });
+
+    // No embeddingService → vector source is inert; the alias only matches Source C.
+    const full = await kbRecall("Xylophone9", { store, maxResults: 5 });
+    const flat = await kbRecall("Xylophone9", { store, maxResults: 5, flat: true });
+
+    expect(full.some((r) => r.owner_id === fact.id)).toBe(true);
+    expect(flat.some((r) => r.owner_id === fact.id)).toBe(false);
+  });
 });
