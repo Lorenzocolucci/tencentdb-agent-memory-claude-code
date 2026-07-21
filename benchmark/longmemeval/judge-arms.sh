@@ -19,6 +19,15 @@ case "$REFARG" in /*|[A-Za-z]:*) REF="$REFARG" ;; *) REF="$HERE/$REFARG" ;; esac
 [ -f "$EVAL" ] || { echo "missing official judge: $EVAL (clone xiaowu0162/LongMemEval)"; exit 1; }
 [ -f "$REF" ] || { echo "missing ref dataset: $REF"; exit 1; }
 
+# Windows Python defaults to cp1252 and evaluate_qa.py opens files without an
+# explicit encoding → UnicodeDecodeError on the UTF-8 datasets. Force UTF-8.
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+# NB: for the huge s_cleaned dataset (277MB) build a SLIM ref containing only the
+# judged question_ids first (evaluate_qa.py re-parses the ref per arm), e.g.:
+#   node -e '...filter data/longmemeval_s_cleaned.json by ids in the jsonl...' > runs/ref-s_cleaned-slim.json
+# and pass that slim file as the ref. Judging gpt-4o also needs OPENAI_API_KEY
+# with spare rate budget — a throttled key stalls in backoff.
+
 echo "=== Official GPT-4o judge (evaluate_qa.py) — base=$BASE ==="
 for ARM in flat kb kb_consol kb5; do
   HYP="$RUNS/hyp-$ARM-$BASE.jsonl"
