@@ -657,12 +657,22 @@ export class OpenAIEmbeddingService implements EmbeddingService {
    * enough for an upstream load balancer / NAT to silently kill it.
    */
   private static defaultDispatcherFactory(): Dispatcher {
+    // Process-scoped override: a batched reindex packs many records' chunks per
+    // request, so DeepInfra's time-to-first-byte can exceed the default 15s
+    // headers/body cap → "Headers Timeout Error" aborts the whole batch. The
+    // reindex process sets TDAI_EMBED_AGENT_TIMEOUT_MS (e.g. 60000); the live
+    // gateway does NOT set it, so recall keeps the tight 15s dead-socket cap.
+    // (Live per-call latency is unaffected either way — the per-request
+    // AbortSignal, ~10s by default, fires first for small live embeds.)
+    const override = Math.floor(Number(process.env.TDAI_EMBED_AGENT_TIMEOUT_MS) || 0);
+    const headersTimeout = override > 0 ? override : AGENT_HEADERS_TIMEOUT_MS;
+    const bodyTimeout = override > 0 ? override : AGENT_BODY_TIMEOUT_MS;
     return new UndiciAgent({
       keepAliveTimeout: AGENT_KEEP_ALIVE_TIMEOUT_MS,
       keepAliveMaxTimeout: AGENT_KEEP_ALIVE_MAX_TIMEOUT_MS,
       connect: { timeout: AGENT_CONNECT_TIMEOUT_MS },
-      headersTimeout: AGENT_HEADERS_TIMEOUT_MS,
-      bodyTimeout: AGENT_BODY_TIMEOUT_MS,
+      headersTimeout,
+      bodyTimeout,
     });
   }
 
