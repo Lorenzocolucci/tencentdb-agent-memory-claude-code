@@ -195,9 +195,17 @@ export async function runReindexCommand(opts: ReindexCommandOptions, ctx: SeedCl
     256,
     Math.max(1, Math.floor(Number(process.env.TDAI_REINDEX_BATCH) || 1)),
   );
+  // Longer per-call timeout for the reindex ONLY (not live recall, which keeps
+  // the service default ~10s): a batched request carries many records' chunks
+  // and large chat-import records make some batches heavy, so a 10s cap aborts
+  // whole batches (→ 64 skipped at once). 60s covers even a full 256-input call.
+  const reindexEmbedTimeoutMs = Math.max(
+    10_000,
+    Math.floor(Number(process.env.TDAI_REINDEX_TIMEOUT_MS) || 60_000),
+  );
   const embedMany =
     typeof embeddingService.embedManyChunked === 'function'
-      ? (texts: string[]) => embeddingService.embedManyChunked!(texts)
+      ? (texts: string[]) => embeddingService.embedManyChunked!(texts, { timeoutMs: reindexEmbedTimeoutMs })
       : undefined;
   if (reindexBatchSize > 1 && embedMany) {
     console.log(`   (embedding batch size: ${reindexBatchSize} records/call)`);
