@@ -17,6 +17,7 @@ export default defineConfig({
     "./src/cli/reindex-standalone.ts",
     "./src/cli/canonicalize-attributes-standalone.ts",
     "./src/cli/reconcile-entities-standalone.ts",
+    "./src/cli/reconcile-apply-standalone.ts",
   ],
   outDir: "./dist",
   format: "esm",
