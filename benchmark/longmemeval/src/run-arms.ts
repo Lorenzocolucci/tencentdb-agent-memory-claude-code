@@ -53,11 +53,20 @@ import { reader, judge } from "./qa.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// ── LIVE production embedder (verified from DB embedding_meta 2026-07-21) ──
-const EMB_PROVIDER = "deepinfra";
-const EMB_BASE_URL = "https://api.deepinfra.com/v1/openai";
-const EMB_MODEL = "Qwen/Qwen3-Embedding-4B";
-const EMB_DIMS = 1024;
+// ── Embedder selection ──
+// Default = the LIVE production embedder (DeepInfra Qwen3-4B/1024, verified from
+// DB embedding_meta) for production fidelity. But DeepInfra Qwen3-4B is too slow
+// to BULK-embed s_cleaned's huge ultrachat distractor haystacks (hundreds of long
+// L0 messages → timeouts). Set TDAI_BENCH_EMBEDDER=openai to use the fast
+// text-embedding-3-small/1536 instead: the flat-vs-kb edge is a property of the
+// recall ALGORITHM (both arms share the embedder), so the comparison stays valid
+// — only "the exact live embedder" fidelity is traded for tractable seeding.
+const USE_OPENAI_EMB = process.env.TDAI_BENCH_EMBEDDER === "openai";
+const EMB_PROVIDER = USE_OPENAI_EMB ? "openai" : "deepinfra";
+const EMB_BASE_URL = USE_OPENAI_EMB ? "https://api.openai.com/v1" : "https://api.deepinfra.com/v1/openai";
+const EMB_MODEL = USE_OPENAI_EMB ? "text-embedding-3-small" : "Qwen/Qwen3-Embedding-4B";
+const EMB_DIMS = USE_OPENAI_EMB ? 1536 : 1024;
+const EMB_KEY_ENV = USE_OPENAI_EMB ? "OPENAI_API_KEY" : "DEEPINFRA_API_KEY";
 
 const VERBOSE = process.env.LME_VERBOSE === "1";
 const logger: Logger = {
@@ -82,9 +91,9 @@ function parseArgs(): Args {
   };
 }
 
-function deepinfraKey(): string {
-  const key = process.env.DEEPINFRA_API_KEY ?? "";
-  if (!key) throw new Error("DEEPINFRA_API_KEY not set — required for Qwen3 embeddings (live embedder)");
+function embKey(): string {
+  const key = process.env[EMB_KEY_ENV] ?? "";
+  if (!key) throw new Error(`${EMB_KEY_ENV} not set — required for embeddings (${EMB_MODEL})`);
   return key;
 }
 
@@ -107,14 +116,14 @@ if (!process.env.TDAI_EMBED_MAX_CONCURRENCY) process.env.TDAI_EMBED_MAX_CONCURRE
 function embeddingConfig(): Record<string, unknown> {
   return {
     enabled: true, provider: EMB_PROVIDER, baseUrl: EMB_BASE_URL,
-    apiKey: deepinfraKey(), model: EMB_MODEL, dimensions: EMB_DIMS,
+    apiKey: embKey(), model: EMB_MODEL, dimensions: EMB_DIMS,
     timeoutMs: EMB_TIMEOUT_MS, captureTimeoutMs: EMB_TIMEOUT_MS, recallTimeoutMs: EMB_TIMEOUT_MS,
   };
 }
 
 function makeEmbeddingService(): OpenAIEmbeddingService {
   return new OpenAIEmbeddingService({
-    provider: EMB_PROVIDER, baseUrl: EMB_BASE_URL, apiKey: deepinfraKey(),
+    provider: EMB_PROVIDER, baseUrl: EMB_BASE_URL, apiKey: embKey(),
     model: EMB_MODEL, dimensions: EMB_DIMS, timeoutMs: EMB_TIMEOUT_MS,
   }, logger);
 }
