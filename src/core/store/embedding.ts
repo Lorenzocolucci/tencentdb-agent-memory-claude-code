@@ -118,6 +118,22 @@ export interface EmbeddingService {
    * an empty array.
    */
   embedChunks(text: string, options?: EmbeddingCallOptions): Promise<Float32Array[]>;
+  /**
+   * Batched variant of {@link embedChunks} for MANY texts at once.
+   *
+   * Splits every input text into overlapping chunks, embeds ALL chunks across
+   * ALL texts in as few batched API calls as possible (one request carries up to
+   * the provider's batch limit of chunks), then regroups the vectors back per
+   * input text. Returns one Float32Array[] per input text (same order), each
+   * holding that text's chunk vectors.
+   *
+   * WHY: per-text round-trips are latency- and per-key-concurrency-bound on a
+   * remote host; packing many texts' chunks into single requests collapses tens
+   * of thousands of calls into hundreds — the decisive lever for a full reindex.
+   * Optional: providers that can't batch (local model, noop) omit it and callers
+   * fall back to per-text {@link embedChunks}.
+   */
+  embedManyChunked?(texts: string[], options?: EmbeddingCallOptions): Promise<Float32Array[][]>;
   /** Return the configured vector dimensions */
   getDimensions(): number;
   /** Return provider + model identifiers for change detection */
@@ -508,6 +524,12 @@ const TRANSIENT_ERROR_MARKERS = [
   "socket hang up",
   "other side closed",
   "terminated",
+  // undici Agent header/body deadline: a slow (not dead) upstream — retry on a
+  // fresh socket rather than treating it as a permanent client error.
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "Headers Timeout Error",
+  "Body Timeout Error",
 ] as const;
 
 /**
@@ -641,12 +663,24 @@ export class OpenAIEmbeddingService implements EmbeddingService {
    * enough for an upstream load balancer / NAT to silently kill it.
    */
   private static defaultDispatcherFactory(): Dispatcher {
+    // Process-scoped override: a batched reindex packs many records' chunks per
+    // request, so DeepInfra's time-to-first-byte can exceed the default 15s
+    // headers/body cap → "Headers Timeout Error" aborts the whole batch. The
+    // reindex process sets TDAI_EMBED_AGENT_TIMEOUT_MS (e.g. 60000); the live
+    // gateway does NOT set it, so recall keeps the tight 15s dead-socket cap.
+    // (Live per-call latency is unaffected either way — the per-request
+    // AbortSignal, ~10s by default, fires first for small live embeds.)
+    // Clamp to [0, 5min]: 0 → keep the tight default; an absurd value can't leave
+    // a hung reindex socket open indefinitely.
+    const override = Math.min(300_000, Math.max(0, Math.floor(Number(process.env.TDAI_EMBED_AGENT_TIMEOUT_MS) || 0)));
+    const headersTimeout = override > 0 ? override : AGENT_HEADERS_TIMEOUT_MS;
+    const bodyTimeout = override > 0 ? override : AGENT_BODY_TIMEOUT_MS;
     return new UndiciAgent({
       keepAliveTimeout: AGENT_KEEP_ALIVE_TIMEOUT_MS,
       keepAliveMaxTimeout: AGENT_KEEP_ALIVE_MAX_TIMEOUT_MS,
       connect: { timeout: AGENT_CONNECT_TIMEOUT_MS },
-      headersTimeout: AGENT_HEADERS_TIMEOUT_MS,
-      bodyTimeout: AGENT_BODY_TIMEOUT_MS,
+      headersTimeout,
+      bodyTimeout,
     });
   }
 
@@ -781,6 +815,32 @@ export class OpenAIEmbeddingService implements EmbeddingService {
     }
 
     return this._callApi(chunks, options?.timeoutMs);
+  }
+
+  /**
+   * Batched, chunk-aware embedding for MANY texts. Splits every text into
+   * chunks, flattens all chunks into one list, embeds them via embedBatch()
+   * (which itself sub-batches by the provider batch limit), then regroups the
+   * resulting vectors back per input text. One request can therefore carry the
+   * chunks of dozens of records, collapsing per-record round-trips.
+   */
+  async embedManyChunked(texts: string[], options?: EmbeddingCallOptions): Promise<Float32Array[][]> {
+    if (texts.length === 0) return [];
+    // boundaries[i] = [startIndexInFlat, chunkCount] for text i.
+    const boundaries: Array<[number, number]> = [];
+    const flat: string[] = [];
+    for (const t of texts) {
+      const { chunks } = splitIntoChunks(t, this.chunkOptions);
+      boundaries.push([flat.length, chunks.length]);
+      for (const c of chunks) flat.push(c);
+    }
+    // A batch of only empty/whitespace texts → one empty group per input.
+    if (flat.length === 0) return texts.map(() => []);
+    // embedBatch first-chunks each input; a pre-split chunk (≤ chunkSize) is
+    // returned unchanged, so this yields exactly one vector per flat chunk while
+    // reusing the tested MAX_BATCH_SIZE sub-batching + retry/circuit-breaker path.
+    const flatVecs = await this.embedBatch(flat, options);
+    return boundaries.map(([start, count]) => flatVecs.slice(start, start + count));
   }
 
   /**

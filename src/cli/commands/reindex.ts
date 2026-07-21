@@ -152,6 +152,24 @@ export async function runReindexCommand(opts: ReindexCommandOptions, ctx: SeedCl
     process.exit(1);
   }
 
+  // Per-call embed timeout for the reindex ONLY. Batched requests carry many
+  // records' chunks and heavy chat-import records make some calls slow, so the
+  // service default (~10s) aborts whole batches. CRITICAL: raising the per-call
+  // AbortSignal is NOT enough — the undici Agent's headers/body timeout (built in
+  // the OpenAIEmbeddingService constructor, i.e. inside createStoreBundle below)
+  // caps at 15s unless TDAI_EMBED_AGENT_TIMEOUT_MS is set. A HeadersTimeoutError
+  // is NOT retried, so the whole batch is skipped deterministically and resume
+  // never converges (silent data loss). Set the env HERE, before the service is
+  // constructed, so the reindex dispatcher is built with the raised cap. The live
+  // gateway never runs this path, so its recall keeps the tight default.
+  const reindexEmbedTimeoutMs = Math.max(
+    10_000,
+    Math.floor(Number(process.env.TDAI_REINDEX_TIMEOUT_MS) || 60_000),
+  );
+  if (!process.env.TDAI_EMBED_AGENT_TIMEOUT_MS) {
+    process.env.TDAI_EMBED_AGENT_TIMEOUT_MS = String(reindexEmbedTimeoutMs);
+  }
+
   // Build the store + embedding service exactly like the live runtime does.
   const bundle = createStoreBundle(cfg, { dataDir, logger });
   const vectorStore = bundle.store;
@@ -180,6 +198,33 @@ export async function runReindexCommand(opts: ReindexCommandOptions, ctx: SeedCl
   console.log(`\n🔁 Reindexing vectors in: ${dbPath}`);
   console.log('   (long texts are split into overlapping chunks; this re-runs safely)\n');
 
+  // Embed concurrency: the reindex is network-bound on a remote embedding host,
+  // so overlapping embed() calls (writes stay serial) cuts wall-time ~N×. Opt-in
+  // via env so only the CLI parallelises; the live init() path keeps its default
+  // sequential behaviour (concurrency=1). Clamp to a sane range.
+  const reindexConcurrency = Math.min(
+    32,
+    Math.max(1, Math.floor(Number(process.env.TDAI_REINDEX_CONCURRENCY) || 1)),
+  );
+  // Batched embedding: pack many records' chunks per provider request. Default 1
+  // (off) keeps the live init() path unchanged; the reindex CLI sets it high. The
+  // provider batch cap (256 chunks/call) still applies inside embedManyChunked.
+  const reindexBatchSize = Math.min(
+    256,
+    Math.max(1, Math.floor(Number(process.env.TDAI_REINDEX_BATCH) || 1)),
+  );
+  // reindexEmbedTimeoutMs is computed above (before the service is built, so the
+  // undici Agent picks up the raised cap). Reused here for the per-call AbortSignal.
+  const embedMany =
+    typeof embeddingService.embedManyChunked === 'function'
+      ? (texts: string[]) => embeddingService.embedManyChunked!(texts, { timeoutMs: reindexEmbedTimeoutMs })
+      : undefined;
+  if (reindexBatchSize > 1 && embedMany) {
+    console.log(`   (embedding batch size: ${reindexBatchSize} records/call)`);
+  } else if (reindexConcurrency > 1) {
+    console.log(`   (embedding concurrency: ${reindexConcurrency})`);
+  }
+
   let lastLayer: 'L1' | 'L0' | '' = '';
   const { l1Count, l0Count } = await vectorStore.reindexAll(
     // Chunk-returning embed function: one vector per chunk, all linked to the
@@ -193,7 +238,7 @@ export async function runReindexCommand(opts: ReindexCommandOptions, ctx: SeedCl
       const pct = total > 0 ? ((done / total) * 100).toFixed(0) : '100';
       process.stdout.write(`\r  [${layer}] ${done}/${total} ${pct}%    `);
     },
-    { resume: opts.resume === true },
+    { resume: opts.resume === true, concurrency: reindexConcurrency, batchSize: reindexBatchSize, embedMany },
   );
 
   // ── KB recall layer (kb_vec) ──────────────────────────────────────────────
@@ -205,11 +250,12 @@ export async function runReindexCommand(opts: ReindexCommandOptions, ctx: SeedCl
   if (typeof vectorStore.reindexKb === 'function') {
     process.stdout.write('\n');
     const kb = await vectorStore.reindexKb(
-      (text: string) => embeddingService.embedChunks(text),
+      (text: string) => embeddingService.embedChunks(text, { timeoutMs: reindexEmbedTimeoutMs }),
       (done, total) => {
         const pct = total > 0 ? ((done / total) * 100).toFixed(0) : '100';
         process.stdout.write(`\r  [KB] ${done}/${total} ${pct}%    `);
       },
+      { concurrency: reindexConcurrency, batchSize: reindexBatchSize, embedMany, resume: opts.resume === true },
     );
     kbCount = kb.kbCount;
   }

@@ -125,3 +125,44 @@ describe("OpenAIEmbeddingService.embedChunks", () => {
     expect(totalChars).toBeGreaterThan(5001);
   });
 });
+
+// Batched reindex path: embedManyChunked packs many records' chunks into few
+// provider calls, then regroups the flat response back to one vector list per
+// input text. A regroup off-by-one would misroute vectors to the wrong record —
+// the highest-risk correctness property of the batched reindex.
+describe("OpenAIEmbeddingService.embedManyChunked (batched reindex)", () => {
+  beforeEach(() => {
+    sentInputs.length = 0;
+    mockAgent = makeMockAgent();
+  });
+
+  afterEach(async () => {
+    await mockAgent.close();
+  });
+
+  it("regroups vectors to each input text, order-preserving, matching per-text chunk counts", async () => {
+    const svc = makeService();
+    const texts = ["a".repeat(50), "b".repeat(6000), "c".repeat(50), "d".repeat(3000)];
+    // Ground truth: the single-text path's per-text chunk vectors.
+    const expected: number[] = [];
+    for (const t of texts) expected.push((await svc.embedChunks(t)).length);
+    const grouped = await svc.embedManyChunked(texts);
+    expect(grouped.length).toBe(texts.length);
+    for (let i = 0; i < texts.length; i++) {
+      expect(grouped[i].length).toBe(expected[i]);
+      for (const v of grouped[i]) expect(v).toHaveLength(DIMS);
+    }
+    // At least one multi-chunk text, so the grouping is non-trivial (not all 1:1).
+    expect(Math.max(...grouped.map((g) => g.length))).toBeGreaterThan(1);
+  });
+
+  it("returns an empty slot for empty / whitespace-only inputs (no misalignment)", async () => {
+    const svc = makeService();
+    const grouped = await svc.embedManyChunked(["hello world", "", "   ", "another memory"]);
+    expect(grouped.length).toBe(4);
+    expect(grouped[1]).toEqual([]);
+    expect(grouped[2]).toEqual([]);
+    expect(grouped[0].length).toBeGreaterThanOrEqual(1);
+    expect(grouped[3].length).toBeGreaterThanOrEqual(1);
+  });
+});
