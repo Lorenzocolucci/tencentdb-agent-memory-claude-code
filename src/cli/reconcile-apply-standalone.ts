@@ -91,6 +91,10 @@ function toFloat32(blob: unknown): Float32Array | null {
 }
 
 function hasColumn(db: DatabaseSync, table: string, col: string): boolean {
+  // Defense-in-depth: PRAGMA cannot bind identifiers, so guard the table name
+  // against a strict identifier shape before interpolating (all callers pass a
+  // literal today, but never template an unvalidated identifier into SQL).
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) throw new Error(`hasColumn: invalid table name ${table}`);
   const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
   return cols.some((c) => c.name === col);
 }
@@ -183,7 +187,9 @@ function doGenerate(dbPath: string, reportFile: string, topAsk: number): void {
       totals: { entities: entities.length, entitiesWithVector: withVector },
       generatedAt: nowIso(),
     });
-    writeFileSync(reportFile, md);
+    // The report embeds entity NAMES (which can be secret-looking labels like
+    // "TWILIO_AUTH_TOKEN") — restrictive mode on POSIX; delete after applying.
+    writeFileSync(reportFile, md, { mode: 0o600 });
 
     const auto = clusters.filter((c) => c.band === "auto");
     const ask = clusters.filter((c) => c.band === "ask");
@@ -191,7 +197,7 @@ function doGenerate(dbPath: string, reportFile: string, topAsk: number): void {
       `\n🔎 Entity-reconciliation report (READ-ONLY)\n` +
         `  entities:        ${entities.length} (${withVector} with a vector)\n` +
         `  clusters:        ${clusters.length}  →  AUTO ${auto.length}, ASK ${ask.length} (top ${topAsk} shown)\n` +
-        `  report written:  ${reportFile}\n\n` +
+        `  report written:  ${reportFile}  (contains entity names — delete after applying)\n\n` +
         `  Next: review the ASK clusters (set 'decision: OK' to merge), then:\n` +
         `    --apply --auto-only            (dry-run of the 140 auto clusters)\n` +
         `    --apply --auto-only --commit   (real merge; stop the gateway first)\n`,
@@ -263,8 +269,10 @@ function doApply(dbPath: string, reportFile: string, opts: { commit: boolean; au
     }
 
     // ── COMMIT path ──
-    ensureMergedIntoColumn(db);
-    // Refuse to run if the DB is locked (gateway still up): a write probe.
+    // Order matters (security review): lock-probe → backup → schema mutation →
+    // merges, so NO write ever precedes the backup and the lock check is the
+    // first thing to touch the DB in write mode.
+    // 1. Refuse to run if the DB is locked (gateway still up): a write probe.
     try {
       db.prepare("BEGIN IMMEDIATE").run();
       db.prepare("ROLLBACK").run();
@@ -273,10 +281,14 @@ function doApply(dbPath: string, reportFile: string, opts: { commit: boolean; au
       process.exit(1);
     }
 
-    // Backup BEFORE any mutation.
+    // 2. Backup BEFORE any mutation. NOTE: this copy is the FULL DB (secrets
+    //    included) — prune old .bak-pre-reconcile-* files after verifying.
     const backup = `${dbPath}.bak-pre-reconcile-${backupStamp()}`;
     copyFileSync(dbPath, backup);
-    process.stderr.write(`\n  backup: ${backup}\n`);
+    process.stderr.write(`\n  backup: ${backup}  (full DB with secrets — prune old ones)\n`);
+
+    // 3. Now the additive schema mutation (no-op when the column already exists).
+    ensureMergedIntoColumn(db);
 
     const now = nowIso();
     let merged = 0, rekeyed = 0, resolved = 0, failed = 0;
@@ -315,6 +327,10 @@ function main(): void {
   }
   if (args.generate === args.apply) {
     process.stderr.write(`\n❌ Choose exactly one of --generate or --apply.\n${USAGE}`);
+    process.exit(1);
+  }
+  if (!Number.isInteger(args.topAsk) || args.topAsk < 0) {
+    process.stderr.write(`\n❌ --top-ask must be a non-negative integer (got ${args.topAsk}).\n`);
     process.exit(1);
   }
   const dbPath = join(dataDir, "vectors.db");

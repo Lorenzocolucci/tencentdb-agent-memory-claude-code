@@ -10,6 +10,12 @@ workspace/
 # Test caches
 __tests__/soak/.model-cache/
 
+# Consolidation Cura #2 review reports + DB backups (contain entity names /
+# full DB — never commit; see reconcile-apply-standalone)
+entity-reconciliation-report.md
+*-report.md
+*.bak-pre-reconcile-*
+
 # Python cache
 __pycache__/
 *.pyc
