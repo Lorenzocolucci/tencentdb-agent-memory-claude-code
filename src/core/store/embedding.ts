@@ -524,6 +524,12 @@ const TRANSIENT_ERROR_MARKERS = [
   "socket hang up",
   "other side closed",
   "terminated",
+  // undici Agent header/body deadline: a slow (not dead) upstream — retry on a
+  // fresh socket rather than treating it as a permanent client error.
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "Headers Timeout Error",
+  "Body Timeout Error",
 ] as const;
 
 /**
@@ -664,7 +670,9 @@ export class OpenAIEmbeddingService implements EmbeddingService {
     // gateway does NOT set it, so recall keeps the tight 15s dead-socket cap.
     // (Live per-call latency is unaffected either way — the per-request
     // AbortSignal, ~10s by default, fires first for small live embeds.)
-    const override = Math.floor(Number(process.env.TDAI_EMBED_AGENT_TIMEOUT_MS) || 0);
+    // Clamp to [0, 5min]: 0 → keep the tight default; an absurd value can't leave
+    // a hung reindex socket open indefinitely.
+    const override = Math.min(300_000, Math.max(0, Math.floor(Number(process.env.TDAI_EMBED_AGENT_TIMEOUT_MS) || 0)));
     const headersTimeout = override > 0 ? override : AGENT_HEADERS_TIMEOUT_MS;
     const bodyTimeout = override > 0 ? override : AGENT_BODY_TIMEOUT_MS;
     return new UndiciAgent({
