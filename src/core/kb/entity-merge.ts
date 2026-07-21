@@ -12,15 +12,21 @@
  * entity_ids, so upsertFact never collides them. Merging + re-keying makes the
  * keys collide so the existing engine collapses same-attribute contradictions.
  *
- * SAFETY: never DELETEs. Satellites are kept (marked merged_into); facts are
- * re-keyed and losers closed (valid_to/superseded_by), never removed. One
- * transaction. Deterministic (recency by valid_from→learned_at→id; no LLM).
- * Reversible: the satellite rows + closed facts remain; a DB backup is the
- * coarse rollback.
+ * SAFETY: satellites are kept (marked merged_into); facts are re-keyed and losers
+ * closed (valid_to/superseded_by), never removed; events re-keyed in place. The
+ * ONE place rows are DELETEd is relation re-keying (Cura #2c), which has no
+ * soft-delete column:
+ *   - FOLD: a duplicate of an existing canonical edge is dropped AFTER its support
+ *     is added to the survivor → support preserved, row removed.
+ *   - SELF-LOOP: an edge that collapses to (canonical→canonical) is dropped and
+ *     its support intentionally DISCARDED — a relation to itself is noise, there
+ *     is no survivor to carry it. No HEAD fact/event is ever lost this way.
+ * One transaction. Deterministic (recency by valid_from→learned_at→id; no LLM).
+ * Reversible via a DB backup (the coarse rollback).
  */
 
 import type { DatabaseSync } from "node:sqlite";
-import { normalizeFactValue } from "./kb-queries.js";
+import { normalizeFactValue, relationId } from "./kb-queries.js";
 
 /** Whether a table exists (mergeEntities tolerates facts-only fixtures without `events`). */
 function tableExists(db: DatabaseSync, name: string): boolean {
@@ -55,6 +61,48 @@ export function pickCanonical(candidates: CanonicalCandidate[]): string {
       (a.createdTime < b.createdTime ? -1 : a.createdTime > b.createdTime ? 1 : 0) ||
       (a.id < b.id ? -1 : 1),
   )[0].id;
+}
+
+export interface CanonGrouping {
+  /** canonical id → its satellite ids (sorted, deterministic). */
+  byCanon: Map<string, string[]>;
+  /** ids whose merged_into chain hit a cycle → skipped (should never occur). */
+  cyclic: string[];
+}
+
+/**
+ * Group already-merged satellites by their ULTIMATE canonical, following
+ * `merged_into` chains. Pure + deterministic (rows sorted by id), cycle-safe
+ * (a cyclic chain lists the id in `cyclic` and drops it from grouping). Used by
+ * the Cura #2c relation backfill.
+ */
+export function groupByUltimateCanonical(
+  rows: ReadonlyArray<{ id: string; merged_into: string }>,
+): CanonGrouping {
+  const parent = new Map(rows.map((r) => [r.id, r.merged_into]));
+  const ultimate = (id: string): string | null => {
+    let cur = id;
+    const seen = new Set<string>([id]);
+    while (parent.has(cur)) {
+      const nxt = parent.get(cur) as string;
+      if (seen.has(nxt)) return null; // cycle
+      seen.add(nxt);
+      cur = nxt;
+    }
+    return cur;
+  };
+  const byCanon = new Map<string, string[]>();
+  const cyclic: string[] = [];
+  const sorted = [...rows].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  for (const r of sorted) {
+    const canon = ultimate(r.id);
+    if (canon === null) { cyclic.push(r.id); continue; }
+    if (canon === r.id) continue; // an entity that is its own canonical isn't a satellite
+    const arr = byCanon.get(canon);
+    if (arr) arr.push(r.id);
+    else byCanon.set(canon, [r.id]);
+  }
+  return { byCanon, cyclic };
 }
 
 interface FactRow {
@@ -125,6 +173,85 @@ export function resolveEntityHeadCollisions(db: DatabaseSync, entityId: string, 
   return closed;
 }
 
+export interface RelationRekeyResult {
+  /** Satellite edges re-pointed onto the canonical (no conflicting canonical edge). */
+  relationsRekeyed: number;
+  /** Satellite edges whose (ns,src,type,dst) already existed on the canonical → support folded, duplicate dropped. */
+  relationsFolded: number;
+  /** Satellite edges that became a self-loop (src==dst==canonical) after re-key → dropped (meaningless). */
+  relationsSelfLoopsDropped: number;
+}
+
+/**
+ * Re-key relations from satellites onto the canonical, conflict-safe, within the
+ * caller's transaction. Cura #2c.
+ *
+ * WHY: mergeEntities re-keys facts + events but relations (src/dst_entity_id)
+ * kept pointing at the merged-away satellites, so queryRelationsForEntity(canon)
+ * missed them — the canonical's "Related [[entity]]" links + relation-based recall
+ * were incomplete for exactly the entity that absorbed the duplicates.
+ *
+ * SEMANTICS (deterministic, sequential):
+ *   - map each touched edge's src/dst: satellite → canonical.
+ *   - src==dst after mapping → self-loop → DROP (a relation to itself is noise).
+ *   - target (ns,src',type,dst') already exists (canonical had that edge, or an
+ *     earlier satellite already produced it) → FOLD support into the survivor,
+ *     DROP this duplicate (support is preserved — "non-destructive in spirit").
+ *   - otherwise → re-point this row (and recompute its deterministic id).
+ */
+export function rekeyRelationsOnMerge(
+  db: DatabaseSync,
+  canonicalId: string,
+  satelliteIds: readonly string[],
+): RelationRekeyResult {
+  const out: RelationRekeyResult = { relationsRekeyed: 0, relationsFolded: 0, relationsSelfLoopsDropped: 0 };
+  if (!tableExists(db, "relations") || satelliteIds.length === 0) return out;
+
+  const satSet = new Set(satelliteIds);
+  interface RelRow { id: string; src_entity_id: string; type: string; dst_entity_id: string; namespace: string; support: number }
+
+  // Gather every edge touching a satellite (as src OR dst), deduped by id.
+  const touched = new Map<string, RelRow>();
+  const sel = db.prepare(
+    "SELECT id, src_entity_id, type, dst_entity_id, namespace, support FROM relations WHERE src_entity_id = ? OR dst_entity_id = ?",
+  );
+  for (const sid of satelliteIds) {
+    for (const r of sel.all(sid, sid) as unknown as RelRow[]) touched.set(r.id, r);
+  }
+
+  const findExisting = db.prepare(
+    "SELECT id FROM relations WHERE namespace = ? AND src_entity_id = ? AND type = ? AND dst_entity_id = ? AND id != ?",
+  );
+  const foldSupport = db.prepare("UPDATE relations SET support = support + ? WHERE id = ?");
+  const del = db.prepare("DELETE FROM relations WHERE id = ?");
+  const move = db.prepare("UPDATE relations SET id = ?, src_entity_id = ?, dst_entity_id = ? WHERE id = ?");
+
+  for (const r of touched.values()) {
+    const src2 = satSet.has(r.src_entity_id) ? canonicalId : r.src_entity_id;
+    const dst2 = satSet.has(r.dst_entity_id) ? canonicalId : r.dst_entity_id;
+    if (src2 === dst2) {
+      del.run(r.id);
+      out.relationsSelfLoopsDropped++;
+      continue;
+    }
+    const existing = findExisting.get(r.namespace, src2, r.type, dst2, r.id) as { id: string } | undefined;
+    if (existing) {
+      // Fold only `support` (the quantity spreading-activation reads). The dropped
+      // row's provenance (valid_from/source_event_id) and the unused `weight`
+      // column are intentionally not merged — not consumed by recall today.
+      foldSupport.run(r.support, existing.id);
+      del.run(r.id);
+      out.relationsFolded++;
+    } else {
+      // No conflicting edge → re-point + recompute the deterministic id so future
+      // upsertRelation(canonical,type,dst) resolves to this same row.
+      move.run(relationId(r.namespace, src2, r.type, dst2), src2, dst2, r.id);
+      out.relationsRekeyed++;
+    }
+  }
+  return out;
+}
+
 export interface MergePlan {
   canonicalId: string;
   satelliteIds: string[];
@@ -138,6 +265,12 @@ export interface MergeResult {
   aliasesAdded: number;
   /** Distinct events whose entities_json referenced a satellite → re-keyed to canonical. */
   eventsRekeyed: number;
+  /** Satellite relation edges re-pointed onto the canonical (Cura #2c). */
+  relationsRekeyed: number;
+  /** Satellite relation edges whose target already existed → support folded, duplicate dropped. */
+  relationsFolded: number;
+  /** Satellite relation edges that became self-loops after re-key → dropped. */
+  relationsSelfLoopsDropped: number;
 }
 
 /**
@@ -220,6 +353,9 @@ export function mergeEntities(db: DatabaseSync, plan: MergePlan, nowIso: string)
       eventsRekeyed = affected.size;
     }
 
+    // Re-key relations (Cura #2c): satellite edges → canonical, conflict-safe.
+    const rel = rekeyRelationsOnMerge(db, canonicalId, satellites);
+
     const headCollisionsResolved = resolveEntityHeadCollisions(db, canonicalId, nowIso);
 
     db.prepare("COMMIT").run();
@@ -230,6 +366,9 @@ export function mergeEntities(db: DatabaseSync, plan: MergePlan, nowIso: string)
       headCollisionsResolved,
       aliasesAdded: aliasSet.size - before,
       eventsRekeyed,
+      relationsRekeyed: rel.relationsRekeyed,
+      relationsFolded: rel.relationsFolded,
+      relationsSelfLoopsDropped: rel.relationsSelfLoopsDropped,
     };
   } catch (err) {
     try {
