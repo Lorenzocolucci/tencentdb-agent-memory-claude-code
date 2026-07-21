@@ -2858,6 +2858,7 @@ export class VectorStore implements IMemoryStore {
       concurrency?: number;
       batchSize?: number;
       embedMany?: (texts: string[]) => Promise<Float32Array[][]>;
+      resume?: boolean;
     },
   ): Promise<{ kbCount: number }> {
     if (this.degraded || !this.kbVecReady) {
@@ -2868,10 +2869,31 @@ export class VectorStore implements IMemoryStore {
     const embedMany = opts?.embedMany;
     const batchSize = Math.max(1, Math.floor(opts?.batchSize ?? 1));
     const useBatched = typeof embedMany === "function" && batchSize > 1;
+    // Resume mode: skip owners that ALREADY have a kb_vec vector. WITHOUT this,
+    // reindexKb re-embeds ALL owners every run — and since a reindex pass can be
+    // killed periodically (env watchdog), an un-resumable 30k-owner KB pass that
+    // takes longer than the kill interval would restart from 0 forever and NEVER
+    // converge. Resume makes each pass advance the frontier like reindexAll does.
+    const embeddedKb: Set<string> | null = opts?.resume
+      ? (() => {
+          try {
+            const done = this.db.prepare("SELECT DISTINCT owner_id FROM kb_vec").all() as Array<{ owner_id: string }>;
+            const set = new Set(done.map((r) => r.owner_id));
+            this.logger?.info(`${TAG} reindexKb resume: ${set.size} kb_vec owners already embedded → will be skipped`);
+            return set;
+          } catch (err) {
+            this.logger?.warn?.(`${TAG} reindexKb resume: could not read kb_vec (full reindex): ${err instanceof Error ? err.message : String(err)}`);
+            return null;
+          }
+        })()
+      : null;
     const rows = this.getAllKbTexts();
     // Empty-content owners were no-ops in the sequential path; skip them up-front
-    // so they don't occupy a batch/wave slot, and still count them as "done".
-    const pending = rows.filter((r) => r.content && r.content.trim().length > 0);
+    // (and, in resume mode, owners already embedded) so they don't occupy a
+    // batch/wave slot, and still count them as "done".
+    const pending = rows.filter(
+      (r) => r.content && r.content.trim().length > 0 && !embeddedKb?.has(r.owner_id),
+    );
     let done = rows.length - pending.length;
     onProgress?.(done, rows.length);
     const write = (r: { owner_id: string; owner_kind: string; content: string; updated_time: string }, chunkVectors: Float32Array[]) => {

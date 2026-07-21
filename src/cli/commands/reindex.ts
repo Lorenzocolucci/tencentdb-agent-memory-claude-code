@@ -243,7 +243,7 @@ export async function runReindexCommand(opts: ReindexCommandOptions, ctx: SeedCl
         const pct = total > 0 ? ((done / total) * 100).toFixed(0) : '100';
         process.stdout.write(`\r  [KB] ${done}/${total} ${pct}%    `);
       },
-      { concurrency: reindexConcurrency, batchSize: reindexBatchSize, embedMany },
+      { concurrency: reindexConcurrency, batchSize: reindexBatchSize, embedMany, resume: opts.resume === true },
     );
     kbCount = kb.kbCount;
   }
