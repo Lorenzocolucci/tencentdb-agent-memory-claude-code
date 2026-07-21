@@ -285,6 +285,12 @@ async function main(): Promise<void> {
     `(${args.perType}/type × ${args.types.length}) | done: ${doneById.size}`);
   console.error(`arms: A=flat@20  B=kb@20  C=kb@20+consol  D=kb@5\n`);
 
+  // ONE_PER_RUN: process exactly ONE new question, then exit cleanly. The seed
+  // path hits a native sqlite-vec / node:sqlite crash (exit 127) when a second
+  // question's store is initialised in the SAME process; doing one question per
+  // invocation and exiting BEFORE the next never reaches that trigger. The driver
+  // (arms-driver.sh) relaunches until all are done — clean, deterministic, no crash.
+  const ONE_PER_RUN = process.env.TDAI_ARMS_ONE_PER_RUN === "1";
   const remaining = subset.filter((q) => !doneById.has(q.question_id));
   for (let i = 0; i < remaining.length; i++) {
     const q = remaining[i]!;
@@ -301,6 +307,7 @@ async function main(): Promise<void> {
         `[ret flat=${r.arms.flat?.retrieved} kb=${r.arms.kb?.retrieved}] consol=${JSON.stringify(r.consolidation)}`);
       console.error(`      gold: ${r.gold}`);
     }
+    if (ONE_PER_RUN) { console.error(`(one-per-run: exiting cleanly, driver will resume)`); break; }
   }
 
   // ── Aggregate (in-loop judge, directional) + emit official-judge hypothesis JSONLs ──
@@ -346,4 +353,9 @@ async function main(): Promise<void> {
   console.error(`NOTE: ${path.basename(datasetPath).includes("oracle") ? "ORACLE = evidence-only, upper bound, NOT leaderboard-comparable." : "s_cleaned = distractors, realistic."}`);
 }
 
-main().catch((err) => { console.error("ARMS RUN FAILED:", err); process.exit(1); });
+main()
+  // Force a clean exit: after the sqlite-vec / node:sqlite work, letting node fall
+  // through its own teardown can segfault (exit 127). All results are already
+  // flushed synchronously (appendFileSync), so exit(0) loses nothing.
+  .then(() => process.exit(0))
+  .catch((err) => { console.error("ARMS RUN FAILED:", err); process.exit(1); });

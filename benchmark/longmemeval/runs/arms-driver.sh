@@ -17,6 +17,9 @@ JSONL="$HERE/runs/arms-$BASE.jsonl"
 LOG="$HERE/runs/${BASE}.driver.log"
 MAX_STUCK=3
 prev=0; stuck=0; attempt=0
+# One question per run-arms invocation → the process never initialises a second
+# question's store in the same process, sidestepping the native seed crash.
+export TDAI_ARMS_ONE_PER_RUN=1
 cd "$REPO" || exit 1
 while :; do
   done_ct=$( [ -f "$JSONL" ] && grep -c '"question_id"' "$JSONL" || echo 0 )
