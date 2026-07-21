@@ -10,6 +10,12 @@ workspace/
 # Test caches
 __tests__/soak/.model-cache/
 
+# Consolidation Cura #2 review reports + DB backups (contain entity names /
+# full DB — never commit; see reconcile-apply-standalone)
+entity-reconciliation-report.md
+*-report.md
+*.bak-pre-reconcile-*
+
 # Python cache
 __pycache__/
 *.pyc
@@ -68,3 +74,8 @@ kb-probe.mts
 src/**/__tests__/_*.test.ts
 *_live_out.txt
 *_dryrun_out.txt
+
+# Throwaway analysis/backfill scratch scripts + on-disk audit dumps (never commit;
+# audit JSON carries internal fact/entity ids)
+scratch-*
+*-audit*.json

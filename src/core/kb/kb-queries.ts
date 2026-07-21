@@ -19,6 +19,7 @@
 
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import { canonicalizeAttribute } from "./attribute-canon-map.js";
 import type {
   KbEntity,
   KbEvent,
@@ -293,18 +294,50 @@ function requireNonEmpty(value: unknown, field: string): string {
 // ============================================================================
 
 /**
+ * Follow `merged_into` from a matched entity row to its CANONICAL row.
+ *
+ * Cura #2 (entity reconciliation) merges near-duplicates by marking the
+ * satellite `merged_into = canonical` and re-keying its facts. This resolver
+ * must therefore RETURN THE CANONICAL when an exact/alias lookup lands on a
+ * satellite — otherwise new facts would keep landing on the merged-away row.
+ *
+ * Transitive (a satellite could point at a row that was itself later merged),
+ * cycle-guarded, and defensive: a broken/dangling pointer keeps the last good
+ * row rather than throwing. Pure read; no mutation. The `merged_into` column is
+ * ensured at KB init, so it is always present here.
+ */
+function followMergedRow(db: DatabaseSync, row: Record<string, unknown>): Record<string, unknown> {
+  let cur = row;
+  const seen = new Set<string>([cur.id as string]);
+  while (cur.merged_into) {
+    const target = cur.merged_into as string;
+    if (seen.has(target)) break; // cycle guard — never loop forever
+    seen.add(target);
+    const next = db
+      .prepare("SELECT * FROM entities WHERE id = ?")
+      .get(target) as Record<string, unknown> | undefined;
+    if (!next) break; // dangling pointer → keep the last good row
+    cur = next;
+  }
+  return cur;
+}
+
+/**
  * Resolve an entity by canonical key, or create it.
  *
  * Resolution order (deterministic, NO LLM):
- *   1. Exact match on (namespace, type, canonical_key)        → return it.
+ *   1. Exact match on (namespace, type, canonical_key)        → follow any
+ *      `merged_into` to the canonical, then return it.
  *   2. Alias match: an existing entity (same ns+type) whose aliases_json
- *      contains the normalized name                            → merge the
- *      incoming display name into its aliases and return it.
+ *      contains the normalized name                            → follow
+ *      `merged_into`, merge the incoming display name into the canonical's
+ *      aliases, and return it.
  *   3. Otherwise create a fresh entity with the deterministic sha1 id.
  *
  * Aliases let "TS" find the "TypeScript" entity once that alias has been
  * recorded, without a fuzzy/LLM step. Near-duplicate reconciliation that needs
- * judgement is a separate, non-destructive lint job (later phase).
+ * judgement is the separate, non-destructive Cura #2 merge (which sets
+ * `merged_into`, followed here).
  */
 export function resolveOrCreateEntity(
   db: DatabaseSync,
@@ -334,8 +367,11 @@ export function resolveOrCreateEntity(
     .prepare("SELECT * FROM entities WHERE namespace = ? AND type = ? AND canonical_key = ?")
     .get(namespace, normType, key) as Record<string, unknown> | undefined;
   if (exact) {
-    // Merge any NEW aliases the caller supplied (idempotent — set union).
-    const merged = mergeAliasesIfNeeded(db, exact, incomingAliases, now);
+    // Follow merged_into to the canonical, then merge any NEW aliases the
+    // caller supplied (idempotent — set union). If the row isn't merged,
+    // followMergedRow returns it unchanged (behaviour identical to before).
+    const canonical = followMergedRow(db, exact);
+    const merged = mergeAliasesIfNeeded(db, canonical, incomingAliases, now);
     return merged;
   }
 
@@ -350,8 +386,10 @@ export function resolveOrCreateEntity(
   for (const cand of candidates) {
     const aliases = parseJsonArray(cand.aliases_json).map((a) => normalizeBase(a));
     if (aliases.includes(normName)) {
-      // Merge the incoming display name (+ any extra aliases) into the entity.
-      const merged = mergeAliasesIfNeeded(db, cand, [name, ...incomingAliases], now);
+      // Follow merged_into to the canonical, then merge the incoming display
+      // name (+ any extra aliases) into it.
+      const canonical = followMergedRow(db, cand);
+      const merged = mergeAliasesIfNeeded(db, canonical, [name, ...incomingAliases], now);
       return merged;
     }
   }
@@ -412,7 +450,9 @@ export function queryEntityById(db: DatabaseSync, id: string): KbEntity | null {
   const row = db.prepare("SELECT * FROM entities WHERE id = ?").get(id) as
     | Record<string, unknown>
     | undefined;
-  return row ? rowToEntity(row) : null;
+  // Follow merged_into so a satellite id resolves to the (fact-bearing) canonical
+  // instead of a hollow merged-away row.
+  return row ? rowToEntity(followMergedRow(db, row)) : null;
 }
 
 export function queryEntityByKey(
@@ -424,7 +464,8 @@ export function queryEntityByKey(
   const row = db
     .prepare("SELECT * FROM entities WHERE namespace = ? AND type = ? AND canonical_key = ?")
     .get(namespace, normalizeBase(type), canonicalKeyValue) as Record<string, unknown> | undefined;
-  return row ? rowToEntity(row) : null;
+  // Follow merged_into so a satellite key resolves to the canonical.
+  return row ? rowToEntity(followMergedRow(db, row)) : null;
 }
 
 // ============================================================================
@@ -554,7 +595,12 @@ export function upsertFact(
   nowMs: number = Date.now(),
 ): KbFact {
   const entityIdValue = requireNonEmpty(params.entityId, "entityId");
-  const attribute = requireNonEmpty(params.attribute, "attribute");
+  // Consolidation Cura #1: canonicalize the attribute at the single write choke
+  // point so synonymous attributes ("stato"/"status", "costo"/"cost") share the
+  // (entity_id, attribute) HEAD key. That lets the supersession algorithm below
+  // collapse what would otherwise be permanently-coexisting contradictions.
+  // Deterministic + no-LLM; unknown attributes (incl. rule_*) pass through.
+  const attribute = canonicalizeAttribute(requireNonEmpty(params.attribute, "attribute"));
   const value = requireNonEmpty(params.value, "value");
   const now = requireNonEmpty(params.now, "now");
   const validFrom = params.validFrom?.trim() || now;
@@ -851,8 +897,11 @@ export function queryEntitiesByTokens(
   const normTokens = [...new Set(tokens.map((t) => normalizeBase(t)).filter((t) => t.length > 0))];
   if (normTokens.length === 0) return [];
 
+  // Exclude entities merged away by Cura #2 (their facts are re-keyed onto the
+  // canonical, which carries their name as an alias — so recall still finds the
+  // canonical, never the empty satellite).
   const rows = db
-    .prepare("SELECT * FROM entities WHERE namespace = ?")
+    .prepare("SELECT * FROM entities WHERE namespace = ? AND merged_into IS NULL")
     .all(namespace) as Array<Record<string, unknown>>;
 
   // Score each entity by how many distinct query tokens it matches (name /
@@ -971,8 +1020,9 @@ export function listEntities(
     .map((t) => normalizeBase(t))
     .filter((t) => t.length > 0);
 
+  // Exclude Cura #2 merged-away satellites (see queryEntitiesByTokens).
   let sql =
-    "SELECT * FROM entities WHERE namespace = ?";
+    "SELECT * FROM entities WHERE namespace = ? AND merged_into IS NULL";
   const args: unknown[] = [ns];
   if (types.length > 0) {
     sql += ` AND type IN (${types.map(() => "?").join(", ")})`;
