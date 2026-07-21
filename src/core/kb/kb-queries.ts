@@ -450,7 +450,9 @@ export function queryEntityById(db: DatabaseSync, id: string): KbEntity | null {
   const row = db.prepare("SELECT * FROM entities WHERE id = ?").get(id) as
     | Record<string, unknown>
     | undefined;
-  return row ? rowToEntity(row) : null;
+  // Follow merged_into so a satellite id resolves to the (fact-bearing) canonical
+  // instead of a hollow merged-away row.
+  return row ? rowToEntity(followMergedRow(db, row)) : null;
 }
 
 export function queryEntityByKey(
@@ -462,7 +464,8 @@ export function queryEntityByKey(
   const row = db
     .prepare("SELECT * FROM entities WHERE namespace = ? AND type = ? AND canonical_key = ?")
     .get(namespace, normalizeBase(type), canonicalKeyValue) as Record<string, unknown> | undefined;
-  return row ? rowToEntity(row) : null;
+  // Follow merged_into so a satellite key resolves to the canonical.
+  return row ? rowToEntity(followMergedRow(db, row)) : null;
 }
 
 // ============================================================================

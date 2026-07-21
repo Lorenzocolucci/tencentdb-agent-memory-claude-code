@@ -32,22 +32,23 @@ import {
   toMergePlans,
   type EntityMeta,
 } from "../core/kb/entity-merge-plan.js";
-import { mergeEntities, ensureMergedIntoColumn } from "../core/kb/entity-merge.js";
+import { mergeEntities, ensureMergedIntoColumn, type MergePlan } from "../core/kb/entity-merge.js";
 
 const DEFAULT_REPORT = "entity-reconciliation-report.md";
 
 const USAGE = `
 Usage:
   node dist/src/cli/reconcile-apply-standalone.mjs --data-dir <dir> --generate [--top-ask N] [--report <file>]
-  node dist/src/cli/reconcile-apply-standalone.mjs --data-dir <dir> --apply [--auto-only] [--commit] [--report <file>]
+  node dist/src/cli/reconcile-apply-standalone.mjs --data-dir <dir> --apply [--auto-only] [--commit --gateway-stopped] [--report <file>]
 
 Modes:
-  --generate   READ-ONLY: write an editable Markdown review report.
-  --apply      Read the report and merge. DRY-RUN unless --commit is given.
-  --commit     Perform the real merge (backup first; requires the gateway stopped).
-  --auto-only  Under --apply: only AUTO clusters (safe first live run).
-  --top-ask N  Under --generate: how many ASK clusters to include (default 30).
-  --report F   Report path (default <data-dir>/${DEFAULT_REPORT}).
+  --generate        READ-ONLY: write an editable Markdown review report.
+  --apply           Read the report and merge. DRY-RUN unless --commit is given.
+  --commit          Perform the real merge (checkpoint+backup first).
+  --gateway-stopped Required with --commit: you assert the gateway is stopped.
+  --auto-only       Under --apply: only AUTO clusters (safe first live run).
+  --top-ask N       Under --generate: how many ASK clusters to include (default 30).
+  --report F        Report path (default <data-dir>/${DEFAULT_REPORT}).
 `;
 
 interface Args {
@@ -57,11 +58,12 @@ interface Args {
   apply: boolean;
   commit: boolean;
   autoOnly: boolean;
+  gatewayStopped: boolean;
   topAsk: number;
 }
 
 function parseArgs(argv: readonly string[]): Args {
-  const out: Args = { generate: false, apply: false, commit: false, autoOnly: false, topAsk: 30 };
+  const out: Args = { generate: false, apply: false, commit: false, autoOnly: false, gatewayStopped: false, topAsk: 30 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--data-dir") out.dataDir = argv[++i];
@@ -74,6 +76,7 @@ function parseArgs(argv: readonly string[]): Args {
     else if (a === "--apply") out.apply = true;
     else if (a === "--commit") out.commit = true;
     else if (a === "--auto-only") out.autoOnly = true;
+    else if (a === "--gateway-stopped") out.gatewayStopped = true;
     else if (a === "--help" || a === "-h") { process.stdout.write(USAGE); process.exit(0); }
     else { process.stderr.write(`\n❌ Unknown argument: ${a}\n${USAGE}`); process.exit(1); }
   }
@@ -167,7 +170,31 @@ function nowIso(): string {
 }
 
 function backupStamp(): string {
-  return nowIso().replace(/[-:]/g, "").replace(/\..*$/, "").replace("T", "-");
+  // Millisecond precision so two same-second --commit runs never clobber a backup.
+  return nowIso().replace(/[-:]/g, "").replace(/\./g, "").replace("T", "-").replace("Z", "");
+}
+
+/**
+ * Re-derive clusters from the DB and assert every merge-plan id belongs to a
+ * SINGLE detected near-duplicate cluster. Prevents a hand-edit that mistypes an
+ * id (into another valid same-type entity) from silently merging strangers:
+ * the report is not blindly trusted. Fail-loud on any id not in a detected cluster.
+ */
+function validatePlansAgainstDetection(db: DatabaseSync, plans: MergePlan[]): void {
+  const { entities } = loadEntities(db);
+  const { pairs } = findCandidatePairs(entities);
+  const clusters = buildClusters(pairs);
+  const memberSets = clusters.map((c) => new Set(c.members));
+  for (const p of plans) {
+    const ids = [p.canonicalId, ...p.satelliteIds];
+    const covering = memberSets.find((s) => ids.every((id) => s.has(id)));
+    if (!covering) {
+      throw new Error(
+        `Plan keep=${p.canonicalId} (+${p.satelliteIds.length}) is NOT a subset of any detected ` +
+          `near-duplicate cluster — refusing (possible mistyped id in the report).`,
+      );
+    }
+  }
 }
 
 // ── generate ─────────────────────────────────────────────────────────────────
@@ -199,8 +226,8 @@ function doGenerate(dbPath: string, reportFile: string, topAsk: number): void {
         `  clusters:        ${clusters.length}  →  AUTO ${auto.length}, ASK ${ask.length} (top ${topAsk} shown)\n` +
         `  report written:  ${reportFile}  (contains entity names — delete after applying)\n\n` +
         `  Next: review the ASK clusters (set 'decision: OK' to merge), then:\n` +
-        `    --apply --auto-only            (dry-run of the 140 auto clusters)\n` +
-        `    --apply --auto-only --commit   (real merge; stop the gateway first)\n`,
+        `    --apply --auto-only                         (dry-run of the auto clusters)\n` +
+        `    --apply --auto-only --commit --gateway-stopped   (real merge; stop the gateway first)\n`,
     );
   } finally {
     db.close();
@@ -209,7 +236,7 @@ function doGenerate(dbPath: string, reportFile: string, topAsk: number): void {
 
 // ── apply ──────────────────────────────────────────────────────────────────
 
-function doApply(dbPath: string, reportFile: string, opts: { commit: boolean; autoOnly: boolean }): void {
+function doApply(dbPath: string, reportFile: string, opts: { commit: boolean; autoOnly: boolean; gatewayStopped: boolean }): void {
   if (!existsSync(reportFile)) {
     process.stderr.write(`\n❌ No report at ${reportFile}. Run --generate first.\n`);
     process.exit(1);
@@ -232,6 +259,11 @@ function doApply(dbPath: string, reportFile: string, opts: { commit: boolean; au
   const db = new DatabaseSync(dbPath, { allowExtension: true, readOnly: !opts.commit });
   try {
     createRequire(import.meta.url)("sqlite-vec").load(db);
+
+    // The report is NOT blindly trusted: re-derive clusters and assert every plan
+    // is a subset of one detected near-duplicate cluster (catches mistyped ids).
+    validatePlansAgainstDetection(db, plans);
+    process.stderr.write(`  membership check:     OK (all ${plans.length} plans within detected clusters)\n`);
 
     // Dry-run preview: how many facts re-key, how many attribute HEAD collisions.
     let totalRekey = 0;
@@ -269,9 +301,20 @@ function doApply(dbPath: string, reportFile: string, opts: { commit: boolean; au
     }
 
     // ── COMMIT path ──
-    // Order matters (security review): lock-probe → backup → schema mutation →
-    // merges, so NO write ever precedes the backup and the lock check is the
-    // first thing to touch the DB in write mode.
+    // The lock probe under WAL only catches an active WRITER, not an idle/reading
+    // gateway, so require the operator to explicitly assert the gateway is down.
+    if (!opts.gatewayStopped) {
+      process.stderr.write(
+        `\n❌ --commit requires --gateway-stopped (WAL makes the lock probe writer-only).\n` +
+          `   Stop the gateway, then re-run with --commit --gateway-stopped.\n`,
+      );
+      process.exit(1);
+    }
+    // Fail fast (no 5s wait) if any lock contention appears mid-run.
+    db.prepare("PRAGMA busy_timeout = 0").run();
+
+    // Order matters (security review): lock-probe → checkpoint → backup → schema
+    // mutation → merges, so NO write ever precedes the backup.
     // 1. Refuse to run if the DB is locked (gateway still up): a write probe.
     try {
       db.prepare("BEGIN IMMEDIATE").run();
@@ -281,13 +324,17 @@ function doApply(dbPath: string, reportFile: string, opts: { commit: boolean; au
       process.exit(1);
     }
 
-    // 2. Backup BEFORE any mutation. NOTE: this copy is the FULL DB (secrets
+    // 2. Fold the WAL into the main file so the file copy is a COMPLETE snapshot
+    //    (WAL mode keeps committed-but-uncheckpointed frames out of the .db file).
+    db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").run();
+
+    // 3. Backup BEFORE any mutation. NOTE: this copy is the FULL DB (secrets
     //    included) — prune old .bak-pre-reconcile-* files after verifying.
     const backup = `${dbPath}.bak-pre-reconcile-${backupStamp()}`;
     copyFileSync(dbPath, backup);
     process.stderr.write(`\n  backup: ${backup}  (full DB with secrets — prune old ones)\n`);
 
-    // 3. Now the additive schema mutation (no-op when the column already exists).
+    // 4. Now the additive schema mutation (no-op when the column already exists).
     ensureMergedIntoColumn(db);
 
     const now = nowIso();
@@ -299,8 +346,15 @@ function doApply(dbPath: string, reportFile: string, opts: { commit: boolean; au
         rekeyed += r.factsRekeyed;
         resolved += r.headCollisionsResolved;
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // A lock appearing mid-run means the gateway came up — abort, don't
+        // silently skip clusters against a live DB.
+        if (/busy|locked/i.test(msg)) {
+          process.stderr.write(`\n❌ DB became locked mid-run (gateway up?) — ABORTING after ${merged} merges. Restore the backup if needed.\n`);
+          process.exit(1);
+        }
         failed++;
-        process.stderr.write(`  ⚠️  cluster keep=${p.canonicalId} FAILED: ${err instanceof Error ? err.message : String(err)}\n`);
+        process.stderr.write(`  ⚠️  cluster keep=${p.canonicalId} FAILED: ${msg}\n`);
       }
     }
     process.stderr.write(
@@ -341,7 +395,7 @@ function main(): void {
   const reportFile = args.reportFile ?? join(dataDir, DEFAULT_REPORT);
 
   if (args.generate) doGenerate(dbPath, reportFile, args.topAsk);
-  else doApply(dbPath, reportFile, { commit: args.commit, autoOnly: args.autoOnly });
+  else doApply(dbPath, reportFile, { commit: args.commit, autoOnly: args.autoOnly, gatewayStopped: args.gatewayStopped });
 }
 
 main();

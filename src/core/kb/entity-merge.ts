@@ -22,6 +22,11 @@
 import type { DatabaseSync } from "node:sqlite";
 import { normalizeFactValue } from "./kb-queries.js";
 
+/** Whether a table exists (mergeEntities tolerates facts-only fixtures without `events`). */
+function tableExists(db: DatabaseSync, name: string): boolean {
+  return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
+}
+
 /** Idempotently add the additive `merged_into` column to `entities`. */
 export function ensureMergedIntoColumn(db: DatabaseSync): void {
   const cols = db.prepare("PRAGMA table_info(entities)").all() as Array<{ name: string }>;
@@ -131,6 +136,8 @@ export interface MergeResult {
   factsRekeyed: number;
   headCollisionsResolved: number;
   aliasesAdded: number;
+  /** Distinct events whose entities_json referenced a satellite → re-keyed to canonical. */
+  eventsRekeyed: number;
 }
 
 /**
@@ -183,6 +190,36 @@ export function mergeEntities(db: DatabaseSync, plan: MergePlan, nowIso: string)
       canonicalId,
     );
 
+    // Re-key events that reference a satellite id in entities_json → canonical
+    // (dedup), so the canonical's timeline + associative (Hebbian) recall stay
+    // complete. Facts alone aren't enough: events reference entities too.
+    // Tolerant of a DB without an `events` table (facts-only fixtures).
+    let eventsRekeyed = 0;
+    if (tableExists(db, "events")) {
+      const satSet = new Set(satellites);
+      const selEvents = db.prepare("SELECT id, entities_json FROM events WHERE entities_json LIKE ?");
+      const updEvent = db.prepare("UPDATE events SET entities_json = ? WHERE id = ?");
+      const affected = new Map<string, string[]>();
+      for (const sid of satellites) {
+        for (const row of selEvents.all(`%${sid}%`) as Array<{ id: string; entities_json: string }>) {
+          if (affected.has(row.id)) continue;
+          let arr: string[];
+          try {
+            arr = JSON.parse(row.entities_json || "[]") as string[];
+          } catch {
+            continue;
+          }
+          if (!arr.some((e) => satSet.has(e))) continue; // LIKE substring false positive
+          affected.set(row.id, arr);
+        }
+      }
+      for (const [eid, arr] of affected) {
+        const next = [...new Set(arr.map((e) => (satSet.has(e) ? canonicalId : e)))];
+        updEvent.run(JSON.stringify(next), eid);
+      }
+      eventsRekeyed = affected.size;
+    }
+
     const headCollisionsResolved = resolveEntityHeadCollisions(db, canonicalId, nowIso);
 
     db.prepare("COMMIT").run();
@@ -192,6 +229,7 @@ export function mergeEntities(db: DatabaseSync, plan: MergePlan, nowIso: string)
       factsRekeyed,
       headCollisionsResolved,
       aliasesAdded: aliasSet.size - before,
+      eventsRekeyed,
     };
   } catch (err) {
     try {
