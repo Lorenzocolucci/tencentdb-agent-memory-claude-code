@@ -582,6 +582,29 @@ interface OpenAIEmbeddingResponse {
 /** Factory for the embedding HTTP dispatcher — overridable in tests. */
 export type EmbeddingDispatcherFactory = () => Dispatcher;
 
+/**
+ * Minimal FIFO async semaphore. Bounds how many embedding HTTP requests are
+ * in flight at once so a burst (e.g. seeding a large haystack fires the
+ * kb-writer fact/event stream AND the L0 background indexing concurrently) does
+ * not overwhelm the provider and time every request out. Unbounded by default.
+ */
+class EmbedConcurrencyGate {
+  private active = 0;
+  private readonly queue: Array<() => void> = [];
+  constructor(private readonly max: number) {}
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.max <= 0) return fn(); // unbounded → no gating (live default)
+    if (this.active >= this.max) await new Promise<void>((r) => this.queue.push(r));
+    this.active++;
+    try {
+      return await fn();
+    } finally {
+      this.active--;
+      this.queue.shift()?.();
+    }
+  }
+}
+
 export class OpenAIEmbeddingService implements EmbeddingService {
   private readonly baseUrl: string;
   private readonly apiKey: string;
@@ -593,6 +616,8 @@ export class OpenAIEmbeddingService implements EmbeddingService {
   private readonly chunkOptions: ChunkOptions;
   private readonly timeoutMs: number;
   private readonly logger?: Logger;
+  /** Optional in-flight-request cap (TDAI_EMBED_MAX_CONCURRENCY; 0 = unbounded). */
+  private readonly gate: EmbedConcurrencyGate;
 
   /**
    * Dedicated undici dispatcher with bounded socket lifetime. We use our OWN
@@ -649,6 +674,11 @@ export class OpenAIEmbeddingService implements EmbeddingService {
     });
     this.timeoutMs = config.timeoutMs && config.timeoutMs > 0 ? config.timeoutMs : DEFAULT_API_TIMEOUT_MS;
     this.logger = logger;
+    // Optional bounded concurrency (default 0 = unbounded → live path unchanged).
+    // A heavy seed can fire dozens of concurrent embeds through one dispatcher and
+    // time them all out; TDAI_EMBED_MAX_CONCURRENCY caps in-flight requests.
+    const maxConc = Math.max(0, Math.floor(Number(process.env.TDAI_EMBED_MAX_CONCURRENCY) || 0));
+    this.gate = new EmbedConcurrencyGate(maxConc);
 
     // Build a dedicated undici Agent with bounded socket lifetime. Tests can
     // inject their own factory (e.g. pointing at an unreachable host) to drive
@@ -685,16 +715,26 @@ export class OpenAIEmbeddingService implements EmbeddingService {
   }
 
   /**
-   * Throw away the current dispatcher (and every socket it pools) and build a
-   * fresh one. Called between retry attempts so attempt N+1 CANNOT inherit the
-   * dead keep-alive socket that made attempt N fail. destroy() is best-effort
-   * and fire-and-forget — we never block the retry on socket teardown.
+   * Point new work at a fresh dispatcher so the retrying attempt opens a
+   * brand-new connection instead of inheriting the dead keep-alive socket that
+   * made attempt N fail. The OLD dispatcher is drained with a GRACEFUL close()
+   * (not destroy()): this service's dispatcher is SHARED across concurrent embed
+   * callers (a seed runs the kb-writer's fact/event stream AND the fire-and-forget
+   * L0 background indexing at the same time). destroy() force-aborts every
+   * in-flight request on the old dispatcher — so one caller's retry would kill
+   * every OTHER caller mid-flight with "The client is destroyed", which then
+   * retries and recycles too → a cascade that leaves facts/events vector-less.
+   * close() lets those healthy in-flight requests finish, then reaps the old
+   * dispatcher. Best-effort, fire-and-forget — we never block the retry on it.
    */
   private recycleDispatcher(): void {
     const old = this.dispatcher;
     this.dispatcher = this.makeDispatcher();
     void Promise.resolve()
-      .then(() => (old as unknown as { destroy?: () => Promise<void> }).destroy?.())
+      .then(() => {
+        const d = old as unknown as { close?: () => Promise<void>; destroy?: () => Promise<void> };
+        return d.close?.() ?? d.destroy?.();
+      })
       .catch(() => {
         /* best-effort: a failed teardown must not break the retry */
       });
@@ -853,7 +893,12 @@ export class OpenAIEmbeddingService implements EmbeddingService {
     return chunks[0] ?? text;
   }
 
+  /** Gated entry: bounds in-flight requests, then runs the real call. */
   private async _callApi(texts: string[], timeoutOverride?: number): Promise<Float32Array[]> {
+    return this.gate.run(() => this._callApiUnbounded(texts, timeoutOverride));
+  }
+
+  private async _callApiUnbounded(texts: string[], timeoutOverride?: number): Promise<Float32Array[]> {
     const body: Record<string, unknown> = {
       input: texts,
       model: this.model,

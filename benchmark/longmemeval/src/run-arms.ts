@@ -88,11 +88,20 @@ function deepinfraKey(): string {
   return key;
 }
 
-// DeepInfra Qwen3-Embedding-4B can take tens of seconds per call under seed load
-// (mirrors the live reindex job's TDAI_EMBED_AGENT_TIMEOUT_MS=60000). A short
-// timeout opens the embedding circuit → kb_vec is left empty → the flat/kb recall
-// comparison is corrupted. Give every embed call a generous budget.
-const EMB_TIMEOUT_MS = 60_000;
+// DeepInfra Qwen3-Embedding-4B can take tens of seconds per call under a heavy
+// seed burst (a 48-session s_cleaned haystack fires many concurrent embeds). Two
+// timeouts must BOTH be generous or the run corrupts:
+//   1. the per-request AbortSignal (config.embedding.timeoutMs, below), and
+//   2. the undici dispatcher's socket headers/body timeout, which defaults to
+//      ~15s UNLESS TDAI_EMBED_AGENT_TIMEOUT_MS is set (the live reindex sets it).
+// If (2) fires, recycleDispatcher() destroys the shared dispatcher mid-burst and
+// every in-flight call fails "The client is destroyed" → facts/events written
+// WITHOUT vectors → kb_vec empty → flat/kb comparison invalid. We set BOTH here.
+const EMB_TIMEOUT_MS = 120_000;
+if (!process.env.TDAI_EMBED_AGENT_TIMEOUT_MS) process.env.TDAI_EMBED_AGENT_TIMEOUT_MS = String(EMB_TIMEOUT_MS);
+// Bound in-flight embeds so a large-haystack seed burst can't overwhelm DeepInfra
+// (kb-writer + L0 background streams share one dispatcher). Default 4 here.
+if (!process.env.TDAI_EMBED_MAX_CONCURRENCY) process.env.TDAI_EMBED_MAX_CONCURRENCY = "4";
 
 /** Explicit, production-faithful embedding block merged into the memory config. */
 function embeddingConfig(): Record<string, unknown> {

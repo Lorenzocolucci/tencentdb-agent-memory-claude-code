@@ -55,18 +55,25 @@ function makeOkAgent(): MockAgent {
   return agent;
 }
 
-/** Track destroy() calls so we can prove old dispatchers are retired on retry. */
+/** Track teardown so we can prove old dispatchers are retired on retry. */
 interface TrackedAgent {
   dispatcher: Dispatcher;
-  destroyed: boolean;
+  torn: boolean;
 }
 
 function trackDestroy(agent: MockAgent): TrackedAgent {
-  const tracked: TrackedAgent = { dispatcher: agent as unknown as Dispatcher, destroyed: false };
+  const tracked: TrackedAgent = { dispatcher: agent as unknown as Dispatcher, torn: false };
+  // recycleDispatcher() now GRACEFULLY close()s the OLD dispatcher (not destroy())
+  // so concurrent in-flight embeds on the shared dispatcher are not aborted. Track
+  // BOTH so the test proves the old dispatcher is retired regardless of method.
+  const origClose = agent.close.bind(agent);
   const origDestroy = agent.destroy.bind(agent);
-  // recycleDispatcher() calls .destroy() on the OLD dispatcher.
+  (agent as unknown as { close: () => Promise<void> }).close = async () => {
+    tracked.torn = true;
+    return origClose();
+  };
   (agent as unknown as { destroy: () => Promise<void> }).destroy = async () => {
-    tracked.destroyed = true;
+    tracked.torn = true;
     return origDestroy();
   };
   return tracked;
@@ -106,12 +113,43 @@ describe("OpenAIEmbeddingService resilience (retry + circuit breaker)", () => {
     // constructor; each retry recycles to a brand-new dispatcher. So at least
     // 3 dispatchers were created (1 initial + 2 recycled).
     expect(created.length).toBeGreaterThanOrEqual(3);
-    // Every recycled (non-current) dispatcher must be destroyed — proving the
-    // retry did NOT reuse the stale socket pool.
-    const destroyedCount = created.filter((t) => t.destroyed).length;
-    expect(destroyedCount).toBeGreaterThanOrEqual(2);
+    // Every recycled (non-current) dispatcher must be torn down (graceful close)
+    // — proving the retry did NOT reuse the stale socket pool.
+    const tornCount = created.filter((t) => t.torn).length;
+    expect(tornCount).toBeGreaterThanOrEqual(2);
 
     for (const t of created) await (t.dispatcher as unknown as MockAgent).close().catch(() => {});
+  });
+
+  it("TDAI_EMBED_MAX_CONCURRENCY caps in-flight embedding requests", async () => {
+    const prev = process.env.TDAI_EMBED_MAX_CONCURRENCY;
+    process.env.TDAI_EMBED_MAX_CONCURRENCY = "2";
+    let inFlight = 0;
+    let peak = 0;
+    // An OK agent whose reply is delayed so calls overlap; the gate must cap peak.
+    const agent = new MockAgent();
+    agent.disableNetConnect();
+    agent
+      .get("https://api.test")
+      .intercept({ path: "/v1/embeddings", method: "POST" })
+      .reply(200, async (opts) => {
+        inFlight++; peak = Math.max(peak, inFlight);
+        await new Promise((r) => setTimeout(r, 40));
+        inFlight--;
+        const body = JSON.parse(String(opts.body ?? "{}")) as { input: string[] };
+        return { data: body.input.map((_t, index) => ({ index, embedding: Array.from({ length: DIMS }, (_v, i) => (i + 1) / 10) })) };
+      })
+      .persist();
+    try {
+      const svc = makeService(() => agent as unknown as Dispatcher);
+      await Promise.all(Array.from({ length: 8 }, (_v, i) => svc.embed(`t${i}`)));
+      expect(peak).toBeLessThanOrEqual(2);
+      expect(peak).toBeGreaterThan(0);
+    } finally {
+      if (prev === undefined) delete process.env.TDAI_EMBED_MAX_CONCURRENCY;
+      else process.env.TDAI_EMBED_MAX_CONCURRENCY = prev;
+      await (agent as unknown as MockAgent).close().catch(() => {});
+    }
   });
 
   it("opens the circuit after K consecutive failures (getHealth().healthy false)", async () => {
