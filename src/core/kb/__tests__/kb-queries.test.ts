@@ -258,6 +258,34 @@ describe("KB data layer (temp DB)", () => {
     expect(b.valid_from).toBe("2024-01-01T00:00:00.000Z");
   });
 
+  // -- Cura #1: attribute canonicalization collapses synonyms onto one HEAD ----
+
+  it("Cura#1: synonymous attributes ('costo'/'cost') share ONE HEAD and supersede", () => {
+    const e = store.resolveOrCreateEntity({ type: "topic", name: "OpenAI", now: NOW });
+    // Different surface attributes for the SAME concept, newer value second.
+    store.upsertFact({ entityId: e.id, attribute: "costo", value: "€18", validFrom: "2026-06-24T00:00:00.000Z", now: "2026-06-24T00:00:00.000Z" });
+    const newer = store.upsertFact({ entityId: e.id, attribute: "cost", value: "€387", validFrom: "2026-07-20T00:00:00.000Z", now: "2026-07-20T00:00:00.000Z" });
+
+    // Exactly ONE HEAD, keyed by the canonical 'cost', holding the newest value.
+    const heads = store.queryHeadFacts(e.id).filter((f) => f.attribute === "cost");
+    expect(heads).toHaveLength(1);
+    expect(heads[0].value).toBe("€387");
+    expect(heads[0].id).toBe(newer.id);
+    // No fragmented 'costo' HEAD survived, and nothing was deleted (audit kept).
+    expect(store.queryHeadFacts(e.id).some((f) => f.attribute === "costo")).toBe(false);
+    expect(dbAll(store, "SELECT count(*) AS c FROM facts WHERE entity_id = ?", e.id)[0].c).toBe(2);
+  });
+
+  it("Cura#1: language-variant attribute ('stato') corroborates the English HEAD ('status')", () => {
+    const e = store.resolveOrCreateEntity({ type: "task", name: "B22", now: NOW });
+    const a = store.upsertFact({ entityId: e.id, attribute: "status", value: "open", confidence: 0.6, now: NOW });
+    const b = store.upsertFact({ entityId: e.id, attribute: "stato", value: "open", confidence: 0.9, now: NOW });
+    // Same canonical key + same value → corroboration, not a new row.
+    expect(b.id).toBe(a.id);
+    expect(b.support).toBe(2);
+    expect(dbAll(store, "SELECT count(*) AS c FROM facts WHERE entity_id = ?", e.id)[0].c).toBe(1);
+  });
+
   it("older-than-head different value -> CLOSED historical row, head untouched", () => {
     const e = store.resolveOrCreateEntity({ type: "person", name: "L", now: NOW });
     // Head established at 2024-05.

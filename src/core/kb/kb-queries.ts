@@ -19,6 +19,7 @@
 
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import { canonicalizeAttribute } from "./attribute-canon-map.js";
 import type {
   KbEntity,
   KbEvent,
@@ -554,7 +555,12 @@ export function upsertFact(
   nowMs: number = Date.now(),
 ): KbFact {
   const entityIdValue = requireNonEmpty(params.entityId, "entityId");
-  const attribute = requireNonEmpty(params.attribute, "attribute");
+  // Consolidation Cura #1: canonicalize the attribute at the single write choke
+  // point so synonymous attributes ("stato"/"status", "costo"/"cost") share the
+  // (entity_id, attribute) HEAD key. That lets the supersession algorithm below
+  // collapse what would otherwise be permanently-coexisting contradictions.
+  // Deterministic + no-LLM; unknown attributes (incl. rule_*) pass through.
+  const attribute = canonicalizeAttribute(requireNonEmpty(params.attribute, "attribute"));
   const value = requireNonEmpty(params.value, "value");
   const now = requireNonEmpty(params.now, "now");
   const validFrom = params.validFrom?.trim() || now;

@@ -68,3 +68,8 @@ kb-probe.mts
 src/**/__tests__/_*.test.ts
 *_live_out.txt
 *_dryrun_out.txt
+
+# Throwaway analysis/backfill scratch scripts + on-disk audit dumps (never commit;
+# audit JSON carries internal fact/entity ids)
+scratch-*
+*-audit*.json
