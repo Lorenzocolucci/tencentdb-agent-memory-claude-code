@@ -251,12 +251,27 @@ function selectSubset(all: LmeQuestion[], types: string[], perType: number): Lme
   return out;
 }
 
-/** Fail-fast: prove the live embedder answers at 1024 dims before spending seed cost. */
+/** Prove the embedder answers at the right dim before spending seed cost.
+ *  Retries transient failures (esp. OpenAI 429 rate-limits under sustained load)
+ *  with backoff — a single transient 429 must NOT abort the whole driver run. */
 async function verifyEmbedder(): Promise<void> {
-  const v = await makeEmbeddingService().embed("longmemeval embedder probe");
-  const len = (v as Float32Array).length;
-  if (len !== EMB_DIMS) throw new Error(`embedder probe: expected ${EMB_DIMS} dims, got ${len}`);
-  console.error(`✓ embedder OK: ${EMB_PROVIDER}/${EMB_MODEL} → ${len} dims`);
+  const svc = makeEmbeddingService();
+  const backoffs = [0, 10_000, 30_000, 60_000, 90_000];
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < backoffs.length; attempt++) {
+    if (backoffs[attempt]) await new Promise((r) => setTimeout(r, backoffs[attempt]));
+    try {
+      const v = await svc.embed("longmemeval embedder probe");
+      const len = (v as Float32Array).length;
+      if (len !== EMB_DIMS) throw new Error(`embedder probe: expected ${EMB_DIMS} dims, got ${len}`);
+      console.error(`✓ embedder OK: ${EMB_PROVIDER}/${EMB_MODEL} → ${len} dims`);
+      return;
+    } catch (err) {
+      lastErr = err;
+      console.error(`[wrn] embedder probe attempt ${attempt + 1}/${backoffs.length} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
 async function main(): Promise<void> {
