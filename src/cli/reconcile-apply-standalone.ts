@@ -32,7 +32,7 @@ import {
   toMergePlans,
   type EntityMeta,
 } from "../core/kb/entity-merge-plan.js";
-import { mergeEntities, ensureMergedIntoColumn, type MergePlan } from "../core/kb/entity-merge.js";
+import { mergeEntities, ensureMergedIntoColumn, rekeyRelationsOnMerge, type MergePlan } from "../core/kb/entity-merge.js";
 
 const DEFAULT_REPORT = "entity-reconciliation-report.md";
 
@@ -41,10 +41,15 @@ Usage:
   node dist/src/cli/reconcile-apply-standalone.mjs --data-dir <dir> --generate [--top-ask N] [--report <file>]
   node dist/src/cli/reconcile-apply-standalone.mjs --data-dir <dir> --apply [--auto-only] [--commit --gateway-stopped] [--report <file>]
 
-Modes:
-  --generate        READ-ONLY: write an editable Markdown review report.
-  --apply           Read the report and merge. DRY-RUN unless --commit is given.
-  --commit          Perform the real merge (checkpoint+backup first).
+Modes (exactly one):
+  --generate           READ-ONLY: write an editable Markdown review report.
+  --apply              Read the report and merge. DRY-RUN unless --commit is given.
+  --backfill-relations Re-key relations for entities ALREADY merged (Cura #2c) —
+                       fixes edges left dangling by merges applied before 2c.
+                       DRY-RUN unless --commit is given.
+
+Flags:
+  --commit          Perform the real mutation (checkpoint+backup first).
   --gateway-stopped Required with --commit: you assert the gateway is stopped.
   --auto-only       Under --apply: only AUTO clusters (safe first live run).
   --top-ask N       Under --generate: how many ASK clusters to include (default 30).
@@ -56,6 +61,7 @@ interface Args {
   reportFile?: string;
   generate: boolean;
   apply: boolean;
+  backfillRelations: boolean;
   commit: boolean;
   autoOnly: boolean;
   gatewayStopped: boolean;
@@ -63,7 +69,7 @@ interface Args {
 }
 
 function parseArgs(argv: readonly string[]): Args {
-  const out: Args = { generate: false, apply: false, commit: false, autoOnly: false, gatewayStopped: false, topAsk: 30 };
+  const out: Args = { generate: false, apply: false, backfillRelations: false, commit: false, autoOnly: false, gatewayStopped: false, topAsk: 30 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--data-dir") out.dataDir = argv[++i];
@@ -74,6 +80,7 @@ function parseArgs(argv: readonly string[]): Args {
     else if (a.startsWith("--top-ask=")) out.topAsk = Number(a.slice("--top-ask=".length));
     else if (a === "--generate") out.generate = true;
     else if (a === "--apply") out.apply = true;
+    else if (a === "--backfill-relations") out.backfillRelations = true;
     else if (a === "--commit") out.commit = true;
     else if (a === "--auto-only") out.autoOnly = true;
     else if (a === "--gateway-stopped") out.gatewayStopped = true;
@@ -338,13 +345,16 @@ function doApply(dbPath: string, reportFile: string, opts: { commit: boolean; au
     ensureMergedIntoColumn(db);
 
     const now = nowIso();
-    let merged = 0, rekeyed = 0, resolved = 0, failed = 0;
+    let merged = 0, rekeyed = 0, resolved = 0, relRekeyed = 0, relFolded = 0, relSelfLoops = 0, failed = 0;
     for (const p of plans) {
       try {
         const r = mergeEntities(db, p, now);
         merged += r.satellitesMerged;
         rekeyed += r.factsRekeyed;
         resolved += r.headCollisionsResolved;
+        relRekeyed += r.relationsRekeyed;
+        relFolded += r.relationsFolded;
+        relSelfLoops += r.relationsSelfLoopsDropped;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         // A lock appearing mid-run means the gateway came up — abort, don't
@@ -362,7 +372,113 @@ function doApply(dbPath: string, reportFile: string, opts: { commit: boolean; au
         `  satellites merged:    ${merged}\n` +
         `  facts re-keyed:       ${rekeyed}\n` +
         `  collisions resolved:  ${resolved}\n` +
+        `  relations re-keyed:   ${relRekeyed} (folded ${relFolded}, self-loops dropped ${relSelfLoops})\n` +
         `  clusters failed:      ${failed}\n` +
+        `  Restart the gateway and verify recall.\n`,
+    );
+  } finally {
+    db.close();
+  }
+}
+
+// ── backfill relations (Cura #2c) ───────────────────────────────────────────
+
+/**
+ * Re-key relations for entities that were ALREADY merged (merged_into set) by a
+ * merge that ran BEFORE Cura #2c re-keyed relations. Reuses the exact same tested
+ * helper (rekeyRelationsOnMerge), grouped per canonical, in one transaction.
+ * DRY-RUN by default; --commit backs up first and requires --gateway-stopped.
+ */
+function doBackfillRelations(dbPath: string, opts: { commit: boolean; gatewayStopped: boolean }): void {
+  const db = new DatabaseSync(dbPath, { readOnly: !opts.commit });
+  try {
+    if (!hasColumn(db, "entities", "merged_into")) {
+      process.stderr.write(`\n🔗 No merged_into column — no merges have run; nothing to backfill.\n`);
+      return;
+    }
+    // Map every merged satellite → its ULTIMATE canonical (follow chains, cycle-safe).
+    const mergedRows = db
+      .prepare("SELECT id, merged_into FROM entities WHERE merged_into IS NOT NULL")
+      .all() as Array<{ id: string; merged_into: string }>;
+    const parent = new Map(mergedRows.map((r) => [r.id, r.merged_into]));
+    const ultimate = (id: string): string => {
+      let cur = id;
+      const seen = new Set<string>([id]);
+      while (parent.has(cur)) {
+        const nxt = parent.get(cur) as string;
+        if (seen.has(nxt)) break; // cycle guard
+        seen.add(nxt);
+        cur = nxt;
+      }
+      return cur;
+    };
+    const byCanon = new Map<string, string[]>();
+    for (const r of mergedRows) {
+      const canon = ultimate(r.id);
+      if (canon === r.id) continue;
+      const arr = byCanon.get(canon);
+      if (arr) arr.push(r.id);
+      else byCanon.set(canon, [r.id]);
+    }
+
+    // Dry-run count (read-only): relations touching a merged satellite.
+    const merged = new Set(mergedRows.map((r) => r.id));
+    let touching = 0, selfLoops = 0;
+    for (const rel of db.prepare("SELECT src_entity_id s, dst_entity_id d FROM relations").all() as Array<{ s: string; d: string }>) {
+      const sm = merged.has(rel.s), dm = merged.has(rel.d);
+      if (!sm && !dm) continue;
+      touching++;
+      if ((sm ? ultimate(rel.s) : rel.s) === (dm ? ultimate(rel.d) : rel.d)) selfLoops++;
+    }
+    process.stderr.write(
+      `\n🔗 Relation backfill (${opts.commit ? "COMMIT" : "DRY-RUN"})\n` +
+        `  merged canonicals:    ${byCanon.size}\n` +
+        `  relations to fix:     ${touching} (≈${touching - selfLoops} re-key/fold, ${selfLoops} self-loops to drop)\n`,
+    );
+    if (touching === 0) { process.stderr.write(`  Nothing to backfill.\n`); return; }
+
+    if (!opts.commit) {
+      process.stderr.write(`\n  DRY-RUN only — nothing written. Re-run with --commit --gateway-stopped.\n`);
+      return;
+    }
+
+    // ── COMMIT path (same safety order as --apply) ──
+    if (!opts.gatewayStopped) {
+      process.stderr.write(`\n❌ --commit requires --gateway-stopped.\n`);
+      process.exit(1);
+    }
+    db.prepare("PRAGMA busy_timeout = 0").run();
+    try {
+      db.prepare("BEGIN IMMEDIATE").run();
+      db.prepare("ROLLBACK").run();
+    } catch {
+      process.stderr.write(`\n❌ DB is locked — stop the gateway before --commit.\n`);
+      process.exit(1);
+    }
+    db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").run();
+    const backup = `${dbPath}.bak-pre-relbackfill-${backupStamp()}`;
+    copyFileSync(dbPath, backup);
+    process.stderr.write(`\n  backup: ${backup}  (full DB with secrets — prune old ones)\n`);
+
+    let rk = 0, fl = 0, sl = 0;
+    db.prepare("BEGIN IMMEDIATE").run();
+    try {
+      for (const [canon, sats] of byCanon) {
+        const r = rekeyRelationsOnMerge(db, canon, sats);
+        rk += r.relationsRekeyed;
+        fl += r.relationsFolded;
+        sl += r.relationsSelfLoopsDropped;
+      }
+      db.prepare("COMMIT").run();
+    } catch (err) {
+      db.prepare("ROLLBACK").run();
+      throw err;
+    }
+    process.stderr.write(
+      `\n✅ Relation backfill complete\n` +
+        `  relations re-keyed:   ${rk}\n` +
+        `  support folded:       ${fl}\n` +
+        `  self-loops dropped:   ${sl}\n` +
         `  Restart the gateway and verify recall.\n`,
     );
   } finally {
@@ -379,8 +495,9 @@ function main(): void {
     process.stderr.write(`\n❌ --data-dir is required (or set TDAI_DATA_DIR).\n${USAGE}`);
     process.exit(1);
   }
-  if (args.generate === args.apply) {
-    process.stderr.write(`\n❌ Choose exactly one of --generate or --apply.\n${USAGE}`);
+  const modeCount = [args.generate, args.apply, args.backfillRelations].filter(Boolean).length;
+  if (modeCount !== 1) {
+    process.stderr.write(`\n❌ Choose exactly one of --generate, --apply, --backfill-relations.\n${USAGE}`);
     process.exit(1);
   }
   if (!Number.isInteger(args.topAsk) || args.topAsk < 0) {
@@ -395,7 +512,8 @@ function main(): void {
   const reportFile = args.reportFile ?? join(dataDir, DEFAULT_REPORT);
 
   if (args.generate) doGenerate(dbPath, reportFile, args.topAsk);
-  else doApply(dbPath, reportFile, { commit: args.commit, autoOnly: args.autoOnly, gatewayStopped: args.gatewayStopped });
+  else if (args.apply) doApply(dbPath, reportFile, { commit: args.commit, autoOnly: args.autoOnly, gatewayStopped: args.gatewayStopped });
+  else doBackfillRelations(dbPath, { commit: args.commit, gatewayStopped: args.gatewayStopped });
 }
 
 main();

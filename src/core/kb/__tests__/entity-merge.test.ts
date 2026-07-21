@@ -5,7 +5,9 @@ import {
   pickCanonical,
   ensureMergedIntoColumn,
   resolveEntityHeadCollisions,
+  rekeyRelationsOnMerge,
 } from "../entity-merge.js";
+import { relationId } from "../kb-queries.js";
 
 const NOW = "2026-07-21T00:00:00.000Z";
 
@@ -114,5 +116,117 @@ describe("mergeEntities", () => {
     fact(db, { id: "f1", entity: "C", attr: "a", value: "1", from: NOW });
     fact(db, { id: "f2", entity: "C", attr: "b", value: "2", from: NOW });
     expect(resolveEntityHeadCollisions(db, "C", NOW)).toBe(0);
+  });
+
+  it("returns zero relation counts when there is no relations table (backward compatible)", () => {
+    ent(db, { id: "C", name: "OpenAI" });
+    ent(db, { id: "S", name: "openai" });
+    fact(db, { id: "fs", entity: "S", attr: "a", value: "1", from: NOW });
+    const res = mergeEntities(db, { canonicalId: "C", satelliteIds: ["S"] }, NOW);
+    expect(res.relationsRekeyed).toBe(0);
+    expect(res.relationsFolded).toBe(0);
+    expect(res.relationsSelfLoopsDropped).toBe(0);
+  });
+});
+
+// ── Cura #2c: relation re-keying ─────────────────────────────────────────────
+
+function addRelationsTable(db: DatabaseSync): void {
+  db.prepare(
+    "CREATE TABLE relations (id TEXT PRIMARY KEY, src_entity_id TEXT NOT NULL, type TEXT NOT NULL, " +
+      "dst_entity_id TEXT NOT NULL, namespace TEXT NOT NULL DEFAULT 'default', valid_from TEXT, valid_to TEXT, " +
+      "support INTEGER DEFAULT 1, source_event_id TEXT, created_time TEXT, " +
+      "UNIQUE(namespace, src_entity_id, type, dst_entity_id))",
+  ).run();
+}
+function rel(db: DatabaseSync, r: { src: string; type: string; dst: string; support?: number; ns?: string }): void {
+  const ns = r.ns ?? "default";
+  db.prepare(
+    "INSERT INTO relations (id, src_entity_id, type, dst_entity_id, namespace, support, created_time) VALUES (?,?,?,?,?,?,?)",
+  ).run(relationId(ns, r.src, r.type, r.dst), r.src, r.type, r.dst, ns, r.support ?? 1, NOW);
+}
+const rels = (db: DatabaseSync) =>
+  db.prepare("SELECT src_entity_id s, type t, dst_entity_id d, support FROM relations ORDER BY s, t, d").all() as Array<{
+    s: string; t: string; d: string; support: number;
+  }>;
+
+describe("rekeyRelationsOnMerge (Cura #2c)", () => {
+  let db: DatabaseSync;
+  beforeEach(() => {
+    db = makeDb();
+    addRelationsTable(db);
+    ent(db, { id: "C", name: "OpenAI", imp: 80 });
+    ent(db, { id: "S", name: "openai-dup" });
+    ent(db, { id: "X", name: "Other" });
+  });
+
+  it("re-keys a satellite's UNIQUE edge onto the canonical (src side)", () => {
+    rel(db, { src: "S", type: "uses", dst: "X" });
+    const res = mergeEntities(db, { canonicalId: "C", satelliteIds: ["S"] }, NOW);
+    expect(res.relationsRekeyed).toBe(1);
+    expect(res.relationsFolded).toBe(0);
+    expect(rels(db)).toEqual([{ s: "C", t: "uses", d: "X", support: 1 }]);
+    // id was recomputed deterministically so upsertRelation resolves to this row.
+    const id = db.prepare("SELECT id FROM relations").get() as { id: string };
+    expect(id.id).toBe(relationId("default", "C", "uses", "X"));
+  });
+
+  it("re-keys the dst side of an edge pointing AT a satellite", () => {
+    rel(db, { src: "X", type: "uses", dst: "S" });
+    const res = mergeEntities(db, { canonicalId: "C", satelliteIds: ["S"] }, NOW);
+    expect(res.relationsRekeyed).toBe(1);
+    expect(rels(db)).toEqual([{ s: "X", t: "uses", d: "C", support: 1 }]);
+  });
+
+  it("folds support when the satellite edge duplicates an existing canonical edge", () => {
+    rel(db, { src: "C", type: "uses", dst: "X", support: 2 });
+    rel(db, { src: "S", type: "uses", dst: "X", support: 3 });
+    const res = mergeEntities(db, { canonicalId: "C", satelliteIds: ["S"] }, NOW);
+    expect(res.relationsFolded).toBe(1);
+    expect(res.relationsRekeyed).toBe(0);
+    // one surviving edge, support folded 2+3.
+    expect(rels(db)).toEqual([{ s: "C", t: "uses", d: "X", support: 5 }]);
+  });
+
+  it("drops a self-loop (satellite → its own canonical)", () => {
+    rel(db, { src: "S", type: "related", dst: "C" });
+    const res = mergeEntities(db, { canonicalId: "C", satelliteIds: ["S"] }, NOW);
+    expect(res.relationsSelfLoopsDropped).toBe(1);
+    expect(res.relationsRekeyed).toBe(0);
+    expect(rels(db)).toEqual([]); // meaningless self-loop removed
+  });
+
+  it("drops a self-loop when BOTH endpoints merge into the canonical", () => {
+    ent(db, { id: "S2", name: "openai-dup2" });
+    rel(db, { src: "S", type: "related", dst: "S2" });
+    const res = mergeEntities(db, { canonicalId: "C", satelliteIds: ["S", "S2"] }, NOW);
+    expect(res.relationsSelfLoopsDropped).toBe(1);
+    expect(rels(db)).toEqual([]);
+  });
+
+  it("two satellite edges collapsing onto the same target: one re-keyed, one folded", () => {
+    ent(db, { id: "S2", name: "openai-dup2" });
+    rel(db, { src: "S", type: "uses", dst: "X", support: 1 });
+    rel(db, { src: "S2", type: "uses", dst: "X", support: 4 });
+    const res = mergeEntities(db, { canonicalId: "C", satelliteIds: ["S", "S2"] }, NOW);
+    expect(res.relationsRekeyed).toBe(1);
+    expect(res.relationsFolded).toBe(1);
+    expect(rels(db)).toEqual([{ s: "C", t: "uses", d: "X", support: 5 }]);
+  });
+
+  it("leaves edges that don't touch any satellite untouched", () => {
+    rel(db, { src: "C", type: "uses", dst: "X" }); // canonical→X, no satellite involved
+    const res = mergeEntities(db, { canonicalId: "C", satelliteIds: ["S"] }, NOW);
+    expect(res.relationsRekeyed).toBe(0);
+    expect(res.relationsFolded).toBe(0);
+    expect(res.relationsSelfLoopsDropped).toBe(0);
+    expect(rels(db)).toEqual([{ s: "C", t: "uses", d: "X", support: 1 }]);
+  });
+
+  it("direct rekeyRelationsOnMerge is a no-op with an empty satellite list", () => {
+    rel(db, { src: "S", type: "uses", dst: "X" });
+    const r = rekeyRelationsOnMerge(db, "C", []);
+    expect(r).toEqual({ relationsRekeyed: 0, relationsFolded: 0, relationsSelfLoopsDropped: 0 });
+    expect(rels(db)).toEqual([{ s: "S", t: "uses", d: "X", support: 1 }]); // untouched
   });
 });
