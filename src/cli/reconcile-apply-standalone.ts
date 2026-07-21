@@ -16,7 +16,7 @@
  */
 
 import { DatabaseSync } from "node:sqlite";
-import { writeFileSync, readFileSync, copyFileSync, existsSync } from "node:fs";
+import { writeFileSync, readFileSync, copyFileSync, chmodSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { getEnv } from "../utils/env.js";
@@ -32,7 +32,7 @@ import {
   toMergePlans,
   type EntityMeta,
 } from "../core/kb/entity-merge-plan.js";
-import { mergeEntities, ensureMergedIntoColumn, rekeyRelationsOnMerge, type MergePlan } from "../core/kb/entity-merge.js";
+import { mergeEntities, ensureMergedIntoColumn, rekeyRelationsOnMerge, groupByUltimateCanonical, type MergePlan } from "../core/kb/entity-merge.js";
 
 const DEFAULT_REPORT = "entity-reconciliation-report.md";
 
@@ -174,6 +174,15 @@ function loadEntities(db: DatabaseSync): LoadResult {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/** Restrict a backup file (full DB with secrets) to owner-only, matching the report. */
+function restrictPerms(path: string): void {
+  try {
+    chmodSync(path, 0o600);
+  } catch {
+    /* best-effort: Windows ignores POSIX modes; never fail the backup over perms */
+  }
 }
 
 function backupStamp(): string {
@@ -339,6 +348,7 @@ function doApply(dbPath: string, reportFile: string, opts: { commit: boolean; au
     //    included) — prune old .bak-pre-reconcile-* files after verifying.
     const backup = `${dbPath}.bak-pre-reconcile-${backupStamp()}`;
     copyFileSync(dbPath, backup);
+    restrictPerms(backup);
     process.stderr.write(`\n  backup: ${backup}  (full DB with secrets — prune old ones)\n`);
 
     // 4. Now the additive schema mutation (no-op when the column already exists).
@@ -396,44 +406,36 @@ function doBackfillRelations(dbPath: string, opts: { commit: boolean; gatewaySto
       process.stderr.write(`\n🔗 No merged_into column — no merges have run; nothing to backfill.\n`);
       return;
     }
-    // Map every merged satellite → its ULTIMATE canonical (follow chains, cycle-safe).
-    const mergedRows = db
-      .prepare("SELECT id, merged_into FROM entities WHERE merged_into IS NOT NULL")
-      .all() as Array<{ id: string; merged_into: string }>;
-    const parent = new Map(mergedRows.map((r) => [r.id, r.merged_into]));
-    const ultimate = (id: string): string => {
-      let cur = id;
-      const seen = new Set<string>([id]);
-      while (parent.has(cur)) {
-        const nxt = parent.get(cur) as string;
-        if (seen.has(nxt)) break; // cycle guard
-        seen.add(nxt);
-        cur = nxt;
-      }
-      return cur;
-    };
-    const byCanon = new Map<string, string[]>();
-    for (const r of mergedRows) {
-      const canon = ultimate(r.id);
-      if (canon === r.id) continue;
-      const arr = byCanon.get(canon);
-      if (arr) arr.push(r.id);
-      else byCanon.set(canon, [r.id]);
+    // Guard (defensive, LOW-5): a DB with merged_into but no relations table has
+    // nothing to backfill — mirror rekeyRelationsOnMerge's tolerance.
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='relations'").get()) {
+      process.stderr.write(`\n🔗 No relations table — nothing to backfill.\n`);
+      return;
     }
+    // Group merged satellites by ULTIMATE canonical (pure, sorted, cycle-safe).
+    const mergedRows = db
+      .prepare("SELECT id, merged_into FROM entities WHERE merged_into IS NOT NULL ORDER BY id")
+      .all() as Array<{ id: string; merged_into: string }>;
+    const { byCanon, cyclic } = groupByUltimateCanonical(mergedRows);
+    if (cyclic.length > 0) {
+      process.stderr.write(`  ⚠️  ${cyclic.length} entities have a cyclic merged_into chain — skipped.\n`);
+    }
+    // satellite → ultimate canonical, for the read-only dry-run count.
+    const canonOfSat = new Map<string, string>();
+    for (const [canon, sats] of byCanon) for (const s of sats) canonOfSat.set(s, canon);
 
-    // Dry-run count (read-only): relations touching a merged satellite.
-    const merged = new Set(mergedRows.map((r) => r.id));
+    // Dry-run count (read-only): DISTINCT relations touching a merged satellite.
     let touching = 0, selfLoops = 0;
     for (const rel of db.prepare("SELECT src_entity_id s, dst_entity_id d FROM relations").all() as Array<{ s: string; d: string }>) {
-      const sm = merged.has(rel.s), dm = merged.has(rel.d);
+      const sm = canonOfSat.has(rel.s), dm = canonOfSat.has(rel.d);
       if (!sm && !dm) continue;
       touching++;
-      if ((sm ? ultimate(rel.s) : rel.s) === (dm ? ultimate(rel.d) : rel.d)) selfLoops++;
+      if ((sm ? canonOfSat.get(rel.s) : rel.s) === (dm ? canonOfSat.get(rel.d) : rel.d)) selfLoops++;
     }
     process.stderr.write(
       `\n🔗 Relation backfill (${opts.commit ? "COMMIT" : "DRY-RUN"})\n` +
         `  merged canonicals:    ${byCanon.size}\n` +
-        `  relations to fix:     ${touching} (≈${touching - selfLoops} re-key/fold, ${selfLoops} self-loops to drop)\n`,
+        `  relations to fix:     ${touching} distinct (${selfLoops} become self-loops → drop)\n`,
     );
     if (touching === 0) { process.stderr.write(`  Nothing to backfill.\n`); return; }
 
@@ -458,12 +460,21 @@ function doBackfillRelations(dbPath: string, opts: { commit: boolean; gatewaySto
     db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").run();
     const backup = `${dbPath}.bak-pre-relbackfill-${backupStamp()}`;
     copyFileSync(dbPath, backup);
+    restrictPerms(backup);
     process.stderr.write(`\n  backup: ${backup}  (full DB with secrets — prune old ones)\n`);
 
-    let rk = 0, fl = 0, sl = 0;
+    let rk = 0, fl = 0, sl = 0, skipped = 0;
+    const canonExists = db.prepare("SELECT 1 FROM entities WHERE id = ? AND merged_into IS NULL");
     db.prepare("BEGIN IMMEDIATE").run();
     try {
       for (const [canon, sats] of byCanon) {
+        // Defense-in-depth: never re-key relations onto a canonical that a corrupt
+        // merged_into value points at but that doesn't exist (or is itself merged).
+        if (!canonExists.get(canon)) {
+          process.stderr.write(`  ⚠️  skip: canonical ${canon} missing or itself merged — ${sats.length} satellites left as-is\n`);
+          skipped++;
+          continue;
+        }
         const r = rekeyRelationsOnMerge(db, canon, sats);
         rk += r.relationsRekeyed;
         fl += r.relationsFolded;
@@ -474,8 +485,9 @@ function doBackfillRelations(dbPath: string, opts: { commit: boolean; gatewaySto
       db.prepare("ROLLBACK").run();
       throw err;
     }
+    if (skipped > 0) process.stderr.write(`  canonicals skipped:   ${skipped}\n`);
     process.stderr.write(
-      `\n✅ Relation backfill complete\n` +
+      `\n✅ Relation backfill complete (counts are per-pass; a cross-canonical edge is counted in each endpoint's pass)\n` +
         `  relations re-keyed:   ${rk}\n` +
         `  support folded:       ${fl}\n` +
         `  self-loops dropped:   ${sl}\n` +

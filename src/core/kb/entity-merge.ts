@@ -14,11 +14,15 @@
  *
  * SAFETY: satellites are kept (marked merged_into); facts are re-keyed and losers
  * closed (valid_to/superseded_by), never removed; events re-keyed in place. The
- * ONE exception is relation re-keying (Cura #2c): duplicate/self-loop edges are
- * DELETEd after their support is folded onto the surviving canonical edge (the
- * relations table has no soft-delete column — support is preserved, the row is
- * not). One transaction. Deterministic (recency by valid_from→learned_at→id; no
- * LLM). Reversible via a DB backup (the coarse rollback).
+ * ONE place rows are DELETEd is relation re-keying (Cura #2c), which has no
+ * soft-delete column:
+ *   - FOLD: a duplicate of an existing canonical edge is dropped AFTER its support
+ *     is added to the survivor → support preserved, row removed.
+ *   - SELF-LOOP: an edge that collapses to (canonical→canonical) is dropped and
+ *     its support intentionally DISCARDED — a relation to itself is noise, there
+ *     is no survivor to carry it. No HEAD fact/event is ever lost this way.
+ * One transaction. Deterministic (recency by valid_from→learned_at→id; no LLM).
+ * Reversible via a DB backup (the coarse rollback).
  */
 
 import type { DatabaseSync } from "node:sqlite";
@@ -57,6 +61,48 @@ export function pickCanonical(candidates: CanonicalCandidate[]): string {
       (a.createdTime < b.createdTime ? -1 : a.createdTime > b.createdTime ? 1 : 0) ||
       (a.id < b.id ? -1 : 1),
   )[0].id;
+}
+
+export interface CanonGrouping {
+  /** canonical id → its satellite ids (sorted, deterministic). */
+  byCanon: Map<string, string[]>;
+  /** ids whose merged_into chain hit a cycle → skipped (should never occur). */
+  cyclic: string[];
+}
+
+/**
+ * Group already-merged satellites by their ULTIMATE canonical, following
+ * `merged_into` chains. Pure + deterministic (rows sorted by id), cycle-safe
+ * (a cyclic chain lists the id in `cyclic` and drops it from grouping). Used by
+ * the Cura #2c relation backfill.
+ */
+export function groupByUltimateCanonical(
+  rows: ReadonlyArray<{ id: string; merged_into: string }>,
+): CanonGrouping {
+  const parent = new Map(rows.map((r) => [r.id, r.merged_into]));
+  const ultimate = (id: string): string | null => {
+    let cur = id;
+    const seen = new Set<string>([id]);
+    while (parent.has(cur)) {
+      const nxt = parent.get(cur) as string;
+      if (seen.has(nxt)) return null; // cycle
+      seen.add(nxt);
+      cur = nxt;
+    }
+    return cur;
+  };
+  const byCanon = new Map<string, string[]>();
+  const cyclic: string[] = [];
+  const sorted = [...rows].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  for (const r of sorted) {
+    const canon = ultimate(r.id);
+    if (canon === null) { cyclic.push(r.id); continue; }
+    if (canon === r.id) continue; // an entity that is its own canonical isn't a satellite
+    const arr = byCanon.get(canon);
+    if (arr) arr.push(r.id);
+    else byCanon.set(canon, [r.id]);
+  }
+  return { byCanon, cyclic };
 }
 
 interface FactRow {
@@ -190,6 +236,9 @@ export function rekeyRelationsOnMerge(
     }
     const existing = findExisting.get(r.namespace, src2, r.type, dst2, r.id) as { id: string } | undefined;
     if (existing) {
+      // Fold only `support` (the quantity spreading-activation reads). The dropped
+      // row's provenance (valid_from/source_event_id) and the unused `weight`
+      // column are intentionally not merged — not consumed by recall today.
       foldSupport.run(r.support, existing.id);
       del.run(r.id);
       out.relationsFolded++;
