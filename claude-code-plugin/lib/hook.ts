@@ -130,17 +130,37 @@ async function handleUserPromptSubmit(data: HookStdin, client: GatewayClient): P
 
   if (!context) return "";
 
+  // Banner visibility fix: the session-open banner ("🧠 …") lives inside
+  // `context`, which is delivered as additionalContext — model-only. The model
+  // has to voluntarily echo it, which it often does not, so the user never sees
+  // that memory loaded. Extract the banner line (BEFORE truncation) and ALSO
+  // emit it as a top-level `systemMessage`, which Claude Code renders directly
+  // to the user — guaranteed visible, once per session (the gateway only puts
+  // the banner block in the context on the first turn).
+  const bannerMatch = context.match(/<session-open-banner>[\s\S]*?<\/session-open-banner>/);
+  const bannerLine = bannerMatch
+    ? (bannerMatch[0]
+        .split("\n")
+        .map((s) => s.trim())
+        .filter((s) => s && !s.startsWith("<") && !s.startsWith("FIRST TURN"))[0] ?? "")
+    : "";
+
   if (context.length > MAX_INJECT_CHARS) {
     context =
       context.slice(0, MAX_INJECT_CHARS - 100) +
       "\n\n[…recall truncated — use /memory-search for full results…]";
   }
-  return JSON.stringify({
+  const out: {
+    hookSpecificOutput: { hookEventName: string; additionalContext: string };
+    systemMessage?: string;
+  } = {
     hookSpecificOutput: {
       hookEventName: "UserPromptSubmit",
       additionalContext: context,
     },
-  });
+  };
+  if (bannerLine) out.systemMessage = bannerLine;
+  return JSON.stringify(out);
 }
 
 async function handlePostToolUse(data: HookStdin, client: GatewayClient): Promise<string> {
