@@ -122,6 +122,7 @@ var GatewayClient = class {
 				session_key: payload.sessionKey,
 				tool_name: payload.toolName,
 				tool_input: payload.toolInput,
+				tool_output_text: payload.toolOutputText,
 				tool_output_is_error: payload.toolOutputIsError
 			}, token, RECALL_TIMEOUT_MS);
 			if (status !== 200) {
@@ -671,21 +672,47 @@ async function handleUserPromptSubmit(data, client) {
 		if (dataDir) context = await searchL0JsonlDirect(join(dataDir, "conversations"), prompt, sessionKey, 3);
 	}
 	if (!context) return "";
+	const bannerMatch = context.match(/<session-open-banner>[\s\S]*?<\/session-open-banner>/);
+	const bannerLine = bannerMatch ? bannerMatch[0].split("\n").map((s) => s.trim()).filter((s) => s && !s.startsWith("<") && !s.startsWith("FIRST TURN"))[0] ?? "" : "";
 	if (context.length > MAX_INJECT_CHARS) context = context.slice(0, MAX_INJECT_CHARS - 100) + "\n\n[…recall truncated — use /memory-search for full results…]";
-	return JSON.stringify({ hookSpecificOutput: {
+	const out = { hookSpecificOutput: {
 		hookEventName: "UserPromptSubmit",
 		additionalContext: context
-	} });
+	} };
+	if (bannerLine) out.systemMessage = bannerLine;
+	return JSON.stringify(out);
+}
+/** Max characters of failed-tool output forwarded to the gateway. */
+const MAX_TOOL_OUTPUT_CHARS = 2e3;
+/**
+* Best-effort stringification of a tool result for friction capture. Returns
+* undefined when there is nothing usable — the caller then sends nothing and
+* behaviour is exactly as before.
+*/
+function stringifyToolOutput(resp) {
+	if (resp == null) return void 0;
+	let text;
+	if (typeof resp === "string") text = resp;
+	else try {
+		text = JSON.stringify(resp) ?? "";
+	} catch {
+		return;
+	}
+	text = text.trim();
+	if (!text) return void 0;
+	return text.length > MAX_TOOL_OUTPUT_CHARS ? text.slice(0, MAX_TOOL_OUTPUT_CHARS) : text;
 }
 async function handlePostToolUse(data, client) {
 	const toolName = data.tool_name ?? "";
 	if (!toolName) return "";
 	const sessionKey = getSessionKey(data.cwd ?? process.cwd());
+	const toolOutputText = data.tool_output_is_error === true ? stringifyToolOutput(data.tool_response) : void 0;
 	let context = await client.observe({
 		toolName,
 		sessionKey,
 		toolInput: data.tool_input,
-		toolOutputIsError: data.tool_output_is_error
+		toolOutputIsError: data.tool_output_is_error,
+		toolOutputText
 	});
 	if (!context) return "";
 	if (context.length > MAX_INJECT_CHARS) context = context.slice(0, MAX_INJECT_CHARS - 100) + "\n\n[…truncated…]";
