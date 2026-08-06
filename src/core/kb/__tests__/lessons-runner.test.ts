@@ -230,4 +230,60 @@ describe("distillLessons orchestrator (B2a cross-session)", () => {
     expect(parsed).toHaveProperty("error_signatures");
     expect(parsed).toHaveProperty("task_type");
   });
+
+  it("maxClusters advances to NEW clusters across runs (already-covered ones do not consume the budget)", async () => {
+    // Two DISTINCT clusters: group A (orthogonal vector e0) and group B (e1).
+    insBug(db, "a1", "sA1", "2026-06-01T00:00:00Z");
+    insBug(db, "a2", "sA2", "2026-06-02T00:00:00Z");
+    insBug(db, "b1", "sB1", "2026-06-03T00:00:00Z");
+    insBug(db, "b2", "sB2", "2026-06-04T00:00:00Z");
+    const axis = (i: number): Float32Array => {
+      const v = new Float32Array(16);
+      v[i] = 1; // unit vector on a single axis → the two groups are orthogonal
+      return v;
+    };
+    embReader = fakeEmbeddingReader(
+      new Map([["a1", axis(0)], ["a2", axis(0)], ["b1", axis(1)], ["b2", axis(1)]]),
+    );
+
+    // Distinct domains so each cluster writes its own HEAD lesson.
+    let call = 0;
+    const runner: LLMRunner = {
+      run: vi.fn(async () => {
+        call += 1;
+        return JSON.stringify({
+          domain: `domain-${call}`,
+          lesson_text: `lesson ${call}`,
+          anti_patterns: [],
+          confidence: 0.8,
+        });
+      }),
+    };
+
+    // Run 1 with a budget of ONE cluster → exactly one lesson.
+    const first = await distillLessons(db, runner, {
+      now: NOW,
+      embeddingReader: embReader,
+      maxClusters: 1,
+    });
+    expect(first.inserted).toBe(1);
+
+    // Run 2, same budget. The cluster distilled in run 1 must NOT consume the
+    // budget again — the run must advance to the OTHER cluster. Before the fix
+    // this returned inserted=0 forever (same first cluster re-picked + skipped),
+    // which is why only 6 lessons existed against 27 real clusters on the live DB.
+    const second = await distillLessons(db, runner, {
+      now: NOW,
+      embeddingReader: embReader,
+      maxClusters: 1,
+    });
+    expect(second.inserted).toBe(1);
+    // The already-covered cluster is still REPORTED as a duplicate — it just no
+    // longer eats the budget, so the fresh cluster is reached in the same run.
+    expect(second.skippedDuplicate).toBe(1);
+
+    // Two distinct lessons now exist.
+    const total = db.prepare("SELECT COUNT(*) c FROM lessons").get() as { c: number };
+    expect(total.c).toBe(2);
+  });
 });

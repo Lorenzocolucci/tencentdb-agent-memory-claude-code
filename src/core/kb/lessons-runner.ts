@@ -180,10 +180,28 @@ export async function distillLessons(
     sinceTs: params.sinceTs,
     embeddingReader: params.embeddingReader,
   });
+  // Drop clusters that already have a lesson BEFORE applying the maxClusters
+  // cap. Without this the cap always re-selected the SAME first N clusters —
+  // which are precisely the ones distilled earliest — so every run skipped them
+  // as duplicates and clusters beyond the cap were NEVER reached. Measured on
+  // the live DB (2026-08-07): 27 real failure clusters, only 6 lessons ever
+  // produced. The check is a cheap DB lookup (no LLM), so filtering first is
+  // free and makes the cap mean "N NEW clusters per run" instead of
+  // "the same N clusters forever". processCluster keeps its own guard.
+  const fresh: FailureCluster[] = [];
+  for (const c of allClusters) {
+    if (clusterAlreadyCovered(db, c.bugEventIds)) {
+      // Counted here (not in processCluster) so the reported stat is unchanged
+      // while the cluster no longer consumes the maxClusters budget.
+      stats.skippedDuplicate += 1;
+      continue;
+    }
+    fresh.push(c);
+  }
   const clusters =
     typeof params.maxClusters === "number"
-      ? allClusters.slice(0, params.maxClusters)
-      : allClusters;
+      ? fresh.slice(0, params.maxClusters)
+      : fresh;
   stats.candidates = clusters.length;
 
   for (const cluster of clusters) {
