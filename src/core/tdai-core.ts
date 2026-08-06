@@ -480,6 +480,7 @@ export class TdaiCore {
       // (default "l1" → existing behavior unchanged).
       recallSource: this.cfg.recall.source,
       rerank: this.cfg.recall.rerank,
+      consolidationBoost: this.cfg.recall.consolidationBoost,
     });
 
     return {

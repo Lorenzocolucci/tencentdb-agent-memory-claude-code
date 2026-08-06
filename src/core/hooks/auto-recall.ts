@@ -665,6 +665,8 @@ export async function runKbRecall(
       // associative recall. The explicit memory-search tool keeps the vector
       // source for on-demand deep retrieval (System 2).
       skipVector: true,
+      // Consolidation → recall wire (config-gated, default OFF).
+      consolidationBoost: cfg.recall.consolidationBoost ?? false,
       logger,
     });
 
