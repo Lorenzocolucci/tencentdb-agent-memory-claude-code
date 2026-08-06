@@ -2608,6 +2608,60 @@ export class VectorStore implements IMemoryStore {
   }
 
   /**
+   * Batched lifecycle read for the recall path (consolidation → recall wire).
+   *
+   * `runConsolidation` writes reinforcement/tier into `memory_lifecycle`, but the
+   * ranking in kbRecall never read it — so repetition over time had ZERO effect on
+   * what gets recalled. This is the read side of that wire.
+   *
+   * ONE query with an IN clause (the PK is (owner_id, owner_kind), so the lookup
+   * is indexed). Batched on purpose: recall is on the critical path and a
+   * per-candidate `getLifecycle()` would fire dozens of queries per recall.
+   *
+   * Never throws: any failure degrades to an empty map, i.e. exactly the
+   * pre-existing ranking behaviour (fail-open, like every other store read).
+   */
+  candidateLifecycle(
+    ownerIds: string[],
+    namespace = "default",
+  ): Map<string, { reinforcementCount: number; tier: string; permanence: number; state: string }> {
+    const out = new Map<string, { reinforcementCount: number; tier: string; permanence: number; state: string }>();
+    try {
+      const ids = [...new Set((ownerIds ?? []).filter(Boolean))];
+      if (ids.length === 0) return out;
+      const placeholders = ids.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(
+          `SELECT owner_id, reinforcement_count, tier, permanence_score, state
+             FROM memory_lifecycle
+            WHERE namespace = ? AND owner_id IN (${placeholders})`,
+        )
+        .all(namespace, ...ids) as Array<{
+        owner_id: string;
+        reinforcement_count: number;
+        tier: string;
+        permanence_score: number;
+        state: string;
+      }>;
+      for (const r of rows) {
+        out.set(r.owner_id, {
+          reinforcementCount: Number(r.reinforcement_count) || 0,
+          tier: String(r.tier ?? "short"),
+          permanence: Number(r.permanence_score) || 0,
+          state: String(r.state ?? "active"),
+        });
+      }
+      return out;
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][assoc] candidateLifecycle failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return new Map();
+    }
+  }
+
+  /**
    * Embed `items` with bounded concurrency, then persist each result via `write`.
    *
    * WHY: reindexAll/reindexKb were strictly sequential (`for … await embedFn`),

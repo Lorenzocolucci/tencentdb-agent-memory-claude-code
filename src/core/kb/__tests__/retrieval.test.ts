@@ -378,6 +378,48 @@ describe("kbRecall (temp DB, deterministic fake embedding)", () => {
     expect(results).toEqual([]);
   });
 
+  it("consolidationBoost ranks a reinforced/long memory above an equally-relevant never-reinforced one, and is a no-op when OFF", async () => {
+    // Two facts with IDENTICAL relevance (same vector, same recency, same
+    // confidence) so ONLY the consolidation signal can separate them.
+    const iso = "2026-06-01T00:00:00Z";
+    const reinforced = await seedFact(store, embedding, {
+      type: "concept", name: "Alpha", attribute: "note", value: "shared note",
+      validFrom: iso, now: iso, vec: [1, 0, 0, 0],
+    });
+    const untouched = await seedFact(store, embedding, {
+      type: "concept", name: "Beta", attribute: "note", value: "shared note",
+      validFrom: iso, now: iso, vec: [1, 0, 0, 0],
+    });
+    embedding.register("shared note", [1, 0, 0, 0]);
+
+    // Consolidation evidence: Alpha was confirmed over and over (what
+    // runConsolidation does on every session that touches it); Beta never was.
+    for (let i = 0; i < 12; i++) {
+      store.reinforceRecalledOwners([{ owner_id: reinforced.factId, owner_kind: "fact" }], iso);
+    }
+
+    const lifecycle = (store as unknown as {
+      candidateLifecycle: (ids: string[], ns: string) => Map<string, { reinforcementCount: number }>;
+    }).candidateLifecycle([reinforced.factId, untouched.factId], "default");
+    // Guard: the fixture really did record the reinforcement we rely on.
+    expect(lifecycle.get(reinforced.factId)!.reinforcementCount).toBeGreaterThan(
+      lifecycle.get(untouched.factId)?.reinforcementCount ?? 0,
+    );
+
+    const withBoost = await kbRecall("shared note", {
+      store, embeddingService: embedding, maxResults: 5, consolidationBoost: true,
+    });
+    const idx = (rows: typeof withBoost, id: string): number => rows.findIndex((r) => r.owner_id === id);
+    expect(idx(withBoost, reinforced.factId)).toBeLessThan(idx(withBoost, untouched.factId));
+
+    // OFF (default): the wire must not change anything.
+    const off = await kbRecall("shared note", { store, embeddingService: embedding, maxResults: 5 });
+    const offDefault = await kbRecall("shared note", {
+      store, embeddingService: embedding, maxResults: 5, consolidationBoost: false,
+    });
+    expect(offDefault.map((r) => r.owner_id)).toEqual(off.map((r) => r.owner_id));
+  });
+
   it("flat=true disables the entity-graph source (Source C): an alias-only hit is reachable in full recall but absent when flat", async () => {
     // Entity with a DISTINCTIVE alias that does NOT appear in any fact's rendered
     // text. Its fact is reachable ONLY via the entity-name/alias match (Source C):
