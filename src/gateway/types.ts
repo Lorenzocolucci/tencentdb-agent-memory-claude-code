@@ -60,6 +60,12 @@ export interface ObserveRequest {
   tool_name: string;
   tool_input?: unknown;
   tool_output_is_error?: boolean;
+  /**
+   * Raw tool output when the call FAILED. Feeds friction capture (the workshop
+   * view): the failure becomes a `bug` event so recurring technical failures can
+   * finally cluster into lessons. Ignored when tool_output_is_error is not true.
+   */
+  tool_output_text?: string;
 }
 
 export interface ObserveResponse {

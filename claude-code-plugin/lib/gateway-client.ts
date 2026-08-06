@@ -171,6 +171,8 @@ export class GatewayClient {
     sessionKey: string;
     toolInput?: unknown;
     toolOutputIsError?: boolean;
+    /** Raw output of a FAILED tool call — feeds friction capture. */
+    toolOutputText?: string;
   }): Promise<string> {
     try {
       const token = await this.freshToken();
@@ -181,6 +183,7 @@ export class GatewayClient {
           session_key: payload.sessionKey,
           tool_name: payload.toolName,
           tool_input: payload.toolInput,
+          tool_output_text: payload.toolOutputText,
           tool_output_is_error: payload.toolOutputIsError,
         },
         token,

@@ -640,6 +640,7 @@ export class TdaiGateway {
       toolName: body.tool_name,
       toolInput: body.tool_input,
       toolOutputIsError: body.tool_output_is_error,
+      toolOutputText: body.tool_output_text,
     });
 
     const response: ObserveResponse = { context: result.inject ?? "" };

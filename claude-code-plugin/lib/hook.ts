@@ -163,6 +163,31 @@ async function handleUserPromptSubmit(data: HookStdin, client: GatewayClient): P
   return JSON.stringify(out);
 }
 
+/** Max characters of failed-tool output forwarded to the gateway. */
+const MAX_TOOL_OUTPUT_CHARS = 2_000;
+
+/**
+ * Best-effort stringification of a tool result for friction capture. Returns
+ * undefined when there is nothing usable — the caller then sends nothing and
+ * behaviour is exactly as before.
+ */
+function stringifyToolOutput(resp: unknown): string | undefined {
+  if (resp == null) return undefined;
+  let text: string;
+  if (typeof resp === "string") {
+    text = resp;
+  } else {
+    try {
+      text = JSON.stringify(resp) ?? "";
+    } catch {
+      return undefined;
+    }
+  }
+  text = text.trim();
+  if (!text) return undefined;
+  return text.length > MAX_TOOL_OUTPUT_CHARS ? text.slice(0, MAX_TOOL_OUTPUT_CHARS) : text;
+}
+
 async function handlePostToolUse(data: HookStdin, client: GatewayClient): Promise<string> {
   // Proactive injection by SITUATION (Track A 3+4): when the agent touches a
   // file, surface what the graph already knows about it. Silent (returns "")
@@ -172,11 +197,21 @@ async function handlePostToolUse(data: HookStdin, client: GatewayClient): Promis
   const cwd = data.cwd ?? process.cwd();
   const sessionKey = getSessionKey(cwd);
 
+  // Friction capture: on a FAILED tool call, forward a bounded slice of the raw
+  // output so the gateway can record it as a `bug` event. This is the ONLY way
+  // memory ever sees the workshop — readAllTurns (capture) drops tool traffic by
+  // design, so before this a repeated technical failure was invisible to the
+  // Mistake Notebook. Bounded here (not just gateway-side) to keep the hook
+  // payload small; secrets are redacted gateway-side before anything is stored.
+  const toolOutputText =
+    data.tool_output_is_error === true ? stringifyToolOutput(data.tool_response) : undefined;
+
   let context = await client.observe({
     toolName,
     sessionKey,
     toolInput: data.tool_input,
     toolOutputIsError: data.tool_output_is_error,
+    toolOutputText,
   });
   if (!context) return "";
 

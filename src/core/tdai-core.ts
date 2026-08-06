@@ -45,6 +45,7 @@ import {
 import { inferTaskType } from "./hooks/task-type.js";
 import { buildSituationInjection } from "./hooks/fingerprint-injection.js";
 import { canonicalKey } from "./kb/kb-queries.js";
+import { buildFrictionEvent, createFrictionState, type FrictionState } from "./kb/friction-capture.js";
 import { applyKbDelta, type KbWriterStore, type ApplyKbDeltaResult } from "./kb/kb-writer.js";
 import type { KbDelta } from "./kb/extraction-schema.js";
 import { performAutoRecall } from "./hooks/auto-recall.js";
@@ -188,6 +189,8 @@ export class TdaiCore {
    * across both injection paths. Cleared in {@link handleSessionEnd}.
    */
   private readonly injectedOwnersBySession = new Map<string, Set<string>>();
+  /** Per-session friction de-dup + flood budget (see friction-capture.ts). */
+  private readonly frictionStateBySession = new Map<string, FrictionState>();
 
   /**
    * Tracks which sessionKeys have already fired the session-open banner.
@@ -860,6 +863,72 @@ export class TdaiCore {
   }
 
   /**
+   * Friction capture (the "workshop" view): persist a FAILED tool call as a
+   * `bug` event so recurring technical failures can finally cluster into
+   * lessons. Synchronous + fully guarded — the caller wraps it in try/catch and
+   * the turn proceeds regardless.
+   *
+   * Design notes:
+   *  - one-off failures are harmless: the Mistake Notebook only distils a lesson
+   *    when the same failure recurs across >= 2 sessions;
+   *  - dedupe + per-session cap live in friction-capture.ts (pure, unit-tested);
+   *  - the failing file, when known, is linked as an entity so the proactive
+   *    file injection can surface the lesson exactly when that file is touched.
+   */
+  private recordFriction(
+    store: IMemoryStore,
+    obs: { sessionKey: string; toolName: string; toolInput: unknown; toolOutputText?: string },
+  ): void {
+    if (typeof store.insertEvent !== "function") return;
+
+    let state = this.frictionStateBySession.get(obs.sessionKey);
+    if (!state) {
+      state = createFrictionState();
+      this.frictionStateBySession.set(obs.sessionKey, state);
+    }
+
+    const ev = buildFrictionEvent(
+      {
+        sessionKey: obs.sessionKey,
+        toolName: obs.toolName,
+        toolInput: obs.toolInput,
+        errorText: obs.toolOutputText,
+        atMs: Date.now(),
+      },
+      state,
+    );
+    if (!ev) return;
+
+    // Link the failing file (when there is one) so the lesson can later be
+    // surfaced by the file-touch injection path.
+    const entities: string[] = [];
+    if (ev.filePath && typeof store.resolveOrCreateEntity === "function") {
+      try {
+        const ent = store.resolveOrCreateEntity({
+          type: "file",
+          name: ev.filePath,
+          now: new Date().toISOString(),
+        });
+        if (ent?.id) entities.push(ent.id);
+      } catch {
+        /* entity resolution is best-effort */
+      }
+    }
+
+    const now = new Date().toISOString();
+    store.insertEvent({
+      ts: now,
+      recordedAt: now,
+      sessionKey: obs.sessionKey,
+      namespace: NAMESPACE,
+      type: "bug",
+      text: ev.text,
+      entities,
+    });
+    this.logger.debug?.(`${TAG} [friction] recorded: ${ev.text.slice(0, 80)}`);
+  }
+
+  /**
    * Handle a PostToolUse observation. Two proactive-injection paths, both
    * silent-unless-relevant and never throwing (memory must not break the turn):
    *
@@ -878,11 +947,29 @@ export class TdaiCore {
     toolName: string;
     toolInput: unknown;
     toolOutputIsError?: boolean;
+    /** Raw output of a FAILED tool call (friction capture input). */
+    toolOutputText?: string;
   }): Promise<{ inject?: string }> {
     if (!obs.sessionKey) return {};
     await this.storeReady?.catch(() => {});
     const store = this.vectorStore;
     if (!store) return {};
+
+    // ── Friction capture: let memory SEE the workshop ──
+    // A failed tool call becomes a `bug` event — the exact input bug-clusters
+    // already consumes. One-offs stay harmless noise; only failures that recur
+    // across sessions become a lesson (EVIDENCE_MIN/SESSION_MIN), which is the
+    // "patterns, never anecdotes" rule. Never on the critical path: fully
+    // guarded, errors swallowed, recall/injection continues regardless.
+    if (obs.toolOutputIsError === true && obs.toolOutputText) {
+      try {
+        this.recordFriction(store, obs);
+      } catch (err) {
+        this.logger.debug?.(
+          `${TAG} [friction] capture failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
 
     const situation = extractSituation({
       toolName: obs.toolName,
