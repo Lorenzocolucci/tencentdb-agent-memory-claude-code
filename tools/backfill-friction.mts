@@ -24,6 +24,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { VectorStore } from "../src/core/store/sqlite.js";
 import { buildFrictionEvent, createFrictionState } from "../src/core/kb/friction-capture.js";
 
@@ -89,12 +90,23 @@ function main(): void {
   });
   store.init({ provider: EMB.provider, model: EMB.model });
 
-  // Already-backfilled sessions (idempotency).
+  // Idempotency (CRITICAL): a second --commit run must NOT duplicate history.
+  // Every backfilled event carries the MARK and its session_key, so we skip any
+  // session already present. Read on a separate read-only handle.
   const done = new Set<string>();
   try {
-    const rows = (store as unknown as { queryRecentEvents?: unknown });
-    void rows;
-  } catch { /* ignore */ }
+    const ro = new DatabaseSync(path.join(DB_DIR, "vectors.db"), { readOnly: true });
+    const rows = ro
+      .prepare("SELECT DISTINCT session_key FROM events WHERE text LIKE ?")
+      .all(`${MARK}%`) as Array<{ session_key: string }>;
+    for (const r of rows) done.add(r.session_key);
+    ro.close();
+  } catch (err) {
+    console.error("ATTENZIONE: impossibile leggere lo stato pregresso — interrompo per non duplicare.", err);
+    store.close();
+    process.exit(1);
+  }
+  if (done.size > 0) console.log(`sessioni gia' recuperate in precedenza: ${done.size}`);
 
   let sessions = 0, failures = 0, written = 0, loops = 0, skipped = 0;
   const loopSamples: string[] = [];
