@@ -1,10 +1,10 @@
 /**
  * Friction capture — pure unit tests (no DB, no network).
  *
- * Pins the guarantees that let this run on the live tool path safely:
- * only failures, secrets redacted, retry-loops de-duplicated, session capped,
- * and the SAME failure produces the SAME signature across sessions (which is
- * what makes cross-session clustering — and therefore lessons — possible).
+ * Pins the guarantees that let this run on the live tool path safely, and the
+ * INTRA-SESSION LOOP behaviour that Lorenzo's correction (2026-08-07) exposed:
+ * the cross-session clustering needs ≥2 sessions, so 5 identical failures inside
+ * ONE session produced nothing at all. A loop must be seen and interrupted.
  */
 import { describe, it, expect } from "vitest";
 import {
@@ -12,6 +12,7 @@ import {
   createFrictionState,
   MAX_PER_SESSION,
   DEDUPE_WINDOW_MS,
+  LOOP_THRESHOLD,
 } from "../friction-capture.js";
 
 const base = {
@@ -30,8 +31,9 @@ describe("buildFrictionEvent", () => {
     expect(ev).not.toBeNull();
     expect(ev!.type).toBe("bug");
     expect(ev!.text).toContain("Bash failed");
-    expect(ev!.text).toContain("npm test");
-    expect(ev!.text.toLowerCase()).toContain("error");
+    expect(ev!.repeatCount).toBe(1);
+    expect(ev!.isLoop).toBe(false);
+    expect(ev!.warning).toBeUndefined();
     expect(st.count).toBe(1);
   });
 
@@ -39,7 +41,7 @@ describe("buildFrictionEvent", () => {
     const st = createFrictionState();
     expect(buildFrictionEvent({ ...base, toolInput: { command: "npm test" }, errorText: "" }, st)).toBeNull();
     expect(buildFrictionEvent({ ...base, toolInput: { command: "npm test" } }, st)).toBeNull();
-    expect(st.count).toBe(0); // rejected failures never consume the budget
+    expect(st.count).toBe(0);
   });
 
   it("REDACTS secrets before they can be stored", () => {
@@ -56,18 +58,59 @@ describe("buildFrictionEvent", () => {
     expect(ev!.text).not.toContain("sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456");
   });
 
-  it("de-duplicates a retry loop inside the window, then allows it again after", () => {
+  // ── THE CASE LORENZO REPORTED ──────────────────────────────────────────────
+  it("DETECTS an intra-session loop: the same failure 5x in ONE session is seen and warned about", () => {
+    const st = createFrictionState();
+    const f = {
+      ...base,
+      toolInput: { file_path: "src/foo.ts" },
+      toolName: "Edit",
+      errorText: "<tool_use_error>File has not been read yet. Read it first before writing to it.</tool_use_error>",
+    };
+
+    const events = [];
+    for (let i = 0; i < 5; i++) {
+      const ev = buildFrictionEvent({ ...f, atMs: 1000 + i * 5000 }, st);
+      if (ev) events.push(ev);
+    }
+
+    // 1st = normal record; 3rd = loop milestone. 2nd/4th/5th stay quiet.
+    expect(events.length).toBe(2);
+    expect(events[0].isLoop).toBe(false);
+
+    const loop = events[1];
+    expect(loop.isLoop).toBe(true);
+    expect(loop.repeatCount).toBe(LOOP_THRESHOLD);
+    expect(loop.text).toContain("LOOP");
+    expect(loop.text).toContain("3x in one session");
+    // The warning is what actually stops the thrash mid-turn.
+    expect(loop.warning).toBeDefined();
+    expect(loop.warning).toContain("3 volte");
+    expect(loop.warning!.toLowerCase()).toContain("fermati");
+  });
+
+  it("keeps nagging on a long thrash without emitting one event per repeat", () => {
     const st = createFrictionState();
     const f = { ...base, toolInput: { command: "npm run build" }, errorText: "Error: ENOENT missing file" };
-    expect(buildFrictionEvent({ ...f, atMs: 1000 }, st)).not.toBeNull();
-    // same failure, hammered 5 more times → all collapsed
-    for (let i = 1; i <= 5; i++) {
-      expect(buildFrictionEvent({ ...f, atMs: 1000 + i * 1000 }, st)).toBeNull();
+    let loops = 0;
+    let total = 0;
+    for (let i = 0; i < 29; i++) {          // the real 29x thrash found in the transcripts
+      const ev = buildFrictionEvent({ ...f, atMs: 1000 + i * 5000 }, st);
+      if (ev) { total++; if (ev.isLoop) loops++; }
     }
-    expect(st.count).toBe(1);
-    // well after the window → recorded again (it is a genuine recurrence)
-    expect(buildFrictionEvent({ ...f, atMs: 1000 + DEDUPE_WINDOW_MS + 1 }, st)).not.toBeNull();
-    expect(st.count).toBe(2);
+    expect(loops).toBeGreaterThanOrEqual(3);   // it re-fires periodically…
+    expect(total).toBeLessThan(15);            // …but never once per repeat
+  });
+
+  it("a failure returning after a long gap starts a NEW episode (recurrence, not thrash)", () => {
+    const st = createFrictionState();
+    const f = { ...base, toolInput: { command: "npm test" }, errorText: "Error: timeout" };
+    const first = buildFrictionEvent({ ...f, atMs: 1000 }, st);
+    expect(first!.repeatCount).toBe(1);
+    const later = buildFrictionEvent({ ...f, atMs: 1000 + DEDUPE_WINDOW_MS + 1 }, st);
+    expect(later).not.toBeNull();
+    expect(later!.repeatCount).toBe(1);
+    expect(later!.isLoop).toBe(false);
   });
 
   it("gives the SAME signature to the same failure across sessions (enables clustering)", () => {
@@ -86,28 +129,18 @@ describe("buildFrictionEvent", () => {
       );
     const e1 = mk(120, "s1");
     const e2 = mk(377, "s2"); // different line number = same underlying failure
-    expect(e1).not.toBeNull();
-    expect(e2).not.toBeNull();
-    expect(e2!.signature).toBe(e1!.signature);
+    expect(e1!.signature).toBe(e2!.signature);
   });
 
   it("distinguishes genuinely different failures", () => {
     const st = createFrictionState();
-    const e1 = buildFrictionEvent(
-      { ...base, toolInput: { command: "npm test" }, errorText: "Error: timeout" },
-      st,
-    );
-    const e2 = buildFrictionEvent(
-      { ...base, toolInput: { command: "npm test" }, errorText: "Error: connection refused" },
-      st,
-    );
+    const e1 = buildFrictionEvent({ ...base, toolInput: { command: "npm test" }, errorText: "Error: timeout" }, st);
+    const e2 = buildFrictionEvent({ ...base, toolInput: { command: "npm test" }, errorText: "Error: connection refused" }, st);
     expect(e1!.signature).not.toBe(e2!.signature);
   });
 
   it("caps how much one session can write (flood guard)", () => {
     const st = createFrictionState();
-    // Genuinely different failures: digits alone would be normalised away on
-    // purpose (same error at a different line = same failure), so vary the WORDS.
     const words = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu apple beetle cactus dahlia ember fjord glacier harbor igloo jungle kettle lantern meadow nebula".split(" ");
     for (let i = 0; i < MAX_PER_SESSION + 15; i++) {
       const w = `${words[i % words.length]}${i >= words.length ? "x" : ""}`;

@@ -878,8 +878,8 @@ export class TdaiCore {
   private recordFriction(
     store: IMemoryStore,
     obs: { sessionKey: string; toolName: string; toolInput: unknown; toolOutputText?: string },
-  ): void {
-    if (typeof store.insertEvent !== "function") return;
+  ): string | undefined {
+    if (typeof store.insertEvent !== "function") return undefined;
 
     let state = this.frictionStateBySession.get(obs.sessionKey);
     if (!state) {
@@ -897,7 +897,7 @@ export class TdaiCore {
       },
       state,
     );
-    if (!ev) return;
+    if (!ev) return undefined;
 
     // Link the failing file (when there is one) so the lesson can later be
     // surfaced by the file-touch injection path.
@@ -926,6 +926,13 @@ export class TdaiCore {
       entities,
     });
     this.logger.debug?.(`${TAG} [friction] recorded: ${ev.text.slice(0, 80)}`);
+    if (ev.isLoop) {
+      this.logger.info(
+        `${TAG} [friction] LOOP detected (${ev.repeatCount}x) — warning injected: ${ev.text.slice(0, 80)}`,
+      );
+    }
+    // Only a LOOP talks back: a first-time failure is normal work, a thrash is not.
+    return ev.warning;
   }
 
   /**
@@ -961,9 +968,10 @@ export class TdaiCore {
     // across sessions become a lesson (EVIDENCE_MIN/SESSION_MIN), which is the
     // "patterns, never anecdotes" rule. Never on the critical path: fully
     // guarded, errors swallowed, recall/injection continues regardless.
+    let frictionWarning: string | undefined;
     if (obs.toolOutputIsError === true && obs.toolOutputText) {
       try {
-        this.recordFriction(store, obs);
+        frictionWarning = this.recordFriction(store, obs);
       } catch (err) {
         this.logger.debug?.(
           `${TAG} [friction] capture failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
@@ -1077,7 +1085,11 @@ export class TdaiCore {
       }
     }
 
-    return blocks.length > 0 ? { inject: blocks.join("\n\n") } : {};
+    // A detected LOOP goes FIRST and always: the whole point is to break the
+    // thrash mid-turn, before the agent retries the same failing move again.
+    // Cross-session lessons arrive weeks later; a loop needs an answer NOW.
+    const out = frictionWarning ? [frictionWarning, ...blocks] : blocks;
+    return out.length > 0 ? { inject: out.join("\n\n") } : {};
   }
 
   // ============================
