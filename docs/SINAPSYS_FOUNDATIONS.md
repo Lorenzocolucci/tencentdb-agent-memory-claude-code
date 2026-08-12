@@ -1,4 +1,22 @@
 # 🏛️ SINAPSYS — Foundations Blueprint (le fondamenta che reggono tutto l'edificio)
+
+> ## 📊 2026-08-07 — le fondamenta OGGI (misurate sul DB live)
+> Le 8 tabelle-mattone sono tutte create e **popolate**. Numeri reali:
+> `memory_lifecycle` **33.649** righe (843 `long`, 1.310 rinforzate) ·
+> `lessons` **45** (erano 6 stamattina) · `entities` 12.385 · `facts` 20.010 ·
+> `events` 15.410 (1.697 `bug`, di cui 866 recuperati dal passato) · `relations` 7.794.
+>
+> **Cambiamento strutturale importante:** `memory_lifecycle` non è più solo *scritto* dal
+> consolidamento — dal 2026-08-07 è anche **LETTO dal recall** (`candidateLifecycle` +
+> `consolidationScore` in `retrieval.ts`). Il Mattone 1 è finalmente collegato all'uscita.
+>
+> ⚠️ **Trappola da conoscere:** `insertEvent` scrive SOLO la riga evento. `kb_fts`/`kb_vec`
+> li scrive lo step di embedding di `kb-writer`, e `reindexKb` enumera gli owner **FROM
+> `kb_fts`** (`sqlite.ts:2091`). Un evento inserito direttamente resta quindi invisibile a
+> ricerca e clustering finché non gli si crea la riga FTS.
+>
+> Stato completo e cosa manca: → [vision/STATO-REALE.md](vision/STATO-REALE.md)
+
 > v1 — 24 giugno 2026 — Lorenzo + Socio. Schema validato e COSTRUITO.
 > **STATO 2026-06-24 sera:** fondamenta LIVE · Fase A live · Fase B **B1 (`a3c81c4`) + B2a (`2a4cc5c`) costruite e live**. Dettaglio moduli/stato: `docs/superpowers/specs/2026-06-24-track-b-mistake-notebook-design.md` + `docs/HANDOFF-2026-06-24-trackB.md`.
 > Principio: ogni fase futura (A→E) e ogni angolo vendibile si aggancia a queste fondamenta SENZA demolire. Tutto additivo (`IF NOT EXISTS` / `ALTER TABLE ADD COLUMN`), stile `initKbSchema()` esistente. Il KB live non si rompe mai.

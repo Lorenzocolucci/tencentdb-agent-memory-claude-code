@@ -10,13 +10,17 @@
 > does what, the data model, the request flows, and the six original ideas mapped to
 > code. Generated from the real tree (not memory).
 >
-> **Scale (measured):** 160 source files · ~44,600 LOC · 135 test files · 585 tests.
-> File counts re-verified 2026-07-18 (`kb/` 31→49, test files 86→135); total
-> source-file-count/LOC/test-count above were NOT re-run this pass (out of
-> scope for this docs-only wave) and may themselves be stale — see
-> `docs/archive/SINAPSYS-STORICO-DOCS-20260718.md` intro.
-> **Status:** all six pillars built, wired, and live; full suite green except 7
-> pre-existing Windows-only daemon/hook env failures.
+> **Scale (all re-measured 2026-08-07):** **194** source files · **~52,500** LOC ·
+> **143** test files · **812** tests green (`src/core`) · `core/kb` = **54** modules.
+> **Status:** all six pillars built, wired and live. Two long-standing gaps were closed
+> on 2026-08-07 — the **consolidation → recall wire** (reinforcement/tier now actually
+> affect ranking) and **friction capture** (memory finally sees failed tool calls, and
+> interrupts intra-session loops). Known-failing: 3 pre-existing `src/gateway/__tests__/auth.test.ts`
+> cases (they read the real gateway config and see a degraded health) — proven
+> pre-existing via `git stash`, unrelated to current work.
+>
+> 👉 **Live state, real numbers and what is still missing:**
+> [`docs/vision/STATO-REALE.md`](vision/STATO-REALE.md).
 
 ---
 
@@ -238,7 +242,40 @@ they are unverified off Windows-ARM.**
 
 ---
 
-## L4 Consolidation Engine (v1) — stub
+## Friction capture — memory sees the WORKSHOP (added 2026-08-07)
+
+`src/core/kb/friction-capture.ts` (🔬 pure) + `TdaiCore.recordFriction`.
+
+**The gap it closes:** capture deliberately drops tool traffic (`readAllTurns` skips
+`tool_use`/`tool_result`), so memory only ever heard the *conversation*. Measured over 5
+real days: **12,005 tool operations → 0 captured**. An error the agent repeated across
+sessions was therefore invisible, and the Mistake Notebook had no food.
+
+A FAILED tool call now becomes a `bug` event — precisely the input `bug-clusters.ts`
+already consumes. Two distinct phenomena, deliberately handled differently:
+
+| | Cross-session recurrence | Intra-session LOOP |
+|---|---|---|
+| Meaning | "you keep making this mistake over weeks" | "you are stuck RIGHT NOW" |
+| Detection | clustering: ≥2 bugs across ≥2 sessions | ≥3 repeats of one signature in a session |
+| Outcome | distilled into a **lesson** | **warning injected FIRST**, mid-turn |
+
+The split exists because `bug-cluster-graph.ts:106` requires `SESSION_MIN = 2`: five
+identical failures inside ONE session produced *nothing*. Measured on real transcripts:
+**38 sessions contained such a loop**, the worst repeating one failure **29 times**.
+
+Guarantees (unit-tested): only failures are recorded; the signature normalises volatile
+bits (line numbers, hashes, path prefixes) so the same failure matches across sessions;
+secrets are redacted **before** storage; text bounded; 40 events/session cap; fail-open.
+
+**Backfill:** `tools/backfill-friction.mts` replays historical failures from the CC
+transcripts through the *same* module (no second implementation to drift) — 119 sessions,
+994 failures, **866 memories recovered**, failure clusters **27 → 67**.
+⚠️ `insertEvent` alone does NOT create `kb_fts`/`kb_vec`; `reindexKb` enumerates owners
+FROM `kb_fts` (`sqlite.ts:2091`), so a directly-inserted event is invisible to search and
+clustering until its FTS row exists (`tools/repair-backfill-fts.mts`).
+
+## L4 Consolidation Engine — now WIRED TO RECALL (2026-08-07)
 
 Reinforcement + staleness decay (`consolidation-runner.ts`, `lifecycle-decay.ts`) were
 already live as the first two passes of the "sleep-time" engine. On 2026-07-18 (commit
@@ -253,12 +290,34 @@ compared before write), bounded (`MAX_ACTIVE_FACTS_SCANNED = 10_000`, `scanCappe
 observable in stats). Never deletes/mutates a fact row. Full detail (SQL, invariant,
 matrix of which phase uses which foundation): `docs/SINAPSYS_FOUNDATIONS.md` (Mattone 8).
 
+**The wire (2026-08-07).** For months this engine wrote `memory_lifecycle`
+(reinforcement counts up to 332, 843 memories promoted to the `long` tier) that **nothing
+ever read**: `kbRecall`'s importance blended only entity importance + confidence + support,
+so a fact confirmed 332 times ranked exactly like one said once by mistake. Now:
+
+- `VectorStore.candidateLifecycle(ownerIds, ns)` — ONE batched, PK-indexed read (recall is
+  on the critical path; a per-candidate `getLifecycle()` would fire dozens of queries).
+- `consolidationScore = 0.7·log1p(reinforcements)/log1p(10) + 0.3·(tier === 'long')`, and
+  **0 for non-active** memories (decayed material must never be boosted).
+- Blend is **purely additive**: `base + c·(1 − base)`. A memory with zero reinforcement
+  ranks bit-identically to before → **no regression by construction**.
+- Config-gated `recall.consolidationBoost` on **both** recall paths (auto-recall banner and
+  the explicit memory-search tool); duck-typed + fail-open like `candidateAdjacency`.
+
+**Measured A/B on the real 2.5 GB memory** (`tools/ab-consolidation.mts`, read-only, 20
+realistic queries): **9/20 queries change their top-8, 2/20 change the #1 hit**; the
+memories that rise are durable truths. ⚠️ Honest limit: only **~4%** of memories carry any
+reinforcement, so this is a precision booster on proven-durable items, not a broad re-rank.
+**LongMemEval structurally cannot measure this** — every question seeds a virgin memory
+where nothing was ever repeated, which is exactly why its `kb_consol` arm measured 0.
+
 ## Test coverage
 
-585 tests across 135 files (file count re-verified 2026-07-18; total test-count
-not re-run this pass, may itself be stale). Pure modules (🔬) are unit-tested in isolation; store
-methods are tested against a real SQLite. 7 failures are pre-existing
-Windows-environment daemon/hook mock issues, not Sinapsys logic.
+**812 tests across 143 test files, green** (`src/core`, re-measured 2026-08-07). Pure
+modules (🔬) are unit-tested in isolation; store methods are tested against a real SQLite.
+The only known failures are 3 cases in `src/gateway/__tests__/auth.test.ts` (they load the
+real gateway config and observe a degraded health) — **proven pre-existing** by re-running
+them on a stashed tree.
 
 > This map is the documentation foundation for the product/SaaS effort: it defines
 > precisely *what* Sinapsys is before we position *who* it is for.
