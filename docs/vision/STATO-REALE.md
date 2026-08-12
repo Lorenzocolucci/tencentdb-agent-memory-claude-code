@@ -103,20 +103,31 @@ La salute deve arrivare a Lorenzo, non al disco.
 
 | # | Cosa manca | Perché conta | Stato |
 |---|---|---|---|
-| **1** | **Sinapsys dentro Argus su Render** | Argus gira 24/7 nel cloud ed è **senza memoria**: è il pezzo che chiude la stella polare | **progettato**, non costruito → [01-vision-and-plan/PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md](01-vision-and-plan/PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md) |
-| 2 | **Decisione: una memoria o due?** | Cloud e portatile divergono; unificare crea dipendenza dalla rete sul lavoro quotidiano | **decisione aperta per Lorenzo** (§6 del doc Punto 5) |
-| 3 | Il temporale crolla sotto distrattori (0/5) | È il terreno di Zep/Graphiti (validity windows) | non affrontato |
-| 4 | `salience` a 0 per il **98,9%** dei ricordi | L'Idea 5 (Distinctive Terms) quasi non timbra | non affrontato |
-| 5 | `state` = `active` per **33.649 su 33.649** | Il decadimento non declassa MAI nulla → "dimenticare" non funziona | non affrontato |
-| 6 | Budget di recall fisso (top-5) | Le domande di aggregazione ("quanti/elenca") hanno bisogno di più | non affrontato |
-| 7 | Embedding/reranker locali (Fase E) | Toglie la dipendenza da un fornitore esterno (il guasto §5.3) | non costruito |
-| 8 | Chat di claude.ai non catturate | Solo Claude Code è agganciato | parcheggiato |
+| **1** | **Sinapsys dentro Argus su Render** | Argus gira 24/7 nel cloud **senza la memoria associativa**: è il pezzo che chiude la stella polare | **progettato**, non costruito → [01-vision-and-plan/PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md](01-vision-and-plan/PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md) |
+| **2** | **Decidere il rapporto con la memoria che Argus HA GIÀ** | Argus ha `argus-memory.mjs` su Supabase, viva e cablata in 10+ moduli. Sostituirla è rischioso; ignorarla crea due verità divergenti | **decisione aperta** — raccomandazione: due velocità (CLS), §3 del doc Punto 5 |
+| 3 | **Decisione: un DB o due?** (portatile ↔ cloud) | Unificare crea dipendenza dalla rete su ogni tuo prompt (recall ha 6s) | **decisione aperta per Lorenzo** (§9 del doc Punto 5) |
+| 4 | Il temporale crolla sotto distrattori (0/5) | È il terreno di Zep/Graphiti (validity windows) | non affrontato |
+| 5 | `salience` a 0 per il **98,9%** dei ricordi | L'Idea 5 (Distinctive Terms) quasi non timbra | non affrontato |
+| 6 | `state` = `active` per **33.649 su 33.649** | Il decadimento non declassa MAI nulla → "dimenticare" non funziona | non affrontato |
+| 7 | Budget di recall fisso (top-5) | Le domande di aggregazione ("quanti/elenca") hanno bisogno di più | non affrontato |
+| 8 | Embedding/reranker locali (Fase E) | Toglie la dipendenza da un fornitore esterno (il guasto §5.3) | non costruito |
+| 9 | Chat di claude.ai non catturate | Solo Claude Code è agganciato | parcheggiato |
 
 ---
 
 ## 7. La sessione GLOBALE che viene: mettere Sinapsys in Render
 
 **Obiettivo:** Argus (24/7 su Render) usa Sinapsys perfettamente.
+
+⚠️ **Premessa da non sbagliare (verificata 2026-08-07):** Argus **non è senza memoria**.
+Ha `C:/Argus/engine/lib/argus-memory.mjs` (308 righe) su **Supabase** - storico chat
+append-only + fatti curati con `evidence_count` — usata da **10+ moduli**, inclusa una sua
+consolidazione. Hanno scelto Supabase proprio perché un disco Render non è condivisibile
+fra i tre servizi. Quindi Sinapsys non va "aggiunta": va **collocata**.
+**Raccomandazione: due velocità (Complementary Learning Systems)** — `argus-memory` resta
+la memoria operativa veloce, Sinapsys diventa lo strato profondo associativo (recall per
+significato, Quaderno degli Errori, interruzione dei loop). È la nostra stella polare
+applicata alla lettera: ippocampo + neocorteccia.
 
 **Il vincolo che decide tutto** (verificato sulla documentazione Render):
 un disco persistente appartiene a **UN SOLO servizio** e **i cron non possono usarlo affatto**.

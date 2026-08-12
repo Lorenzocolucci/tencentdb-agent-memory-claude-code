@@ -1,3 +1,15 @@
+# ⛔ SUPERATO — vedi PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md
+
+> **2026-08-07.** Questo documento (21/07) e' stato **fuso** nella versione 2:
+> [PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md](PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md).
+> Le verifiche ancora valide (vincoli Render, manifest env, rsync, motivo per cui pgvector
+> e' stato scartato) sono state riportate li'. **Due affermazioni qui sono FALSE oggi:**
+> (1) `engine/lib/memory.mjs` non esiste piu' (cancellato nel commit `a98bf24`);
+> (2) la memoria attuale di Argus e' `engine/lib/argus-memory.mjs` su **Supabase**, non un
+> client Sinapsys. Conservato solo come traccia storica del ragionamento.
+
+---
+
 # Punto 5 — Sinapsys ONLINE dentro Argus su Render (design-first)
 
 > Autore: Socio (Claude) — 2026-07-21. Design-first con ricerca SOTA PRIMA del codice.

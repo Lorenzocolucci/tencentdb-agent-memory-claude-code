@@ -1,3 +1,11 @@
+# ⛔ SUPERATO — kickoff del 2026-07-21
+
+> **2026-08-07.** I branch e lo stato citati qui non sono piu' attuali (siamo su `main`).
+> Punto d'ingresso corrente: [../STATO-REALE.md](../STATO-REALE.md).
+> Prossimo passo: [PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md](PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md).
+
+---
+
 # Kickoff prossima sessione — Sinapsys al 100% + test reale + deploy in Argus su Render
 
 > Scritto 2026-07-21 a fine sessione (Cura #1 + Cura #2 2a + 2b-core fatti). Copia il blocco qui sotto nella nuova sessione.
