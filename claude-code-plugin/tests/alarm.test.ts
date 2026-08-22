@@ -24,7 +24,12 @@ function makeFakeClient(overrides: Partial<GatewayClient> = {}): GatewayClient {
   return {
     health: vi.fn(async () => true),
     // Staleness tripwire (2026-08-22) reads /health's body.
-    healthDetailed: vi.fn(async () => ({ last_capture_at: new Date().toISOString() })),
+    healthDetailed: vi.fn(async () => ({
+      status: "ok" as const,
+      embedding: "ok" as const,
+      last_capture_at: new Date().toISOString(),
+      reachable: true,
+    })),
     recall: vi.fn(async (): Promise<RecallResult> => ({ context: "" })),
     captureTurn: vi.fn(async () => ({ l0_recorded: 1, scheduler_notified: true })),
     observe: vi.fn(async () => ""),
@@ -102,6 +107,33 @@ describe("tripwire: gateway unreachable (the 2026-08-13 → 08-18 outage)", () =
 
   it("session-start clears the alarm once the gateway answers again", async () => {
     await raiseAlarm(dir, "gateway-unreachable", "giù");
+    const client = makeFakeClient();
+    await handleHook("session-start", { stdin: "{}", client, dataDir: dir });
+    expect(await readAlarms(dir)).toEqual([]);
+  });
+});
+
+describe("tripwire: degraded is NOT the same as down", () => {
+  it("does NOT cry 'gateway unreachable' when /health answers 503 (embedder busy)", async () => {
+    // Real case, 2026-08-22: DeepInfra answered "429 engine_overloaded", so
+    // /health returned 503 while /recall kept working. An alarm that cries wolf
+    // is worse than no alarm.
+    const client = makeFakeClient({
+      healthDetailed: vi.fn(async () => ({
+        status: "degraded" as const,
+        embedding: "failing" as const,
+        last_capture_at: new Date().toISOString(),
+        reachable: true,
+      })),
+    } as Partial<GatewayClient>);
+    await handleHook("session-start", { stdin: "{}", client, dataDir: dir });
+    const codes = (await readAlarms(dir)).map((a) => a.code);
+    expect(codes).not.toContain("gateway-unreachable");
+    expect(codes).toContain("memory-degraded");
+  });
+
+  it("clears the degraded alarm as soon as the embedder recovers", async () => {
+    await raiseAlarm(dir, "memory-degraded", "vecchio");
     const client = makeFakeClient();
     await handleHook("session-start", { stdin: "{}", client, dataDir: dir });
     expect(await readAlarms(dir)).toEqual([]);

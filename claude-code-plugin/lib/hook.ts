@@ -110,6 +110,21 @@ async function handleSessionStart(
   }
   await clearAlarm(dataDir, "gateway-unreachable");
 
+  // Reachable but unhappy is a THIRD state, not a synonym for "down". The
+  // gateway answers 503 while its embedding provider is refusing calls
+  // (DeepInfra: "429 engine_overloaded") even though /recall still works.
+  // Say what is actually true — and clear it the moment it recovers, so a
+  // transient provider hiccup costs one honest line, not a standing siren.
+  if (health.status === "degraded" || health.embedding === "failing") {
+    await raiseAlarm(
+      dataDir,
+      "memory-degraded",
+      "l'embedder non risponde bene — la memoria funziona ma richiama peggio",
+    );
+  } else {
+    await clearAlarm(dataDir, "memory-degraded");
+  }
+
   // The hole detector: memory silent while work kept happening.
   const verdict = assessStaleness(
     health.last_capture_at,

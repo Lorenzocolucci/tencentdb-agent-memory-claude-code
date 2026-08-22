@@ -82,11 +82,14 @@ var GatewayClient = class {
 		try {
 			const token = await this.freshToken();
 			const { status, body } = await this.rawRequest("GET", "/health", void 0, token);
-			if (status !== 200) {
+			if (status !== 200 && status !== 503) {
 				await this.logFailure("GET", "/health", this.describeStatus(status, body));
 				return null;
 			}
-			return JSON.parse(body);
+			return {
+				...JSON.parse(body),
+				reachable: true
+			};
 		} catch (err) {
 			await this.logFailure("GET", "/health", err instanceof Error ? err.message : String(err));
 			return null;
@@ -962,6 +965,8 @@ async function handleSessionStart(_data, client, dataDir) {
 		return "";
 	}
 	await clearAlarm(dataDir, "gateway-unreachable");
+	if (health.status === "degraded" || health.embedding === "failing") await raiseAlarm(dataDir, "memory-degraded", "l'embedder non risponde bene — la memoria funziona ma richiama peggio");
+	else await clearAlarm(dataDir, "memory-degraded");
 	const verdict = assessStaleness(health.last_capture_at, newestTranscriptMs(join(homedir(), ".claude", "projects")), Date.now());
 	if (verdict.stale) await raiseAlarm(dataDir, "memory-stale", describeStaleness(verdict));
 	else await clearAlarm(dataDir, "memory-stale");

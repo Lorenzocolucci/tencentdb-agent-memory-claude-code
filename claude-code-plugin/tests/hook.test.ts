@@ -9,7 +9,12 @@ function makeFakeClient(overrides: Partial<GatewayClient> = {}): GatewayClient {
   return {
     health: vi.fn(async () => true),
     // Staleness tripwire (2026-08-22) reads /health's body.
-    healthDetailed: vi.fn(async () => ({ last_capture_at: new Date().toISOString() })),
+    healthDetailed: vi.fn(async () => ({
+      status: "ok" as const,
+      embedding: "ok" as const,
+      last_capture_at: new Date().toISOString(),
+      reachable: true,
+    })),
     recall: vi.fn(async (): Promise<RecallResult> => ({ context: "recalled" })),
     captureTurn: vi.fn(async () => ({ l0_recorded: 1, scheduler_notified: true })),
     // Friction capture (2026-08-07): handlePostToolUse calls client.observe.

@@ -73,6 +73,15 @@ export interface SearchResult {
   strategy?: string;
 }
 
+/** What /health actually tells us. `null` from healthDetailed() = unreachable. */
+export interface HealthDetail {
+  status?: "ok" | "degraded";
+  embedding?: "ok" | "failing";
+  last_capture_at?: string | null;
+  /** Always true when returned — the gateway answered, whatever the status. */
+  reachable?: boolean;
+}
+
 export class GatewayClient {
   private baseUrl: URL;
   private token: string;
@@ -129,15 +138,21 @@ export class GatewayClient {
    * /health with its body, so callers can see `last_capture_at`.
    * Returns null when the gateway cannot be reached or answers non-200.
    */
-  async healthDetailed(): Promise<{ last_capture_at?: string | null } | null> {
+  async healthDetailed(): Promise<HealthDetail | null> {
     try {
       const token = await this.freshToken();
       const { status, body } = await this.rawRequest("GET", "/health", undefined, token);
-      if (status !== 200) {
+      // 503 means DEGRADED, NOT unreachable: the gateway answered. It returns
+      // 503 whenever the embedding path is unhappy — e.g. DeepInfra replying
+      // "429 engine_overloaded" — while /recall keeps working. Treating that as
+      // "gateway down" made the session-start tripwire cry wolf, and an alarm
+      // that cries wolf is worse than no alarm at all.
+      if (status !== 200 && status !== 503) {
         await this.logFailure("GET", "/health", this.describeStatus(status, body));
         return null;
       }
-      return JSON.parse(body) as { last_capture_at?: string | null };
+      const parsed = JSON.parse(body) as HealthDetail;
+      return { ...parsed, reachable: true };
     } catch (err) {
       await this.logFailure("GET", "/health", err instanceof Error ? err.message : String(err));
       return null;

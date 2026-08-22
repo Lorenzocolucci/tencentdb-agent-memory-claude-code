@@ -29,7 +29,8 @@ export type AlarmCode =
   | "gateway-unreachable"
   | "capture-failed"
   | "capture-empty"
-  | "memory-stale";
+  | "memory-stale"
+  | "memory-degraded";
 
 export interface AlarmRecord {
   code: AlarmCode;

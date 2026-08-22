@@ -51,6 +51,7 @@ import type { KbDelta } from "./kb/extraction-schema.js";
 import { performAutoRecall } from "./hooks/auto-recall.js";
 import { SessionBannerTracker } from "./hooks/session-banner.js";
 import { CornerstoneInjectionTracker, buildCornerstones } from "./distinctiveness/cornerstone-runner.js";
+import { beginHeavyTask, endHeavyTask } from "./diagnostics/inflight-registry.js";
 import { CornerstoneSessionCache } from "./distinctiveness/cornerstone-cache.js";
 import { renderGroundedTrustInterrupt } from "./kb/grounded-trust-ask.js";
 import { performAutoCapture } from "./hooks/auto-capture.js";
@@ -70,6 +71,31 @@ import { MemoryPipelineManager } from "../utils/pipeline-manager.js";
 import { CheckpointManager } from "../utils/checkpoint.js";
 import { SessionFilter } from "../utils/session-filter.js";
 import { StandaloneLLMRunnerFactory } from "../adapters/standalone/llm-runner.js";
+
+/**
+ * Hand control back to the event loop. Used before any step that does
+ * seconds of SYNCHRONOUS work, so the current response flushes first.
+ */
+/**
+ * Minimum gap between distillation passes.
+ *
+ * They used to fire on the FIRST TURN OF EVERY SESSION. Each of the three steps
+ * re-clusters the whole failure corpus from scratch — pairwise comparison over
+ * 1.706 bug events, ~6 s of synchronous work each, ~18 s in total (measured on
+ * the live DB, 2026-08-22). Deferring that to a macrotask stops it blocking the
+ * turn that scheduled it, but it still blocks every OTHER request while it runs:
+ * first-turn recall went 11,5 s → 1,9 s for the first session and 18 s for the
+ * next, because the previous session's passes were still churning.
+ *
+ * The passes are also idempotent and their input moves on a scale of days, so
+ * running them once per session was pure waste. Half an hour keeps the Mistake
+ * Notebook growing while making a collision with a live turn rare.
+ */
+const DISTILLATION_COOLDOWN_MS = 30 * 60 * 1000;
+
+function yieldToMacrotask(): Promise<void> {
+  return new Promise<void>((resolve) => setImmediate(resolve));
+}
 
 const TAG = "[memory-tdai] [core]";
 
@@ -168,6 +194,12 @@ export class TdaiCore {
    * of currently-running background tasks.
    */
   private readonly bgTasks = new Set<Promise<void>>();
+  /**
+   * When the distillation passes may next run. See DISTILLATION_COOLDOWN_MS —
+   * they are expensive and their input (recurring-failure clusters) changes over
+   * days, not over minutes.
+   */
+  private distillationNextAllowedAt = 0;
 
   /**
    * Files whose proactive memory has already been injected in a given session
@@ -670,13 +702,24 @@ export class TdaiCore {
    * no cluster → no LLM; idempotent (already-distilled skipped) → safe on both.
    */
   private scheduleBackgroundDistillation(): void {
+    // Cooldown BEFORE anything else: cheapest possible no-op on the hot path.
+    const now = Date.now();
+    if (now < this.distillationNextAllowedAt) {
+      this.logger.debug?.(`${TAG} [distillation] skipped (cooldown)`);
+      return;
+    }
+    this.distillationNextAllowedAt = now + DISTILLATION_COOLDOWN_MS;
+
     const runnerFactory = this.runnerFactory;
     const logger = this.logger;
+
+    /** Heavy steps, run one at a time AFTER the caller's response has flushed. */
+    const steps: Array<{ name: string; run: () => Promise<void> }> = [];
 
     // Track B (Mistake Notebook): recurring-failure clusters → lessons.
     if (this.vectorStore?.runLessonDistillation) {
       const store = this.vectorStore;
-      const distillTask = (async () => {
+      steps.push({ name: "lessons", run: async () => {
         try {
           const runner = runnerFactory.createRunner({ enableTools: false });
           const stats = await store.runLessonDistillation!(runner, {
@@ -696,9 +739,7 @@ export class TdaiCore {
             `${TAG} [lessons] distillation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
           );
         }
-      })();
-      this.bgTasks.add(distillTask);
-      void distillTask.then(() => this.bgTasks.delete(distillTask));
+      } });
     }
 
     // Pilastro C Fase 2 ("dimenticare con gusto"): recurring cross-session
@@ -706,7 +747,7 @@ export class TdaiCore {
     // via Fase 1, never deleted).
     if (typeof this.vectorStore?.insertEvent === "function" && typeof this.vectorStore?.listRecentEvents === "function") {
       const store = this.vectorStore;
-      const principleTask = (async () => {
+      steps.push({ name: "principles", run: async () => {
         try {
           const runner = runnerFactory.createRunner({ enableTools: false });
           const stats = await distillPrinciples(store, runner, {
@@ -726,9 +767,7 @@ export class TdaiCore {
             `${TAG} [principles] distillation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
           );
         }
-      })();
-      this.bgTasks.add(principleTask);
-      void principleTask.then(() => this.bgTasks.delete(principleTask));
+      } });
     }
 
     // Percorso B (behavioral notebook) — recurring cross-session BEHAVIORAL
@@ -737,7 +776,7 @@ export class TdaiCore {
     // Deterministic, no LLM. CONSERVATIVE: additive only. Fire-and-forget.
     if (typeof this.vectorStore?.runUsageDistillation === "function") {
       const store = this.vectorStore;
-      const usageTask = (async () => {
+      steps.push({ name: "usage", run: async () => {
         try {
           const runner = runnerFactory.createRunner({ enableTools: false });
           const stats = await store.runUsageDistillation!(runner, {
@@ -761,9 +800,43 @@ export class TdaiCore {
             `${TAG} [usage] distillation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
           );
         }
+      } });
+    }
+
+    if (steps.length === 0) return;
+
+    // WHY THE YIELD (measured 2026-08-22, live DB)
+    // -------------------------------------------
+    // "Detached" was a lie. An async function body runs SYNCHRONOUSLY until its
+    // first await — and `await store.runLessonDistillation(...)` must first
+    // EVALUATE that call, whose own body reaches `selectFailureClusters(db, …)`,
+    // which is fully synchronous and took **6.2 s** on the live DB (1.699 bug
+    // events). Three such steps ran back to back on the caller's stack, so the
+    // first turn of every session paid ~11 s: /recall answered in 274 ms
+    // internally but 11.500 ms at the socket, blowing the plugin's 6 s budget.
+    // Result: the session-open injection — banner included — was dropped in
+    // EVERY project. Yielding to a macrotask first hands the response back to
+    // the socket before any of this runs; stepping one at a time (with a yield
+    // between) keeps at most one blocking stretch in flight, so a live recall
+    // can slip in between them. Same pattern as scheduleConsolidation.
+    // Each step keeps its OWN bgTasks entry (a shutdown drain must still await
+    // each one), but they are chained so only one blocking stretch is ever in
+    // flight, with a macrotask yield before each.
+    let previous: Promise<void> = Promise.resolve();
+    for (const step of steps) {
+      const task = (async () => {
+        await previous;
+        await yieldToMacrotask();
+        const token = beginHeavyTask(`distillation:${step.name}`);
+        try {
+          await step.run();
+        } finally {
+          endHeavyTask(token);
+        }
       })();
-      this.bgTasks.add(usageTask);
-      void usageTask.then(() => this.bgTasks.delete(usageTask));
+      previous = task;
+      this.bgTasks.add(task);
+      void task.then(() => this.bgTasks.delete(task));
     }
   }
 
