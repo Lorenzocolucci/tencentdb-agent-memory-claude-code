@@ -63,11 +63,22 @@ describe("Gateway optional Bearer token", () => {
     expect(res.status).toBe(401);
   });
 
+  // These tests are about AUTHORIZATION, not health. They used to assert 200,
+  // which stopped being true in b96590e (2026-06-18) when /health began
+  // answering 503 while degraded — and a gateway built here has no store, so it
+  // is degraded by construction. The property under test is "the request got
+  // PAST the auth gate": no 401, and no WWW-Authenticate challenge. That is
+  // stricter than the old assertion, which passed for an incidental reason.
+  function expectAuthorized(res: { status: number; wwwAuth: string | undefined }, ctx = "") {
+    expect(res.status, ctx).not.toBe(401);
+    expect(res.wwwAuth, ctx).toBeUndefined();
+  }
+
   it("accepts correct Bearer token", async () => {
     const res = await request(PORT, "/health", {
       Authorization: `Bearer ${TOKEN}`,
     });
-    expect(res.status).toBe(200);
+    expectAuthorized(res);
   });
 
   it("includes WWW-Authenticate header on 401 per RFC 6750 §3", async () => {
@@ -81,7 +92,7 @@ describe("Gateway optional Bearer token", () => {
       const res = await request(PORT, "/health", {
         Authorization: `${scheme} ${TOKEN}`,
       });
-      expect(res.status, `scheme=${scheme}`).toBe(200);
+      expectAuthorized(res, `scheme=${scheme}`);
     }
   });
 
@@ -156,6 +167,8 @@ describe("Gateway with no token configured", () => {
 
   it("accepts unauthenticated requests when token is empty (backward compat)", async () => {
     const res = await request(PORT, "/health");
-    expect(res.status).toBe(200);
+    // Same reasoning as above: no auth gate configured => no 401, no challenge.
+    expect(res.status).not.toBe(401);
+    expect(res.wwwAuth).toBeUndefined();
   });
 });
