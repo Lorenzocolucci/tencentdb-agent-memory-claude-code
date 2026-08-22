@@ -32,7 +32,7 @@ un altro e i ricordi **arrivano all'agente** senza che li cerchi. Non un motore 
 
 **Salute al 2026-08-22:** gateway `status: ok`, `embedding: ok`, recall live via `strategy=kb`
 (**0,5 s a caldo**, 13,6 s la prima query a freddo), `/health` riporta ora anche `last_capture_at`.
-**1.005 test verdi**, 3 rossi noti (§9).
+**1.014 test verdi, 0 rossi** (2 saltati: solo-POSIX su Windows).
 
 ---
 
@@ -95,6 +95,7 @@ Ogni guasto scriveva in un file di log che nessuno legge. **Un log non è un seg
 | `capture-failed` | la cattura fallisce dopo il ritentativo | `lib/hook.ts` (stop) |
 | `capture-empty` | il gateway risponde OK ma scrive **0 righe** | `lib/hook.ts` (stop) |
 | `memory-stale` | hai lavorato **>24 h** dopo l'ultimo ricordo salvato | `lib/staleness.ts` + `/health.last_capture_at` |
+| `memory-degraded` | il gateway risponde ma l'embedder no (503) — richiamo peggiore, non morte | `lib/hook.ts` (session-start) |
 
 Come arrivano a Lorenzo: un allarme viene scritto come briciola (`alarms.json`) e il primo
 `UserPromptSubmit` successivo lo mostra come **`systemMessage`**, l'unico canale che Claude Code
@@ -112,6 +113,29 @@ il plugin stesso è rotto o spento. Provato dal vivo con soglia forzata a 1 s.
 
 `npm run install:cc-plugin` costruisce **e installa** in un colpo solo, scoprendo la cartella
 d'installazione invece di assumerla. Il passaggio manuale che si poteva dimenticare non esiste più.
+
+### Il quarto guasto, trovato mentre si verificava il banner
+
+Il banner non compariva **nemmeno dopo il fix**. Motivo: il recall al **primo turno di ogni
+sessione** impiegava **11,5 s** mentre il budget del plugin è **6 s** → l'iniezione veniva
+scartata. In **ogni** progetto. E il gateway dichiarava `total=274 ms`: due numeri diversi per
+la stessa cosa.
+
+**Causa:** `scheduleBackgroundDistillation` lanciava tre compiti `(async () => …)()` chiamandoli
+"staccati". Non lo erano: **il corpo di una funzione async gira in modo SINCRONO fino alla prima
+attesa**, e `await store.runLessonDistillation(…)` deve prima *valutare* la chiamata — che arriva
+a `selectFailureClusters`, un confronto a coppie interamente sincrono sul corpus degli errori.
+Misurato sul DB vivo (1.706 errori): SQL 43 ms, letture vettori 505 ms, **aggregazione ~5,6 s** →
+6,2 s a compito, tre di fila sullo stack del chiamante.
+
+**Fix** (`src/core/tdai-core.ts`): cedere il controllo al ciclo eventi **prima** di ogni passo, in
+catena (mai più di un blocco per volta), + **finestra di 30 minuti** — quei calcoli sono
+idempotenti e il loro input cambia in giorni, non in minuti.
+
+**Misurato dopo:** Argus 444/285 ms · Sinapsys 302/284 ms · Sofia-AI 317/376 ms.
+**Banner verificato dal vivo attraverso il plugin installato**, su Argus, sessione nuova.
+
+---
 
 ### Recupero
 
