@@ -8,13 +8,28 @@ import type { GatewayClient, RecallResult } from "../lib/gateway-client.js";
 function makeFakeClient(overrides: Partial<GatewayClient> = {}): GatewayClient {
   return {
     health: vi.fn(async () => true),
+    // Staleness tripwire (2026-08-22) reads /health's body.
+    healthDetailed: vi.fn(async () => ({ last_capture_at: new Date().toISOString() })),
     recall: vi.fn(async (): Promise<RecallResult> => ({ context: "recalled" })),
     captureTurn: vi.fn(async () => ({ l0_recorded: 1, scheduler_notified: true })),
+    // Friction capture (2026-08-07): handlePostToolUse calls client.observe.
+    // The fake was never given one, so post-tool-use threw "not a function".
+    observe: vi.fn(async () => ""),
     searchMemories: vi.fn(async () => ({ results: "m", total: 1 })),
     searchConversations: vi.fn(async () => ({ results: "c", total: 1 })),
     sessionEnd: vi.fn(async () => {}),
     ...overrides,
   } as unknown as GatewayClient;
+}
+
+/**
+ * A captureTurn fake that reports a REAL write. `async () => null` means
+ * "capture failed" to the implementation, which then deliberately does not
+ * advance the cursor — so a fake returning null can never satisfy a test about
+ * cursor progress. Assertions are unchanged; only the fake tells the truth.
+ */
+function fakeCaptureOk() {
+  return vi.fn(async () => ({ l0_recorded: 2, scheduler_notified: true }));
 }
 
 describe("handleHook: user-prompt-submit", () => {
@@ -167,13 +182,13 @@ describe("handleHook: stop", () => {
       transcript_path: "/tmp/t.jsonl",
       stop_hook_active: true,
     });
-    const out = await handleHook("stop", { stdin, client });
+    const out = await handleHook("stop", { stdin, client, dataDir: cursorDir });
     expect(out).toBe("");
     expect(captureTurn).not.toHaveBeenCalled();
   });
 
   it("calls captureTurn when stop_hook_active is false", async () => {
-    const captureTurn = vi.fn(async () => null);
+    const captureTurn = fakeCaptureOk();
     const client = makeFakeClient({
       captureTurn,
     } as Partial<GatewayClient>);
@@ -195,7 +210,7 @@ describe("handleHook: stop", () => {
         cwd: "/tmp/proj",
         stop_hook_active: false,
       });
-      await handleHook("stop", { stdin, client });
+      await handleHook("stop", { stdin, client, dataDir: cursorDir });
       expect(captureTurn).toHaveBeenCalledOnce();
       const call = captureTurn.mock.calls[0][0];
       expect(call.user_content).toBe("q");
@@ -209,7 +224,7 @@ describe("handleHook: stop", () => {
     // Two-turn transcript, fire Stop once. Then append a third turn and fire
     // Stop again. The second call must POST only the new turn — without the
     // cursor a long session would re-write every turn on each Stop.
-    const captureTurn = vi.fn(async () => null);
+    const captureTurn = fakeCaptureOk();
     const client = makeFakeClient({
       captureTurn,
     } as Partial<GatewayClient>);
@@ -231,7 +246,7 @@ describe("handleHook: stop", () => {
         cwd: "/tmp/proj",
         stop_hook_active: false,
       });
-      await handleHook("stop", { stdin, client });
+      await handleHook("stop", { stdin, client, dataDir: cursorDir });
       expect(captureTurn).toHaveBeenCalledTimes(1);
       const first = captureTurn.mock.calls[0][0];
       expect(first.messages).toHaveLength(4); // 2 turns × (user + assistant)
@@ -245,7 +260,7 @@ describe("handleHook: stop", () => {
             '{"type":"assistant","message":{"role":"assistant","content":"a3"},"uuid":"a3"}',
           ].join("\n"),
       );
-      await handleHook("stop", { stdin, client });
+      await handleHook("stop", { stdin, client, dataDir: cursorDir });
       expect(captureTurn).toHaveBeenCalledTimes(2);
       const second = captureTurn.mock.calls[1][0];
       // Cursor should have skipped the first 2 turns — only q3/a3 sent.
@@ -258,7 +273,7 @@ describe("handleHook: stop", () => {
   });
 
   it("skips captureTurn when no new turns since last cursor", async () => {
-    const captureTurn = vi.fn(async () => null);
+    const captureTurn = fakeCaptureOk();
     const client = makeFakeClient({
       captureTurn,
     } as Partial<GatewayClient>);
@@ -280,8 +295,8 @@ describe("handleHook: stop", () => {
         cwd: "/tmp/proj",
         stop_hook_active: false,
       });
-      await handleHook("stop", { stdin, client });
-      await handleHook("stop", { stdin, client });
+      await handleHook("stop", { stdin, client, dataDir: cursorDir });
+      await handleHook("stop", { stdin, client, dataDir: cursorDir });
       // Second Stop sees the same transcript → cursor already at end → no call.
       expect(captureTurn).toHaveBeenCalledTimes(1);
     } finally {
@@ -290,7 +305,7 @@ describe("handleHook: stop", () => {
   });
 
   it("caps first capture at MAX_CAPTURE_TURNS (50) when transcript is long", async () => {
-    const captureTurn = vi.fn(async () => null);
+    const captureTurn = fakeCaptureOk();
     const client = makeFakeClient({
       captureTurn,
     } as Partial<GatewayClient>);
@@ -311,7 +326,7 @@ describe("handleHook: stop", () => {
         cwd: "/tmp/proj",
         stop_hook_active: false,
       });
-      await handleHook("stop", { stdin, client });
+      await handleHook("stop", { stdin, client, dataDir: cursorDir });
       expect(captureTurn).toHaveBeenCalledTimes(1);
       const call = captureTurn.mock.calls[0][0];
       // Capped at 50 turns × (user + assistant) = 100 messages.

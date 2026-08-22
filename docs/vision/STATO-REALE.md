@@ -1,6 +1,6 @@
 # 🧭 SINAPSYS — STATO REALE
 
-> **Aggiornato: 2026-08-07.** Ogni numero qui è stato **misurato**, non ricordato.
+> **Aggiornato: 2026-08-22.** Ogni numero qui è stato **misurato**, non ricordato.
 > **Questo è il documento da leggere PER PRIMO.** Tutti gli altri partono da qui.
 >
 > Regola di questo file: se una cosa non è stata verificata con una prova reale
@@ -30,8 +30,9 @@ un altro e i ricordi **arrivano all'agente** senza che li cerchi. Non un motore 
 | **Embedder** | DeepInfra **Qwen3-Embedding-4B @ 1024 dim** (verificato in `embedding_meta`) |
 | **Estrazione** | Moonshot/Kimi (`TDAI_LLM_*`), fallback `gpt-5.4-mini` |
 
-**Salute al 2026-08-07:** gateway `status: ok`, `embedding: ok`, recall live via `strategy=kb`,
-banner di sessione visibile. **812 test verdi** (`src/core`).
+**Salute al 2026-08-22:** gateway `status: ok`, `embedding: ok`, recall live via `strategy=kb`
+(**0,5 s a caldo**, 13,6 s la prima query a freddo), `/health` riporta ora anche `last_capture_at`.
+**1.005 test verdi**, 3 rossi noti (§9).
 
 ---
 
@@ -39,13 +40,14 @@ banner di sessione visibile. **812 test verdi** (`src/core`).
 
 | | |
 |---|---|
-| Conversazioni grezze (L0) | **35.452** |
-| Entità | **12.385** |
-| Fatti | **20.010** |
-| Eventi | **15.410** — di cui **1.697** errori (`bug`), di cui **866** recuperati dal passato |
-| Relazioni | **7.794** |
-| **Lezioni** (Quaderno Errori) | **45** — erano **6** il 2026-08-07 mattina |
-| Righe di consolidamento | **33.649** — **843** promosse a `long`, **1.310** rinforzate |
+| Conversazioni grezze (L0) | **35.676** |
+| Entità | **12.422** |
+| Fatti | **20.092** |
+| Eventi | **15.439** — di cui **1.699** errori (`bug`) |
+| Relazioni | **7.831** |
+| **Lezioni** (Quaderno Errori) | **53** — erano **6** il 2026-08-07 mattina |
+| Righe di consolidamento | **33.728** — **844** promosse a `long`, **1.511** rinforzate |
+| DB | **2,76 GB** |
 
 ---
 
@@ -66,6 +68,57 @@ banner di sessione visibile. **812 test verdi** (`src/core`).
 
 Dettaglio modulo-per-modulo: [../SINAPSYS-ARCHITECTURE.md](../SINAPSYS-ARCHITECTURE.md) ·
 mappa dei flussi: [02-architecture/INTERCONNECTION-MAP.md](02-architecture/INTERCONNECTION-MAP.md)
+
+---
+
+## 4-bis. Il guasto del 13–22 agosto e la garanzia "MAI in silenzio"
+
+### Che cosa è successo (accertato, non ipotizzato)
+
+Dal **12/08 23:13** al **22/08** la memoria non ha registrato **nulla**. Tre guasti in fila,
+tutti silenziosi:
+
+| # | guasto | prova |
+|---|---|---|
+| 1 | Claude Code ha cambiato il layout d'installazione dei plugin (`<plugins>/cache/<mkt>/<plugin>/<versione>/dist/lib/`). Il plugin calcolava la propria cartella dati risalendo **4 livelli**; ne servono **6** → cartella inesistente → `no daemon, skipped` ad ogni aggancio | `~/.tdai-memory/hook.log`; il calcolo sbagliato dava `…/cache/tdai-local/data` |
+| 2 | il gateway è morto il 13/08 alle 22:56 ed è rimasto giù fino al 18/08 | `hook.log`: `ECONNREFUSED` il 14, 15, 17 e 18 agosto |
+| 3 | il plugin **installato** era la build del **29/06**: le correzioni del 07/08 (banner + officina) erano nel repo e **mai copiate** | `hooks.json` installato senza `PostToolUse`; bundle senza il fix del banner |
+
+Ogni guasto scriveva in un file di log che nessuno legge. **Un log non è un segnale.**
+
+### Le cinque trappole ora in funzione (ognuna con test che nomina il guasto che coglie)
+
+| trappola | scatta quando | dove |
+|---|---|---|
+| `data-dir-lost` | il plugin non trova la propria cartella (guasto 1) | `lib/hook.ts` → `lib/data-dir.ts` |
+| `gateway-unreachable` | `/health` non risponde (guasto 2) | `lib/hook.ts` (session-start) |
+| `capture-failed` | la cattura fallisce dopo il ritentativo | `lib/hook.ts` (stop) |
+| `capture-empty` | il gateway risponde OK ma scrive **0 righe** | `lib/hook.ts` (stop) |
+| `memory-stale` | hai lavorato **>24 h** dopo l'ultimo ricordo salvato | `lib/staleness.ts` + `/health.last_capture_at` |
+
+Come arrivano a Lorenzo: un allarme viene scritto come briciola (`alarms.json`) e il primo
+`UserPromptSubmit` successivo lo mostra come **`systemMessage`**, l'unico canale che Claude Code
+rende direttamente all'utente. **Un allarme batte sempre il banner "mi ricordo di te"**: una
+falsa rassicurazione è ciò che ha nascosto il guasto per dieci giorni.
+
+**Rete di sicurezza indipendente:** `~/.claude/scripts/hooks/session-start-tdai-health.js` ripete
+il controllo di anzianità **senza dipendere dal plugin** — è l'unico punto che può accorgersene se
+il plugin stesso è rotto o spento. Provato dal vivo con soglia forzata a 1 s.
+
+**Perché in ferie non urla:** l'anzianità confronta l'ultimo ricordo con l'ultima sessione
+**realmente avvenuta**. Senza sessioni nuove i due orologi restano fermi insieme.
+
+### Contro il ritorno del guasto 3 (deriva repo → installato)
+
+`npm run install:cc-plugin` costruisce **e installa** in un colpo solo, scoprendo la cartella
+d'installazione invece di assumerla. Il passaggio manuale che si poteva dimenticare non esiste più.
+
+### Recupero
+
+`tools/recover-sessions.mts` rigioca i transcript attraverso lo **stesso** `/capture` degli
+agganci (nessuna porta di servizio): a vuoto per default, `--commit` per scrivere, riprendibile,
+con doppia guardia anti-doppione (cursore **e** verifica sul database in sola lettura).
+**Le 9 sessioni perse sono state recuperate: 152 turni, 0 fallimenti.**
 
 ---
 

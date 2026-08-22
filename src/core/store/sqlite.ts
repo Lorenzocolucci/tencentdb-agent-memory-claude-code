@@ -2040,6 +2040,29 @@ export class VectorStore implements IMemoryStore {
     }
   }
 
+  /**
+   * ISO timestamp of the most recent L0 message, or null when memory is empty.
+   *
+   * Exposed on /health so a client can tell "the gateway is up" apart from
+   * "the gateway is up AND still being fed". Between 2026-08-13 and 08-22 the
+   * gateway answered 200 while nothing whatsoever was being written, and there
+   * was no way to see it. **Fault-tolerant**: returns null on failure.
+   */
+  lastCaptureAt(): string | null {
+    if (this.degraded) return null;
+    try {
+      const row = this.db
+        .prepare("SELECT MAX(recorded_at) AS last FROM l0_conversations")
+        .get() as { last: string | null };
+      return row?.last ?? null;
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} lastCaptureAt failed (non-fatal, returning null): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    }
+  }
+
   // ── Re-index operations ──────────────────────────────────
 
   /**

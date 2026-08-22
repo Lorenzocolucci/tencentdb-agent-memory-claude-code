@@ -379,12 +379,31 @@ export class TdaiGateway {
         embeddingService: !!this.core.getEmbeddingService(),
       },
       embedding: embeddingOk ? "ok" : "failing",
+      last_capture_at: await this.readLastCaptureAt(),
     };
 
     // Return 503 when degraded so EVERY existing probe — daemon.ts, the cc
     // hook client, and start-gateway.ps1 (all of which gate on HTTP 200) —
     // treats a degraded embedding path as unhealthy, without changing them.
     sendJson(res, healthy ? 200 : 503, response);
+  }
+
+  /**
+   * Newest captured message, or null when the store cannot answer.
+   *
+   * Never throws and never fails the health check: an unknown value must read
+   * as "unknown", not as "broken" — the caller decides what staleness means.
+   */
+  private async readLastCaptureAt(): Promise<string | null> {
+    try {
+      const store = this.core.getVectorStore() as
+        | { lastCaptureAt?: () => string | null | Promise<string | null> }
+        | null;
+      if (!store || typeof store.lastCaptureAt !== "function") return null;
+      return (await store.lastCaptureAt()) ?? null;
+    } catch {
+      return null;
+    }
   }
 
   /**

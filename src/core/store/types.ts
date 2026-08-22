@@ -480,6 +480,12 @@ export interface IMemoryStore {
   // ── L0 Read ──────────────────────────────────────────────
 
   countL0(): MaybePromise<number>;
+  /**
+   * ISO timestamp of the newest L0 message, or null when empty/unsupported.
+   * Optional so alternative stores need not implement it; callers treat a
+   * missing value as "unknown", never as "broken".
+   */
+  lastCaptureAt?(): MaybePromise<string | null>;
   queryL0ForL1(sessionKey: string, afterRecordedAtMs?: number, limit?: number, afterRowId?: number): MaybePromise<L0QueryRow[]>;
   queryL0GroupedBySessionId(sessionKey: string, afterRecordedAtMs?: number, limit?: number, afterRowId?: number): MaybePromise<L0SessionGroup[]>;
   getAllL0Texts(): MaybePromise<Array<{ record_id: string; message_text: string; recorded_at: string }>>;

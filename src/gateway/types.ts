@@ -29,6 +29,14 @@ export interface HealthResponse {
    * The result is cached (see HEALTH_EMBEDDING_TTL_MS) so /health stays cheap.
    */
   embedding: "ok" | "failing";
+  /**
+   * ISO timestamp of the newest captured message, or null when unknown/empty.
+   *
+   * NO SILENT FAILURE: "the gateway answers" and "the gateway is still being
+   * fed" are different questions. From 2026-08-13 to 08-22 the first was true
+   * and the second false, and nothing in /health could tell them apart.
+   */
+  last_capture_at?: string | null;
 }
 
 // ============================

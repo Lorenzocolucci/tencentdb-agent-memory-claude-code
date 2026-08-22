@@ -125,6 +125,25 @@ export class GatewayClient {
     return `HTTP ${status} ${trimmed}`;
   }
 
+  /**
+   * /health with its body, so callers can see `last_capture_at`.
+   * Returns null when the gateway cannot be reached or answers non-200.
+   */
+  async healthDetailed(): Promise<{ last_capture_at?: string | null } | null> {
+    try {
+      const token = await this.freshToken();
+      const { status, body } = await this.rawRequest("GET", "/health", undefined, token);
+      if (status !== 200) {
+        await this.logFailure("GET", "/health", this.describeStatus(status, body));
+        return null;
+      }
+      return JSON.parse(body) as { last_capture_at?: string | null };
+    } catch (err) {
+      await this.logFailure("GET", "/health", err instanceof Error ? err.message : String(err));
+      return null;
+    }
+  }
+
   async health(): Promise<boolean> {
     try {
       const token = await this.freshToken();
