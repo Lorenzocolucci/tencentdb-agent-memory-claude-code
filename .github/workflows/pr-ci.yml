@@ -50,7 +50,8 @@ jobs:
           # is explicit and cannot affect a real machine: nothing in src/ imports
           # that package by name, and Windows installs it exactly as before.
           npm pkg delete optionalDependencies.sqlite-vec-windows-arm64
-          npm install --ignore-scripts --no-package-lock
+          npm install --ignore-scripts --no-package-lock --foreground-scripts \
+            || { echo "───── npm debug log ─────"; tail -n 120 /home/runner/.npm/_logs/*-debug-0.log; exit 1; }
 
   # ── 1-bis. Tests ───────────────────────────────────────────
   # This job did not exist. The repo had 1063 passing tests and the CI never ran
@@ -87,7 +88,8 @@ jobs:
           # is explicit and cannot affect a real machine: nothing in src/ imports
           # that package by name, and Windows installs it exactly as before.
           npm pkg delete optionalDependencies.sqlite-vec-windows-arm64
-          npm install --ignore-scripts --no-package-lock
+          npm install --ignore-scripts --no-package-lock --foreground-scripts \
+            || { echo "───── npm debug log ─────"; tail -n 120 /home/runner/.npm/_logs/*-debug-0.log; exit 1; }
 
       - name: Build
         run: npm run build:all
