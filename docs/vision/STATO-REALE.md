@@ -32,7 +32,7 @@ un altro e i ricordi **arrivano all'agente** senza che li cerchi. Non un motore 
 
 **Salute al 2026-08-22:** gateway `status: ok`, `embedding: ok`, recall live via `strategy=kb`
 (**0,5 s a caldo**, 13,6 s la prima query a freddo), `/health` riporta ora anche `last_capture_at`.
-**1.028 test verdi, 0 rossi** (2 saltati: solo-POSIX su Windows).
+**1.052 test verdi, 0 rossi** (2 saltati: solo-POSIX su Windows).
 
 ---
 
@@ -181,6 +181,56 @@ già acceso (prima usciva senza toccarlo, quindi un file rotto non veniva mai ri
 agganci (nessuna porta di servizio): a vuoto per default, `--commit` per scrivere, riprendibile,
 con doppia guardia anti-doppione (cursore **e** verifica sul database in sola lettura).
 **Le 9 sessioni perse sono state recuperate: 152 turni, 0 fallimenti.**
+
+---
+
+## 4-ter. Il verdetto di utilità (2026-08-23) — la misura che mancava
+
+Sinapsys **non ha mai saputo se serviva**. Peggio: l'unico anello di ritorno era rovesciato —
+`reinforceRecalledOwners` rinforza i migliori risultati associativi di **ogni** richiamo, quindi un
+ricordo iniettato e ignorato diventava **più forte per sempre**. Il recupero veniva scambiato per
+utilità.
+
+### Come si misura (e perché non si chiede al modello)
+
+Chiedere a me *"ti è servito?"* è il disegno ovvio ed è sbagliato: mi valuto da solo, nessuno può
+controllare, e ho ogni motivo per dire di sì. Quindi si misura una cosa verificabile:
+
+> Un ricordo conta come **USATO** se nella risposta compaiono parole distintive che vengono dal
+> **RICORDO** e **non dal messaggio dell'utente**.
+
+Quella seconda condizione è tutto il disegno. Senza, la misura è un'eco: tu scrivi "Argus", il
+ricordo dice "Argus", la risposta ripete "Argus" — e ogni ricordo sembra utile. Sottraendo il
+vocabolario del prompt resta solo ciò che l'agente **non poteva avere dalla conversazione** — che
+è esattamente ciò a cui serve la memoria. Deterministico: niente LLM, niente vettori.
+
+### Tre stati, tenuti distinti apposta
+
+| stato | significato |
+|---|---|
+| **usato** | la risposta porta parole che vengono solo dal ricordo |
+| **rumore** | giudicabile, iniettato, mai atterrato |
+| **non giudicabile** | non aggiungeva nulla che l'utente non avesse già scritto — nessuna risposta potrebbe provarne l'uso |
+
+L'utilità si calcola **solo sui giudicabili**. Se non c'è nulla di giudicabile il verdetto dice
+*"non lo so"* invece di inventare un numero.
+
+### Dove vive
+
+`src/core/kb/recall-usage.ts` (giudizio, puro) · `src/core/kb/recall-ledger.ts` + tabella
+`recall_ledger` (registro) · richiamo → scrive · cattura → giudica · `tools/memory-verdict.mts` →
+te lo mostra. **Ogni riga conserva le parole che hanno deciso**: un numero da controllare, non da
+credere.
+
+### Prima misura reale
+
+Un richiamo vero ha iniettato **16 ricordi**; il turno successivo ne ha usato **1** — quello di cui
+ho davvero parlato — provato da `["fallback","lock","postgres","redis","supabase"]`.
+**Utilità: 6%.** È il primo numero onesto che questo sistema abbia mai prodotto su sé stesso.
+
+> ⚠️ **Non ancora fatto, di proposito:** l'anello di ritorno (usato → rinforza, rumore → decade)
+> **non è collegato**. Cambia cosa la memoria conserva, quindi si accende solo dopo che il verdetto
+> avrà girato abbastanza su traffico vero da meritare fiducia. Prima misurare, poi agire.
 
 ---
 
