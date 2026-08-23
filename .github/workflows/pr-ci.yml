@@ -37,7 +37,20 @@ jobs:
       # that DLL; Lorenzo's Windows machine still installs it normally.
       - name: npm install
         if: steps.cache-deps.outputs.cache-hit != 'true'
-        run: npm install --ignore-scripts --omit=optional
+        run: |
+          # `sqlite-vec-windows-arm64` is a `file:` optional dependency pointing
+          # at claude-code-plugin/vendor/win32-arm64, a hand-compiled Windows
+          # ARM64 vec0.dll (upstream sqlite-vec ships no windows-arm64 build).
+          # On an ubuntu runner npm cannot reconcile that link node and dies
+          # with `Cannot read properties of null (reading 'edgesOut')` — the
+          # single crash that made EVERY run on this repo red since 2026-06-16.
+          # `--omit=optional` does NOT help: it drops the link TARGET while the
+          # link node still points at it, which is the same crash.
+          # Removing the entry from the manifest for the duration of the CI run
+          # is explicit and cannot affect a real machine: nothing in src/ imports
+          # that package by name, and Windows installs it exactly as before.
+          npm pkg delete optionalDependencies.sqlite-vec-windows-arm64
+          npm install --ignore-scripts --no-package-lock
 
   # ── 1-bis. Tests ───────────────────────────────────────────
   # This job did not exist. The repo had 1063 passing tests and the CI never ran
@@ -61,7 +74,20 @@ jobs:
           key: deps-${{ runner.os }}-${{ hashFiles('package.json') }}
 
       - name: Install (cache miss)
-        run: npm install --ignore-scripts --omit=optional
+        run: |
+          # `sqlite-vec-windows-arm64` is a `file:` optional dependency pointing
+          # at claude-code-plugin/vendor/win32-arm64, a hand-compiled Windows
+          # ARM64 vec0.dll (upstream sqlite-vec ships no windows-arm64 build).
+          # On an ubuntu runner npm cannot reconcile that link node and dies
+          # with `Cannot read properties of null (reading 'edgesOut')` — the
+          # single crash that made EVERY run on this repo red since 2026-06-16.
+          # `--omit=optional` does NOT help: it drops the link TARGET while the
+          # link node still points at it, which is the same crash.
+          # Removing the entry from the manifest for the duration of the CI run
+          # is explicit and cannot affect a real machine: nothing in src/ imports
+          # that package by name, and Windows installs it exactly as before.
+          npm pkg delete optionalDependencies.sqlite-vec-windows-arm64
+          npm install --ignore-scripts --no-package-lock
 
       - name: Build
         run: npm run build:all
