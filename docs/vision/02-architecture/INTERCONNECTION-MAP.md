@@ -1,7 +1,6 @@
 # 🗺️ Mappa delle Interconnessioni
 
-> **Aggiornata 2026-08-07** — riscritta sui flussi REALI (la versione precedente era ferma al
-> 24/06 e 116 commit indietro). Regola: questo file si aggiorna PRIMA di considerare completo
+> **Aggiornata 2026-08-23** — riscritta sui flussi REALI. Regola: questo file si aggiorna PRIMA di considerare completo
 > un cambio di struttura.
 >
 > Stato/numeri: [../STATO-REALE.md](../STATO-REALE.md) · Moduli: [../../SINAPSYS-ARCHITECTURE.md](../../SINAPSYS-ARCHITECTURE.md)
@@ -63,8 +62,45 @@ STATO-REALE  ◄── punto d'ingresso, l'unico che si aggiorna ogni sessione
  │            └──► memory_lifecycle ──► LETTO dal recall (§B, acceso)  │
  │ distillLessons: bug → cluster (≥2 bug, ≥2 sessioni) → LEZIONI       │
  │     (fix 2026-08-07: i cluster già distillati non consumano più     │
- │      il budget → le lezioni sono passate da 6 a 45)                 │
+ │      il budget → le lezioni sono passate da 6 a 68)                 │
+ │     ⚠️ i tre passi di distillazione CEDONO il ciclo eventi prima di │
+ │        partire e girano al massimo 1 volta ogni 30 min: prima       │
+ │        bloccavano il primo turno per 11,5 s (budget hook: 6 s)      │
  └─────────────────────────────────────────────────────────────────────┘
+```
+
+### Il verdetto di utilità (2026-08-23) — l'unico anello che misura
+
+```
+ recall  ──► scrive nel recall_ledger CIÒ CHE HA DAVVERO INIETTATO
+             (una riga per ricordo, NON giudicata)
+ capture ──► giudica: il ricordo è USATO solo se nella risposta compaiono
+             parole distintive che vengono dal RICORDO e NON dal prompt
+             (senza quella sottrazione si misura un'eco)
+             └─► salva le parole che hanno deciso → verificabile
+ report  ──► npx tsx tools/memory-verdict.mts        (10% al 2026-08-23)
+
+ ⚠️ ASIMMETRIA DA CONOSCERE: `reinforceRecalledOwners` rinforza ciò che il
+    recall PESCA. Quindi un ricordo iniettato e ignorato diventa più forte.
+    Il verdetto esiste per correggerlo, ma l'anello di ritorno
+    (usato → rinforza / rumore → decade) NON è ancora collegato: prima
+    si misura su traffico vero, poi si agisce.
+```
+
+### Le 7 trappole "mai in silenzio" (2026-08-22/23)
+
+```
+ data-dir-lost · gateway-unreachable · capture-failed · capture-empty
+ memory-stale  · memory-degraded     · writing-to-backup
+        │
+        └─► briciola in alarms.json ─► il primo UserPromptSubmit la mostra
+            come systemMessage (l'unico canale che CC rende all'utente)
+            UN ALLARME BATTE SEMPRE IL BANNER: la falsa rassicurazione è
+            ciò che ha nascosto 10 giorni di cattura morta.
+
+ Rete INDIPENDENTE dal plugin (se il plugin è rotto non può lamentarsi):
+ ~/.claude/scripts/hooks/session-start-tdai-health.js confronta
+ /health.last_capture_at con l'ultima sessione realmente avvenuta.
 ```
 
 ---
@@ -77,7 +113,8 @@ STATO-REALE  ◄── punto d'ingresso, l'unico che si aggiorna ogni sessione
 | `entities` / `facts` / `events` / `relations` | `kb-writer.applyKbDelta`, `recordFriction` | `kbRecall`, proiezioni, cluster | vivo |
 | `kb_vec` / `kb_fts` | embed step di kb-writer, `reindexKb` | `kbRecall` (vettori + BM25) | vivo |
 | `memory_lifecycle` | `runConsolidation`, `reinforceRecalledOwners` | **`kbRecall` (dal 2026-08-07)** | **filo attaccato** |
-| `lessons` | `distillLessons` | injection, `kbRecall` | vivo (45) |
+| `lessons` | `distillLessons` | injection, `kbRecall` | vivo (68) |
+| **`recall_ledger`** | `kbRecall` (scrive non giudicato) | `judgePendingRecalls` alla cattura, `memory-verdict` | **vivo (2026-08-23)** |
 | `memory_audit` | consolidamento + supersession | debug | vivo |
 | `context_fingerprints` | hook PostToolUse | `fingerprint-injection` | vivo |
 

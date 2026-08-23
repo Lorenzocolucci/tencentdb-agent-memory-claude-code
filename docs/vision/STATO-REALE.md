@@ -1,6 +1,6 @@
 # 🧭 SINAPSYS — STATO REALE
 
-> **Aggiornato: 2026-08-22.** Ogni numero qui è stato **misurato**, non ricordato.
+> **Aggiornato: 2026-08-23.** Ogni numero qui è stato **misurato**, non ricordato.
 > **Questo è il documento da leggere PER PRIMO.** Tutti gli altri partono da qui.
 >
 > Regola di questo file: se una cosa non è stata verificata con una prova reale
@@ -24,13 +24,13 @@ un altro e i ricordi **arrivano all'agente** senza che li cerchi. Non un motore 
 |---|---|
 | **Codice** | `C:\Users\lo\tencentdb-agent-memory` — branch **`main`** (locale; `fork` come remoto consentito, **mai `tencent`**) |
 | **Gateway** | processo Node dal `dist/` del repo, in ascolto su **`127.0.0.1:8421`** (token in `<dataDir>/token`) |
-| **Dati (DB live)** | `C:\Users\lo\.claude\plugins\data\tdai-memory-tdai-local\vectors.db` — **2,57 GB** |
+| **Dati (DB live)** | `C:\Users\lo\.claude\plugins\data\tdai-memory-tdai-local\vectors.db` — **2,80 GB** |
 | **Config attiva** | ⚠️ `C:\Users\lo\.memory-tencentdb\memory-tdai\tdai-gateway.yaml` — **NON** in `tdai-gateway\`, errore facile da fare |
 | **Avvio / stop** | `C:\Users\lo\tdai-gateway\start-gateway.ps1` / `stop-gateway.ps1` |
 | **Embedder** | DeepInfra **Qwen3-Embedding-4B @ 1024 dim** (verificato in `embedding_meta`) |
 | **Estrazione** | Moonshot/Kimi (`TDAI_LLM_*`), fallback `gpt-5.4-mini` |
 
-**Salute al 2026-08-22:** gateway `status: ok`, `embedding: ok`, recall live via `strategy=kb`
+**Salute al 2026-08-23:** gateway `status: ok`, `embedding: ok`, recall live via `strategy=kb`
 (**0,5 s a caldo**, 13,6 s la prima query a freddo), `/health` riporta ora anche `last_capture_at`.
 **1.052 test verdi, 0 rossi** (2 saltati: solo-POSIX su Windows).
 
@@ -40,14 +40,15 @@ un altro e i ricordi **arrivano all'agente** senza che li cerchi. Non un motore 
 
 | | |
 |---|---|
-| Conversazioni grezze (L0) | **35.676** |
-| Entità | **12.422** |
-| Fatti | **20.092** |
-| Eventi | **15.439** — di cui **1.699** errori (`bug`) |
-| Relazioni | **7.831** |
-| **Lezioni** (Quaderno Errori) | **53** — erano **6** il 2026-08-07 mattina |
-| Righe di consolidamento | **33.728** — **844** promosse a `long`, **1.511** rinforzate |
-| DB | **2,76 GB** |
+| Conversazioni grezze (L0) | **35.893** |
+| Entità | **12.582** |
+| Fatti | **20.416** |
+| Eventi | **15.687** — di cui **1.708** errori (`bug`) e **18** principi |
+| Relazioni | **7.958** |
+| **Lezioni** (Quaderno Errori) | **68** — erano **6** la mattina del 2026-08-07 |
+| Righe di consolidamento | **34.309** — **850** promosse a `long`, **1.517** rinforzate |
+| DB | **2,80 GB** |
+| **Registro del richiamo** (verdetto) | **67** iniezioni, **50** giudicate, **5** usate → **utilità 10%** |
 
 ---
 
@@ -57,7 +58,7 @@ un altro e i ricordi **arrivano all'agente** senza che li cerchi. Non un motore 
 |---|---|---|
 | **Idea 1 — Context Fingerprint** | live | `src/core/hooks/{session-situation,fingerprint-*,task-type}.ts` |
 | **Idea 2 — Implicit Priming** | live | `src/core/kb/{implicit-priming,spreading-activation}.ts` |
-| **Idea 3 — Mistake Notebook** | **live e finalmente CRESCE** (6→45 lezioni) | `src/core/kb/{bug-clusters,lessons-*}.ts` |
+| **Idea 3 — Mistake Notebook** | **live e CRESCE** (6→68 lezioni) | `src/core/kb/{bug-clusters,bug-working-set,lessons-*}.ts` |
 | **Idea 4 — Proactive Injection** | live | `src/core/hooks/{situation,situation-injection}.ts` |
 | **Idea 5 — Distinctive Terms** | live (ma timbra poco: vedi §6) | `src/core/distinctiveness/*` |
 | **Idea 6 — Grounded Trust** | live | `src/core/kb/{provenance,stakes,grounded-trust-ask}.ts` |
@@ -222,11 +223,24 @@ L'utilità si calcola **solo sui giudicabili**. Se non c'è nulla di giudicabile
 te lo mostra. **Ogni riga conserva le parole che hanno deciso**: un numero da controllare, non da
 credere.
 
-### Prima misura reale
+### Il numero, su traffico vero (2026-08-23)
 
-Un richiamo vero ha iniettato **16 ricordi**; il turno successivo ne ha usato **1** — quello di cui
-ho davvero parlato — provato da `["fallback","lock","postgres","redis","supabase"]`.
-**Utilità: 6%.** È il primo numero onesto che questo sistema abbia mai prodotto su sé stesso.
+| | |
+|---|---|
+| iniezioni registrate | **67** |
+| giudicate | **50** |
+| **usate davvero** | **5** |
+| rumore (giudicabili, mai usate) | **45** |
+| non giudicabili | 0 |
+| **UTILITÀ** | **10%** |
+
+Ogni verdetto porta con sé le parole che l'hanno deciso — il primo è provato da
+`["fallback","lock","postgres","redis","supabase"]`.
+
+**10% è basso, e va letto per quello che è:** su 10 ricordi che la memoria mi mette davanti, 1
+lascia traccia nel lavoro. Non è ancora un giudizio sul valore di Sinapsys — è la prima volta che
+esiste un numero da migliorare invece di un'impressione. Si legge con
+`npx tsx tools/memory-verdict.mts`.
 
 > ⚠️ **Non ancora fatto, di proposito:** l'anello di ritorno (usato → rinforza, rumore → decade)
 > **non è collegato**. Cambia cosa la memoria conserva, quindi si accende solo dopo che il verdetto
@@ -273,7 +287,7 @@ La salute deve arrivare a Lorenzo, non al disco.
 | 3 | **Decisione: un DB o due?** (portatile ↔ cloud) | Unificare crea dipendenza dalla rete su ogni tuo prompt (recall ha 6s) | **decisione aperta per Lorenzo** (§9 del doc Punto 5) |
 | 4 | Il temporale crolla sotto distrattori (0/5) | È il terreno di Zep/Graphiti (validity windows) | non affrontato |
 | 5 | `salience` a 0 per il **98,9%** dei ricordi | L'Idea 5 (Distinctive Terms) quasi non timbra | non affrontato |
-| 6 | `state` = `active` per **33.649 su 33.649** | Il decadimento non declassa MAI nulla → "dimenticare" non funziona | non affrontato |
+| 6 | `state` = `active` per **34.309 su 34.309** | Il decadimento non declassa MAI nulla → "dimenticare" non funziona | non affrontato |
 | 7 | Budget di recall fisso (top-5) | Le domande di aggregazione ("quanti/elenca") hanno bisogno di più | non affrontato |
 | 8 | Embedding/reranker locali (Fase E) | Toglie la dipendenza da un fornitore esterno (il guasto §5.3) | non costruito |
 | 9 | Chat di claude.ai non catturate | Solo Claude Code è agganciato | parcheggiato |

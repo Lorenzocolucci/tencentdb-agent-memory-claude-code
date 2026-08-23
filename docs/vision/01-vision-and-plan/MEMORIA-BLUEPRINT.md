@@ -22,7 +22,7 @@
 >
 > Aggiornamenti importanti alle Idee dopo il 18/07:
 > - **Idea 3 (Mistake Notebook)** era di fatto ferma (6 lezioni contro 27 cluster reali):
->   il budget ripescava sempre gli stessi cluster già distillati. Risolto → **45 lezioni**.
+>   il budget ripescava sempre gli stessi cluster già distillati. Risolto → **68 lezioni**.
 >   E ora è **nutrita dall'officina**: i fallimenti tecnici entrano in memoria.
 > - **Consolidamento**: scriveva rinforzi che il recall non leggeva mai. Filo attaccato e
 >   acceso (`recall.consolidationBoost`), misurato in A/B sulla memoria vera.

@@ -1,6 +1,20 @@
 # Piano — Attaccare il filo staccato: consolidamento → recall
 
-> Design-first, 2026-08-07. Autore: Socio. Stato: **PROPOSTA, non applicata.**
+> ## ✅ FATTO — questo piano è stato eseguito
+> Design-first 2026-08-07, **applicato e ACCESO lo stesso giorno**
+> (`recall.consolidationBoost: true` nella config del gateway).
+> Misura A/B sulla memoria vera: **9 query su 20 cambiano la top-8**, 2 su 20 cambiano il
+> primo risultato. Codice: `candidateLifecycle` + `consolidationScore` in
+> `src/core/kb/retrieval.ts`. Puramente additivo: un ricordo con 0 rinforzi si posiziona
+> esattamente come prima.
+>
+> ⚠️ **Da leggere insieme al seguito:** il consolidamento rinforza ciò che *ricorre*, non ciò
+> che *serve*. La misura di utilità è arrivata dopo — vedi [../STATO-REALE.md](../STATO-REALE.md)
+> §4-ter (verdetto di utilità, 2026-08-23).
+>
+> Il testo sotto è il **piano originale**, tenuto come traccia del ragionamento.
+
+> Design-first, 2026-08-07. Autore: Socio.
 > Regola: nessuna modifica al path di recall live senza flag + fail-open + misura.
 
 ## 1. Il problema, in una riga

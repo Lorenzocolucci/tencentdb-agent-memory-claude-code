@@ -1,6 +1,6 @@
 # Punto 5 — Sinapsys dentro Argus su Render (DESIGN)
 
-> **Versione 2 — 2026-08-07.** Fonde e sostituisce `PUNTO5-SINAPSYS-ARGUS-RENDER-DESIGN.md`
+> **Versione 2 — 2026-08-07**, numeri riverificati il **2026-08-23**. Fonde e sostituisce `PUNTO5-SINAPSYS-ARGUS-RENDER-DESIGN.md`
 > (21/07), di cui conserva le verifiche ancora valide e **corregge due premesse sbagliate**.
 > Stato: **PROPOSTA — nulla toccato su Render.** Stato generale: [../STATO-REALE.md](../STATO-REALE.md).
 
@@ -66,14 +66,14 @@ Argus su Render (verificato via API, 2026-08-07) — **tre servizi, una immagine
               ┌──────────────────────────────────┐
               │  sinapsys-memory (PRIVATE)       │  ← 1 sola istanza
               │  node dist/src/gateway/cli.mjs   │
-              │  disco persistente /var/data     │  ← vectors.db (2,57 GB)
+              │  disco persistente /var/data     │  ← vectors.db (2,80 GB)
               └──────────────────────────────────┘
 ```
 
 Il gateway **è già** questo server HTTP: non si riscrive nulla, gira lo stesso codice del portatile.
 
 **Perché non riscrivere Sinapsys su Supabase/pgvector** (idea circolata a luglio): zero riscrittura
-dello store, zero re-embed (i 2,57 GB sono già Qwen3/1024), zero ricompilazione di vec0, e
+dello store, zero re-embed (i 2,80 GB sono già Qwen3/1024), zero ricompilazione di vec0, e
 soprattutto **le 5 idee associative restano intatte** (spreading activation, priming: JS puro).
 Portarle su Postgres async sarebbe settimane di lavoro col rischio di regredire proprio il
 differenziatore. **Scartata con motivo.**
@@ -114,7 +114,7 @@ comportamento byte-identico a oggi. Flag `ARGUS_SINAPSYS=1`, default OFF.
 
 ---
 
-## 5. Migrazione dei 2,57 GB
+## 5. Migrazione dei 2,80 GB
 
 I dischi Render **non sono accessibili in build/pre-deploy**: il DB non può stare nell'immagine
 (e non deve — sarebbe un'immagine con dentro dati personali).

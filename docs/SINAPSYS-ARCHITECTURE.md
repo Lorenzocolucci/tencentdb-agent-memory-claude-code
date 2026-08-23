@@ -10,14 +10,19 @@
 > does what, the data model, the request flows, and the six original ideas mapped to
 > code. Generated from the real tree (not memory).
 >
-> **Scale (all re-measured 2026-08-07):** **194** source files · **~52,500** LOC ·
-> **143** test files · **812** tests green (`src/core`) · `core/kb` = **54** modules.
-> **Status:** all six pillars built, wired and live. Two long-standing gaps were closed
-> on 2026-08-07 — the **consolidation → recall wire** (reinforcement/tier now actually
-> affect ranking) and **friction capture** (memory finally sees failed tool calls, and
-> interrupts intra-session loops). Known-failing: 3 pre-existing `src/gateway/__tests__/auth.test.ts`
-> cases (they read the real gateway config and see a degraded health) — proven
-> pre-existing via `git stash`, unrelated to current work.
+> **Scale (all re-measured 2026-08-23):** **345** TypeScript files · **~72,800** LOC ·
+> **151** test files · **1,052** tests green, 2 skipped (POSIX-only, on Windows) ·
+> **0 failing**.
+> **Status:** all six pillars built, wired and live. Three gaps closed since 2026-08-07 —
+> the **consolidation → recall wire** (reinforcement/tier now affect ranking), **friction
+> capture** (memory sees failed tool calls and interrupts intra-session loops), and the
+> **usefulness verdict** (2026-08-23: memory is finally measured on what it CHANGED, not
+> on what it retrieved).
+>
+> ⚠️ **Read this before trusting anything here:** between 2026-08-13 and 2026-08-22 capture
+> was dead and nobody noticed. Root cause, the seven tripwires that now make silence
+> impossible, and the performance fixes are in
+> [`docs/vision/STATO-REALE.md`](vision/STATO-REALE.md) §4-bis/§4-ter.
 >
 > 👉 **Live state, real numbers and what is still missing:**
 > [`docs/vision/STATO-REALE.md`](vision/STATO-REALE.md).
@@ -110,6 +115,9 @@ hanging off them, linked by **relations**. The six ideas live here.
 | `fingerprint-writer.ts` 🗄️ | Idea 1: persist the situation signature of a moment |
 | **Mistake Notebook (Idea 3):** | |
 | `bug-clusters.ts` · `bug-similarity.ts` · `bug-embeddings.ts` · `bug-cluster-graph.ts` · `union-find.ts` 🔬 | Cross-session failure clustering (B1) — semantic, never anecdotal |
+| **`bug-working-set.ts`** 🔬 | (2026-08-23) Bounds the O(N²) clustering pass. NOT a recency cap — priority goes to bug events no lesson cites yet, so the backlog drains instead of being buried. 1,706 events → 4,726 ms became ~240 ms |
+| **`recall-usage.ts`** 🔬 | (2026-08-23) The usefulness rule: a memory counts as USED only when the reply carries distinctive tokens from the MEMORY and **not from the user's prompt** — without that subtraction the metric is an echo |
+| **`recall-ledger.ts`** | (2026-08-23) Writes what recall injected (unjudged), settles it at capture time, and keeps the deciding tokens. Deliberately separate from hebbian reinforcement, which rewards *retrieval* |
 | `lesson-trigger.ts` · `error-signature-extractor.ts` 🔬 | B2a: the trigger = a Context Fingerprint of the failure |
 | `lessons-distiller.ts` 🤖 | Turn a recurring cluster into a generalizable lesson |
 | `lessons-runner.ts` · `lessons-runner-db.ts` | Orchestrate clusters → trigger → distill → write (idempotent) |
@@ -180,7 +188,7 @@ stale data. Keeps long agent sessions within the model's context budget.
 
 ---
 
-## Data model (10 tables)
+## Data model (11 tables)
 
 | Table | Holds | Written by |
 | :-- | :-- | :-- |
@@ -192,6 +200,7 @@ stale data. Keeps long agent sessions within the model's context budget.
 | `lessons` | Mistake Notebook: versioned lessons + **exposure/avoidance** | `lessons-writer` |
 | `context_fingerprints` | Idea 1: situation signatures (files/errors/task) | `fingerprint-writer` |
 | `memory_audit` | Append-only trail of every automatic mutation | `memory-audit` |
+| `recall_ledger` | **The usefulness verdict**: one row per memory actually injected into a turn, judged at capture time, keeping the tokens that decided it | `recall-ledger` |
 | `embedding_meta` | Embedding provider/model/dim bookkeeping | `sqlite` |
 | `l0_vec / kb_vec / kb_fts / l1_vec` | Vector + FTS shadow tables (sqlite-vec / FTS5) | `sqlite` |
 
@@ -221,6 +230,7 @@ stale data. Keeps long agent sessions within the model's context budget.
 | **Distinctive Terms** | 5 | `distinctiveness/*` (cornerstone) | live |
 | **Grounded Trust** | 6 | `provenance`, `stakes`, `grounded-trust-ask`, lifecycle gate | live |
 | *(heart)* | — | **`spreading-activation`** — the graph that triggers one memory from another | live |
+| *(the honest mirror)* | — | **`recall-usage`** + **`recall-ledger`** — does any of this actually help? Measured, not asserted | live; feedback loop deliberately OFF |
 
 ---
 
@@ -313,11 +323,15 @@ where nothing was ever repeated, which is exactly why its `kb_consol` arm measur
 
 ## Test coverage
 
-**812 tests across 143 test files, green** (`src/core`, re-measured 2026-08-07). Pure
-modules (🔬) are unit-tested in isolation; store methods are tested against a real SQLite.
-The only known failures are 3 cases in `src/gateway/__tests__/auth.test.ts` (they load the
-real gateway config and observe a degraded health) — **proven pre-existing** by re-running
-them on a stashed tree.
+**1,052 tests across 151 test files, green — 0 failing** (re-measured 2026-08-23).
+Pure modules (🔬) are unit-tested in isolation; store methods are tested against a real
+SQLite. Two tests are skipped on Windows because they assert POSIX file modes, which the
+implementation itself skips there (`claude-code-plugin/lib/daemon.ts`).
+
+The three long-standing `src/gateway/__tests__/auth.test.ts` failures are **fixed**: they
+asserted `/health` returns 200, which stopped being true when `/health` began answering
+503 while degraded (`b96590e`, 2026-06-18). They now assert what they are named for —
+the request got past the auth gate (no 401, no `WWW-Authenticate` challenge).
 
 > This map is the documentation foundation for the product/SaaS effort: it defines
 > precisely *what* Sinapsys is before we position *who* it is for.

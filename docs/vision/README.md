@@ -1,6 +1,6 @@
 # 🧠 Sinapsys — Project Hub
 
-> Struttura verificata il **2026-08-07**. Questo file descrive l'*organizzazione*;
+> Struttura verificata il **2026-08-23**. Questo file descrive l'*organizzazione*;
 > lo *stato* vive in [STATO-REALE.md](STATO-REALE.md).
 
 La miglior memoria persistente per agenti AI. Questo è l'**hub di prodotto e conoscenza**.
@@ -29,6 +29,8 @@ La miglior memoria persistente per agenti AI. Questo è l'**hub di prodotto e co
 | **Mettere le mani nel codice** | [STATO-REALE](STATO-REALE.md) → [CODE-POINTER](CODE-POINTER.md) → [SINAPSYS-ARCHITECTURE](../SINAPSYS-ARCHITECTURE.md) → [INTERCONNECTION-MAP](02-architecture/INTERCONNECTION-MAP.md) |
 | **Portare Sinapsys in Render (prossimo passo)** | [STATO-REALE §7](STATO-REALE.md) → [PUNTO5-SINAPSYS-IN-ARGUS-RENDER](01-vision-and-plan/PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md) |
 | **Sapere quanto vale davvero** | [STATO-REALE §5](STATO-REALE.md) → [benchmark/longmemeval/DESIGN-2026-07-21](../../benchmark/longmemeval/DESIGN-2026-07-21.md) |
+| **Sapere se la memoria SERVE davvero** | [STATO-REALE §4-ter](STATO-REALE.md) → `npx tsx tools/memory-verdict.mts` |
+| **Capire perché è morta in silenzio (e perché non può più)** | [STATO-REALE §4-bis](STATO-REALE.md) |
 
 ## Regole del progetto (enterprise dall'inizio)
 - **Codice:** una funzione per file, ~200 righe max, alta coesione / basso accoppiamento.
