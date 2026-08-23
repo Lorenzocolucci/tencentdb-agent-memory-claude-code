@@ -154,6 +154,27 @@ function normalizeFilePath(name: string): string {
 }
 
 /**
+ * Normalize a project tag for comparison/keying (NFKC + lowercase + trim).
+ * Empty / missing → "" (meaning "unattributed", NOT "matches everything").
+ */
+export function normalizeProjectTag(project: string | null | undefined): string {
+  return (project ?? "").normalize("NFKC").toLowerCase().trim();
+}
+
+/**
+ * Is this (already posix-normalized) path self-identifying — i.e. absolute?
+ * "c:/argus/readme.md", "/home/lo/readme.md" and UNC "//host/share/x" are:
+ * they name exactly one file on this machine, so they need no project tag.
+ * "docs/readme.md" and "readme.md" are NOT: every repo has one.
+ */
+export function isAbsoluteFilePath(posixPath: string): boolean {
+  return /^[a-z]:\//i.test(posixPath) || posixPath.startsWith("/");
+}
+
+/** Separator between the project tag and the path inside a scoped file key. */
+export const FILE_KEY_PROJECT_SEP = "::";
+
+/**
  * Normalize a library name by stripping a trailing version suffix so
  * "react@18.2.0", "react 18", and "react" all collapse to "react".
  * Recognizes the common forms: "name@version", "name version", "name==version",
@@ -176,17 +197,36 @@ function normalizeLibrary(name: string): string {
  * The key is `${normalizedType}:${normalizedName}` so the same name under two
  * different types stays distinct (e.g. a person named "Sofia" vs a project
  * named "Sofia"). Type-specific name normalization:
- *   - file     → posix path normalize
+ *   - file     → posix path normalize, SCOPED BY PROJECT (see below)
  *   - library  → strip version suffix
  *   - person / everything else → base normalize (NFKC, lower, trim)
+ *
+ * FILE identity = PROJECT + PATH, never the bare name.
+ * A file called "README.md" is not one thing in the world: every repo has one.
+ * Keying a file entity on its basename alone made `file:readme.md` GLOBAL, so
+ * facts learned about one repo's README were injected while reading another
+ * repo's README (measured: July 2026 "argus canary" facts leaking into every
+ * project). Hence:
+ *   - relative/bare path + known project → `file:<project>::<path>`
+ *   - absolute path                      → `file:<path>` (already unique on
+ *     this machine; no project tag needed, and tagging it would fork the entity
+ *     whenever the project label changes)
+ *   - relative/bare path, project unknown → `file:<path>` (legacy shape;
+ *     unattributable, and the read path refuses to surface it cross-project)
  */
-export function canonicalKey(type: string, name: string): string {
+export function canonicalKey(type: string, name: string, project?: string): string {
   const t = normalizeBase(type);
   let normName: string;
   switch (t) {
-    case "file":
-      normName = normalizeFilePath(name);
+    case "file": {
+      const filePath = normalizeFilePath(name);
+      const proj = normalizeProjectTag(project);
+      if (proj && !isAbsoluteFilePath(filePath)) {
+        return `file:${proj}${FILE_KEY_PROJECT_SEP}${filePath}`;
+      }
+      normName = filePath;
       break;
+    }
     case "library":
       normName = normalizeLibrary(name);
       break;
@@ -359,13 +399,33 @@ export function resolveOrCreateEntity(
   const project = params.project ?? "";
   const incomingAliases = (params.aliases ?? []).map((a) => a.trim()).filter(Boolean);
 
-  const key = canonicalKey(type, name);
+  const key = canonicalKey(type, name, project);
   const normType = normalizeBase(type);
 
   // ── 1. Exact (namespace, type, canonical_key) match ──
-  const exact = db
+  let exact = db
     .prepare("SELECT * FROM entities WHERE namespace = ? AND type = ? AND canonical_key = ?")
     .get(namespace, normType, key) as Record<string, unknown> | undefined;
+
+  // ── 1-bis. Legacy adoption (file entities only) ──
+  // Before project scoping, a file entity was keyed `file:<path>`. Keep writing
+  // to that row when it demonstrably belongs to THIS project, so the fix does
+  // not orphan the facts already learned about it. An unattributed row
+  // (project = "") or another project's row is NOT adopted — adopting it is the
+  // very leak we are closing.
+  if (!exact && normType === "file") {
+    const legacyKey = canonicalKey(type, name);
+    if (legacyKey !== key) {
+      const legacy = db
+        .prepare("SELECT * FROM entities WHERE namespace = ? AND type = ? AND canonical_key = ?")
+        .get(namespace, normType, legacyKey) as Record<string, unknown> | undefined;
+      const legacyProject = normalizeProjectTag(legacy?.project as string | undefined);
+      if (legacy && legacyProject && legacyProject === normalizeProjectTag(project)) {
+        exact = legacy;
+      }
+    }
+  }
+
   if (exact) {
     // Follow merged_into to the canonical, then merge any NEW aliases the
     // caller supplied (idempotent — set union). If the row isn't merged,
@@ -384,6 +444,17 @@ export function resolveOrCreateEntity(
     .prepare("SELECT * FROM entities WHERE namespace = ? AND type = ?")
     .all(namespace, normType) as Array<Record<string, unknown>>;
   for (const cand of candidates) {
+    // Un alias non scavalca il confine di progetto per un FILE: "readme.md"
+    // registrato come alias del README di un altro repo non deve catturare
+    // questo. (L'entità viva ent_5df45b96cfdb8ed5 porta davvero l'alias
+    // "sofia-ai:README.md": è l'altra porta della stessa stanza.) Per gli altri
+    // tipi l'alias resta trasversale — è lì che l'associatività deve vivere.
+    if (
+      normType === "file" &&
+      normalizeProjectTag(cand.project as string) !== normalizeProjectTag(project)
+    ) {
+      continue;
+    }
     const aliases = parseJsonArray(cand.aliases_json).map((a) => normalizeBase(a));
     if (aliases.includes(normName)) {
       // Follow merged_into to the canonical, then merge the incoming display

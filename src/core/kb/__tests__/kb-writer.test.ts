@@ -165,7 +165,11 @@ describe("applyKbDelta (temp DB)", () => {
     expect(result.events[0].entities.length).toBe(2); // both resolved entity ids
 
     // ── relations table: fixed-by edge between the two resolved entities ──
-    const fileEnt = store.queryEntityByKey("default", "file", "file:booking.ts");
+    // La chiave di un file porta il PROGETTO: "booking.ts" da solo non è un'identità
+    // (ogni repo può averne uno) — vedi situation-injection-project-scope.test.ts.
+    expect(store.queryEntityByKey("default", "file", "file:booking.ts")).toBeNull();
+    const fileEnt = store.queryEntityByKey("default", "file", "file:repo::booking.ts");
+    expect(fileEnt).not.toBeNull();
     expect(dbAll(store, "SELECT count(*) AS c FROM relations")[0].c).toBe(1);
     expect(result.relations[0].src_entity_id).toBe(bug!.id);
     expect(result.relations[0].dst_entity_id).toBe(fileEnt!.id);

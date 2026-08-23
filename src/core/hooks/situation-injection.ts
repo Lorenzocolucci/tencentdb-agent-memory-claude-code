@@ -14,8 +14,13 @@
  * resurfaces unbidden the moment the agent touches a file in its trigger pattern.
  */
 
-import type { IMemoryStore, KbLessonHit } from "../store/types.js";
-import { canonicalKey } from "../kb/kb-queries.js";
+import type { IMemoryStore, KbEntity, KbLessonHit } from "../store/types.js";
+import {
+  canonicalKey,
+  isAbsoluteFilePath,
+  normalizeProjectTag,
+  FILE_KEY_PROJECT_SEP,
+} from "../kb/kb-queries.js";
 import { classifyStakes } from "../kb/stakes.js";
 import { selectStanceToSurface } from "../kb/stance-severity.js";
 import { willingnessTier } from "../kb/stance-track-record.js";
@@ -56,18 +61,86 @@ function renderStanceInterrupt(lesson: KbLessonHit, stakesDomain: string | null)
   );
 }
 
-/** Candidate canonical keys for a touched file: full posix path AND basename. */
-function fileKeyCandidates(filePath: string): string[] {
+/**
+ * Candidate canonical keys for a touched file, strongest first.
+ *
+ * The KB stores file entities inconsistently (sometimes the full path, often
+ * just the basename the extractor saw), so we try both shapes — and, when the
+ * current project is known, their project-scoped forms first.
+ *
+ * The basename shapes are the dangerous ones: `file:readme.md` matches the
+ * README of EVERY repo. They stay in the list (that is how most of the real
+ * corpus is keyed) but {@link fileEntityBelongsHere} refuses any match that
+ * cannot be proven to belong to the project we are actually in.
+ */
+function fileKeyCandidates(filePath: string, project?: string): string[] {
   const full = canonicalKey("file", filePath); // already posix-normalized + lowercased
   // Derive the basename from the NORMALIZED key (always "/"-separated), never
   // from the raw input — Windows backslash paths must not depend on a fragile
   // split of the original string.
   const posixPath = full.startsWith("file:") ? full.slice("file:".length) : full;
   const base = posixPath.split("/").filter(Boolean).pop() ?? posixPath;
-  const baseKey = `file:${base}`;
-  // The KB stores file entities inconsistently (sometimes the full path,
-  // sometimes the basename), so try both; dedupe when they coincide.
-  return full === baseKey ? [full] : [full, baseKey];
+  const proj = normalizeProjectTag(project);
+
+  const keys: string[] = [];
+  if (proj) {
+    // Project-scoped shapes (what NEW file entities are keyed on).
+    if (!isAbsoluteFilePath(posixPath)) {
+      keys.push(`file:${proj}${FILE_KEY_PROJECT_SEP}${posixPath}`);
+    }
+    keys.push(`file:${proj}${FILE_KEY_PROJECT_SEP}${base}`);
+  }
+  keys.push(full, `file:${base}`);
+  return [...new Set(keys)];
+}
+
+/**
+ * Is this stored file entity allowed to speak while we are working in
+ * `project` on `posixPath`?
+ *
+ * THE GUARD THIS MODULE EXISTS FOR. Facts about a FILE are local to a project:
+ * "README.md was given the argus canary line" is true of ONE repo's README and
+ * is misleading — read as a current instruction — in every other repo. (Lessons
+ * and principles stay cross-project; they travel through the recall path, not
+ * through here. Associativity is not what leaks: file identity is.)
+ *
+ * A match is allowed only when it is PROVABLY this project's file:
+ *   1. the matched key is project-scoped (the project is inside the key), or
+ *   2. the entity carries a project tag equal to the current one, or
+ *   3. the key is an absolute path identical to the file we just touched
+ *      (self-identifying — no project tag needed).
+ * Everything else — above all an unattributed bare basename — stays silent.
+ */
+function fileEntityBelongsHere(
+  entity: KbEntity,
+  matchedKey: string,
+  posixPath: string,
+  project?: string,
+): boolean {
+  const proj = normalizeProjectTag(project);
+  if (proj && matchedKey.startsWith(`file:${proj}${FILE_KEY_PROJECT_SEP}`)) return true;
+  if (proj && normalizeProjectTag(entity.project) === proj) return true;
+  const keyPath = matchedKey.startsWith("file:") ? matchedKey.slice("file:".length) : matchedKey;
+  return isAbsoluteFilePath(keyPath) && keyPath === posixPath;
+}
+
+/**
+ * Resolve the file entity for a touched path, or null when nothing that
+ * provably belongs to this project is known about it.
+ */
+function resolveFileEntity(
+  store: IMemoryStore,
+  filePath: string,
+  project?: string,
+): KbEntity | null {
+  if (!store.queryEntityByKey) return null;
+  const full = canonicalKey("file", filePath);
+  const posixPath = full.startsWith("file:") ? full.slice("file:".length) : full;
+  for (const key of fileKeyCandidates(filePath, project)) {
+    const found = store.queryEntityByKey(NAMESPACE, "file", key);
+    if (found && fileEntityBelongsHere(found, key, posixPath, project)) return found;
+  }
+  return null;
 }
 
 /**
@@ -77,22 +150,16 @@ function fileKeyCandidates(filePath: string): string[] {
 export function buildFileInjection(
   store: IMemoryStore,
   filePath: string,
-  opts?: { sessionId?: string; now?: string; actionContent?: string },
+  opts?: { sessionId?: string; now?: string; actionContent?: string; project?: string },
 ): string | null {
   if (!store.queryEntityByKey || !store.queryHeadFacts || !store.queryEventsForEntity) {
     return null; // backend without KB read primitives → silence
   }
 
-  // Resolve the file entity by full-path key, falling back to basename key.
-  let entity = null as ReturnType<NonNullable<IMemoryStore["queryEntityByKey"]>>;
-  for (const key of fileKeyCandidates(filePath)) {
-    const found = store.queryEntityByKey(NAMESPACE, "file", key);
-    if (found) {
-      entity = found;
-      break;
-    }
-  }
-  if (!entity) return null; // unknown file → silence
+  // Resolve the file entity — project-scoped key, then legacy shapes, and only
+  // ever a match that provably belongs to THIS project (see fileEntityBelongsHere).
+  const entity = resolveFileEntity(store, filePath, opts?.project);
+  if (!entity) return null; // unknown file (here) → silence
 
   const facts = store.queryHeadFacts(entity.id).slice(0, MAX_FACTS);
   const events = store.queryEventsForEntity(entity.id, NAMESPACE, MAX_EVENTS);
@@ -182,11 +249,10 @@ export function buildFileInjection(
  * wiring to learn which owner a situation surfaced and to dedup against the
  * single-file block — additive, no change to {@link buildFileInjection}.
  */
-export function resolveFileOwnerId(store: IMemoryStore, filePath: string): string | null {
-  if (!store.queryEntityByKey) return null;
-  for (const key of fileKeyCandidates(filePath)) {
-    const found = store.queryEntityByKey(NAMESPACE, "file", key);
-    if (found) return found.id;
-  }
-  return null;
+export function resolveFileOwnerId(
+  store: IMemoryStore,
+  filePath: string,
+  project?: string,
+): string | null {
+  return resolveFileEntity(store, filePath, project)?.id ?? null;
 }

@@ -52,6 +52,11 @@ export interface SituationCueContext {
    * sessione — lì i semi vengono da eventi recenti + fingerprint (corretto).
    */
   readonly situation?: SessionSituation;
+  /**
+   * Progetto corrente. Serve a NON prendere come seme il file omonimo di un
+   * ALTRO progetto (`file:readme.md` combaciava con il README di ogni repo).
+   */
+  readonly project?: string;
   readonly logger?: Logger;
 }
 
@@ -124,7 +129,7 @@ export function buildSituationSeeds(store: IMemoryStore, ctx: SituationCueContex
   // (3) File recenti (mid-session): fileKey → entity id.
   try {
     for (const fileKey of ctx.situation?.fileKeys ?? []) {
-      const id = resolveFileOwnerId(store, fileKey);
+      const id = resolveFileOwnerId(store, fileKey, ctx.project);
       if (id) addSeed(seeds, id, WEIGHT["recent-file"], "recent-file");
     }
   } catch (err) {

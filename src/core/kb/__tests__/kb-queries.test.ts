@@ -60,6 +60,20 @@ describe("kb-queries pure helpers", () => {
     expect(canonicalKey("file", "src//core///x.ts/")).toBe("file:src/core/x.ts");
   });
 
+  it("canonicalKey file: un nome base NON è un'identità — la chiave porta il PROGETTO", () => {
+    // Il guasto: `file:readme.md` era globale e combaciava col README di ogni repo.
+    expect(canonicalKey("file", "README.md", "Argus")).toBe("file:argus::readme.md");
+    expect(canonicalKey("file", "README.md", "Argus")).not.toBe(
+      canonicalKey("file", "README.md", "Sofia-AI"),
+    );
+    expect(canonicalKey("file", "docs/README.md", "Argus")).toBe("file:argus::docs/readme.md");
+    // Un percorso ASSOLUTO nomina già un solo file: niente tag progetto (non forkare
+    // l'entità ogni volta che l'etichetta del progetto cambia).
+    expect(canonicalKey("file", "C:\\Argus\\README.md", "Argus")).toBe("file:c:/argus/readme.md");
+    // Progetto ignoto → forma legacy (e il percorso di lettura rifiuta di mostrarla altrove).
+    expect(canonicalKey("file", "README.md")).toBe("file:readme.md");
+  });
+
   it("canonicalKey library: strips version suffix", () => {
     expect(canonicalKey("library", "react@18.2.0")).toBe("library:react");
     expect(canonicalKey("library", "react 18")).toBe("library:react");
