@@ -1360,7 +1360,21 @@ async function main() {
 		if (out) process.stdout.write(out);
 	} catch (err) {
 		await safeLog(logPath, `${event}: ${err.message}`);
+		await reportHookCrash(dataDir, event, err);
+		if (event === "user-prompt-submit") try {
+			const line = await drainAlarms(dataDir);
+			if (line) process.stdout.write(JSON.stringify({ systemMessage: line }));
+		} catch {}
 	}
+}
+/** Max chars of an error message forwarded to the user-facing alarm. */
+const MAX_CRASH_MESSAGE_CHARS = 200;
+/**
+* Turn an unexpected exception into a signal Lorenzo actually sees.
+* Never throws: reporting a failure must not become one.
+*/
+async function reportHookCrash(dataDir, event, err) {
+	await raiseAlarm(dataDir, "hook-crashed", `la memoria si è fermata con un errore (${event}) — nulla viene salvato né richiamato: ${(err instanceof Error ? err.message : String(err)).slice(0, MAX_CRASH_MESSAGE_CHARS)}`);
 }
 function readStdin() {
 	return new Promise((resolve) => {
@@ -1381,4 +1395,4 @@ async function safeLog(path, msg) {
 }
 if (!!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main().catch(() => process.exit(0));
 //#endregion
-export { handleHook };
+export { handleHook, reportHookCrash };
