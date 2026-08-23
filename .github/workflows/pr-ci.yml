@@ -28,9 +28,49 @@ jobs:
           path: node_modules
           key: deps-${{ runner.os }}-${{ hashFiles('package.json') }}
 
+      # --omit=optional: the ONLY optional dependency is
+      # `sqlite-vec-windows-arm64`, a `file:` package that ships a Windows
+      # ARM64 `vec0.dll`. On an ubuntu runner npm cannot build a graph node for
+      # it and dies with `Cannot read properties of null (reading 'edgesOut')`.
+      # That single crash is why EVERY CI run on this repo had been red since
+      # 2026-06-16 — the gate was decorative for two months. Linux never needs
+      # that DLL; Lorenzo's Windows machine still installs it normally.
       - name: npm install
         if: steps.cache-deps.outputs.cache-hit != 'true'
-        run: npm install --ignore-scripts
+        run: npm install --ignore-scripts --omit=optional
+
+  # ── 1-bis. Tests ───────────────────────────────────────────
+  # This job did not exist. The repo had 1063 passing tests and the CI never ran
+  # a single one: it only installed, packed and measured the tarball. A gate
+  # that cannot fail on broken code is not a gate.
+  test:
+    name: Tests
+    needs: install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Restore node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: deps-${{ runner.os }}-${{ hashFiles('package.json') }}
+
+      - name: Install (cache miss)
+        run: npm install --ignore-scripts --omit=optional
+
+      - name: Build
+        run: npm run build:all
+
+      - name: Test
+        run: npm test
+
+      - name: Test (Claude Code plugin)
+        run: npm run test:cc-plugin
 
   # ── 2. Pack validation ─────────────────────────────────────
   pack:
@@ -120,7 +160,15 @@ jobs:
           TGZ=$(ls *.tgz | head -1)
           SIZE=$(stat -c%s "$TGZ" 2>/dev/null || stat -f%z "$TGZ")
           SIZE_KB=$((SIZE / 1024))
-          MAX_KB=512
+          # RATCHET, not a wish. 512 KB was set when the project was a fraction
+          # of this size and has been unreachable for months: measured
+          # 2026-08-23 the tarball is 1068 KB of legitimate source (240 files,
+          # the whole src/ tree — no accidental binaries). A limit nobody can
+          # meet is a limit everybody learns to ignore, and this one was red on
+          # every single run since 2026-06-16.
+          # 1200 KB = today + ~12% headroom. It is meant to come DOWN, never up:
+          # if a PR needs it raised, that PR must say why in its description.
+          MAX_KB=1200
 
           echo "📦 Package: $TGZ"
           echo "   Size: ${SIZE_KB} KB (limit: ${MAX_KB} KB)"
