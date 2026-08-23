@@ -24,6 +24,16 @@ import { createRequire } from "node:module";
 import type { DatabaseSync, StatementSync } from "node:sqlite";
 import type { MemoryRecord } from "../record/l1-writer.js";
 import { initFoundationsSchema } from "../kb/foundations-schema.js";
+import {
+  recordInjections,
+  judgePending,
+  readVerdict,
+  type RecordInjectionsParams,
+  type JudgePendingParams,
+  type JudgePendingResult,
+  type ReadVerdictParams,
+  type RecallVerdict,
+} from "../kb/recall-ledger.js";
 import { ensureMergedIntoColumn } from "../kb/entity-merge.js";
 import { runConsolidation, type ConsolidationStats } from "../kb/consolidation-runner.js";
 import {
@@ -2532,6 +2542,37 @@ export class VectorStore implements IMemoryStore {
       );
       return [];
     }
+  }
+
+  /**
+   * Record what recall actually injected into a turn (unjudged).
+   *
+   * Deliberately separate from reinforceRecalledOwners below: that one rewards
+   * RETRIEVAL, this one only takes note, so usefulness can later be measured
+   * instead of assumed. Never throws.
+   */
+  recordRecallInjections(params: RecordInjectionsParams): number {
+    if (this.degraded || !this.kbReady) return 0;
+    return recordInjections(this.db, params);
+  }
+
+  /** Settle the pending ledger rows of a session against the turn just captured. */
+  judgePendingRecalls(params: JudgePendingParams): JudgePendingResult {
+    if (this.degraded || !this.kbReady) {
+      return { injected: 0, used: 0, unjudgeable: 0, perMemory: [], expired: 0 };
+    }
+    return judgePending(this.db, params, this.logger);
+  }
+
+  /** Aggregate the ledger into the usefulness verdict. Read-only. */
+  readRecallVerdict(params: ReadVerdictParams = {}): RecallVerdict {
+    if (this.degraded || !this.kbReady) {
+      return {
+        judged: 0, used: 0, unjudgeable: 0, pending: 0, noise: 0,
+        usefulness: null, topUsed: [], topNoise: [],
+      };
+    }
+    return readVerdict(this.db, params);
   }
 
   /**

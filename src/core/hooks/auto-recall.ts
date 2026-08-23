@@ -776,6 +776,34 @@ export async function runKbRecall(
       }
     }
 
+    // ── LEDGER — write down what we are about to put in front of the agent ──
+    // Note the asymmetry with the block below: hebbian reinforcement rewards
+    // RETRIEVAL, which is why an ignored memory used to grow stronger forever.
+    // This only takes note; the verdict is settled at capture time, when the
+    // agent's reply exists and usefulness can be measured instead of assumed.
+    const recordLedger = (vectorStore as {
+      recordRecallInjections?: (p: {
+        sessionKey: string; namespace?: string; now: string;
+        injections: Array<{ ownerId: string; ownerKind: string; score: number; associative: boolean; memoryText: string }>;
+      }) => number;
+    }).recordRecallInjections;
+    if (typeof recordLedger === "function" && sit?.sessionKey) {
+      try {
+        recordLedger.call(vectorStore, {
+          sessionKey: sit.sessionKey,
+          namespace: sit.namespace,
+          now: new Date().toISOString(),
+          injections: visible.map((r) => ({
+            ownerId: r.owner_id,
+            ownerKind: r.owner_kind,
+            score: r.score,
+            associative: !!r.associative,
+            memoryText: r.text,
+          })),
+        });
+      } catch { /* best-effort: bookkeeping never breaks recall */ }
+    }
+
     // ── B2a — HEBBIAN reinforcement: every recall strengthens what it surfaced ──
     // The associatively-surfaced memories (they CAME via spreading activation) are
     // the "un ricordo tira l'altro" hits — reinforce the strongest few so they

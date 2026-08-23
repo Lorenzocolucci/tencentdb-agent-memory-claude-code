@@ -155,6 +155,40 @@ export function initFoundationsSchema(db: DatabaseSync, logger?: FoundationsLogg
     ddl("CREATE INDEX IF NOT EXISTS idx_fp_session ON context_fingerprints(session_key, ts)");
     ddl("CREATE INDEX IF NOT EXISTS idx_fp_task ON context_fingerprints(task_type)");
 
+    // ── Brick 4-bis — recall_ledger (the usefulness verdict) ───────────────
+    // Sinapsys never knew whether it was USEFUL. Worse, its only feedback loop
+    // (reinforceRecalledOwners) strengthened whatever recall surfaced, so a
+    // memory injected and ignored grew stronger forever — retrieval was being
+    // mistaken for usefulness.
+    //
+    // One row per memory ACTUALLY INJECTED into a turn. It starts unjudged;
+    // when the turn is captured, recall-usage.ts decides whether the agent's
+    // reply shows evidence the memory was used, and the row records the verdict
+    // WITH the tokens that carried it — so a number can be audited instead of
+    // believed. `unjudgeable` keeps "said nothing new" apart from "was noise".
+    ddl(`
+      CREATE TABLE IF NOT EXISTS recall_ledger (
+        id TEXT PRIMARY KEY,
+        ts TEXT NOT NULL,
+        session_key TEXT NOT NULL,
+        session_id TEXT NOT NULL DEFAULT '',
+        owner_id TEXT NOT NULL,
+        owner_kind TEXT NOT NULL DEFAULT '',
+        score REAL NOT NULL DEFAULT 0,
+        associative INTEGER NOT NULL DEFAULT 0,
+        memory_text TEXT NOT NULL DEFAULT '',
+        judged INTEGER NOT NULL DEFAULT 0,
+        used INTEGER NOT NULL DEFAULT 0,
+        unjudgeable INTEGER NOT NULL DEFAULT 0,
+        matched_json TEXT NOT NULL DEFAULT '[]',
+        judged_at TEXT,
+        namespace TEXT NOT NULL DEFAULT 'default'
+      )
+    `);
+    ddl("CREATE INDEX IF NOT EXISTS idx_ledger_pending ON recall_ledger(session_key, judged, ts)");
+    ddl("CREATE INDEX IF NOT EXISTS idx_ledger_owner ON recall_ledger(owner_id, owner_kind)");
+    ddl("CREATE INDEX IF NOT EXISTS idx_ledger_ts ON recall_ledger(ts)");
+
     // ── Brick 5 — relations.weight (spreading activation, Phase D) ─────────
     // The ONLY change to an existing table. Skipped cleanly if relations is
     // absent (the 4 new tables don't depend on it); guarded so re-running is a

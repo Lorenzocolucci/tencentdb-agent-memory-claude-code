@@ -481,6 +481,12 @@ export class TdaiCore {
     await this.storeReady?.catch(() => {});
     await this.ensureSchedulerStarted();
 
+    // USEFULNESS VERDICT: the turn is the first moment the agent's reply exists,
+    // so it is the only moment memory can be judged on what it CHANGED rather
+    // than on what it retrieved. Cheap (string work over ≤25 rows), synchronous,
+    // and swallowed on failure — a verdict must never cost a capture.
+    this.judgeRecallUsefulness(turn);
+
     return performAutoCapture({
       messages: turn.messages,
       sessionKey: turn.sessionKey,
@@ -496,6 +502,54 @@ export class TdaiCore {
       embeddingService: this.embeddingService,
       bgTaskRegistry: this.bgTasks,
     });
+  }
+
+  /**
+   * Settle the recall ledger for this session against the turn just committed.
+   *
+   * Uses the WHOLE turn as evidence — every user message concatenated as the
+   * prompt, every assistant message as the reply — because a memory injected on
+   * one prompt often pays off two replies later. The judgement subtracts the
+   * user's own vocabulary, so an echo can never be counted as usefulness
+   * (see kb/recall-usage.ts).
+   */
+  private judgeRecallUsefulness(turn: CompletedTurn): void {
+    const store = this.vectorStore as {
+      judgePendingRecalls?: (p: {
+        sessionKey: string; userText: string; assistantText: string; now: string;
+      }) => { injected: number; used: number; unjudgeable: number; expired: number };
+    } | undefined;
+    if (!store || typeof store.judgePendingRecalls !== "function" || !turn.sessionKey) return;
+
+    try {
+      const messages = turn.messages ?? [];
+      const userText = [
+        turn.userText ?? "",
+        ...messages.filter((m) => m.role === "user").map((m) => m.content ?? ""),
+      ].join("\n");
+      const assistantText = messages
+        .filter((m) => m.role === "assistant")
+        .map((m) => m.content ?? "")
+        .join("\n");
+      if (!assistantText) return;
+
+      const v = store.judgePendingRecalls({
+        sessionKey: turn.sessionKey,
+        userText,
+        assistantText,
+        now: new Date().toISOString(),
+      });
+      if (v.injected > 0 || v.expired > 0) {
+        this.logger.debug?.(
+          `${TAG} [verdict] ${v.used}/${v.injected} ricordi usati ` +
+            `(non giudicabili=${v.unjudgeable}, scaduti=${v.expired})`,
+        );
+      }
+    } catch (err) {
+      this.logger.warn(
+        `${TAG} [verdict] judging failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   /**
