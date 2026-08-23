@@ -35,10 +35,15 @@ benchmark-runs/
 .codebuddy
 .ai_assets
 
-# Dev-only scripts & lockfile (not shipped in MR)
+# Dev-only scripts (not shipped in MR)
 install-plugin.sh
-package-lock.json
-# ...except the published fork plugin's lockfile (committed for reproducible installs)
+# package-lock.json WAS ignored here. That single line is why every CI run was
+# red from 2026-06-16 to 2026-08-23: the runner checked out a repo with no
+# lockfile, so `npm install` re-resolved the whole graph from the registry and
+# eventually hit a transitive package whose peer set npm 10 cannot place
+# (crash inside arborist `#loadPeerSet`). A lockfile is not a dev-only file:
+# it is what makes an install reproducible. It is committed now, and the CI
+# uses `npm ci`.
 !claude-code-plugin/package-lock.json
 pnpm-lock.yaml
 yarn.lock
