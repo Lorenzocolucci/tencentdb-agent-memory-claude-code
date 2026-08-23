@@ -14,6 +14,22 @@
 
 ---
 
+> ## 📍 2026-08-07 — QUESTA È LA VISIONE, NON LO STATO
+> Il testo di questo documento resta **vincolante** come nord: memoria associativa,
+> ricostruzione e non lookup, i ricordi vengono all'agente.
+> **Lo stato reale, i numeri misurati e cosa manca** vivono in
+> → **[../STATO-REALE.md](../STATO-REALE.md)**.
+>
+> Aggiornamenti importanti alle Idee dopo il 18/07:
+> - **Idea 3 (Mistake Notebook)** era di fatto ferma (6 lezioni contro 27 cluster reali):
+>   il budget ripescava sempre gli stessi cluster già distillati. Risolto → **68 lezioni**.
+>   E ora è **nutrita dall'officina**: i fallimenti tecnici entrano in memoria.
+> - **Consolidamento**: scriveva rinforzi che il recall non leggeva mai. Filo attaccato e
+>   acceso (`recall.consolidationBoost`), misurato in A/B sulla memoria vera.
+> - **Nuovo fenomeno riconosciuto**: il *loop intra-sessione* (stesso errore N volte
+>   adesso) non è materia da lezione — va **interrotto subito**. Vedi
+>   [PIANO-FILO-CONSOLIDAMENTO-RECALL.md](PIANO-FILO-CONSOLIDAMENTO-RECALL.md).
+
 ## Stato implementativo (aggiornato 2026-07-18 — nota conservativa, la VISIONE sotto resta invariata e vincolante)
 
 Le **5 idee originali** (Parte 3) + l'**Idea 6 Grounded Trust** (aggiunta 2026-06-29) sono TUTTE implementate e live nel repo `tencentdb-agent-memory` (verificato file:line, non a memoria, 2026-07-18):

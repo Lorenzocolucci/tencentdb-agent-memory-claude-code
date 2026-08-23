@@ -118,6 +118,14 @@ export interface RecallConfig {
    */
   source: "l1" | "kb";
   /**
+   * Consolidation → recall wire (default false / OFF). When true, the KB ranking
+   * folds each candidate's stored reinforcement count + lifecycle tier into its
+   * importance boost, so memories confirmed over time rank above one-offs.
+   * Purely additive (never lowers a score) and fail-open. Only used when
+   * source = "kb".
+   */
+  consolidationBoost: boolean;
+  /**
    * Rerank toggle for the KB retrieval path (Phase 4, default: false / OFF).
    * When false the rerank() stage is a no-op passthrough. Kimi list-rerank is a
    * later phase; the interface is fail-open by design (rerank failure → the
@@ -554,6 +562,8 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       source: str(recallGroup, "source") === "kb" ? "kb" : "l1",
       // Rerank OFF by default in Phase 4 (no-op passthrough until eval enables it).
       rerank: bool(recallGroup, "rerank") ?? false,
+      // Consolidation wire OFF by default — live ranking unchanged until enabled.
+      consolidationBoost: bool(recallGroup, "consolidationBoost") ?? false,
     },
     embedding: {
       enabled: embeddingEnabled,

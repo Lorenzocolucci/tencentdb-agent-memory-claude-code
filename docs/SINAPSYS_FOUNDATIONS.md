@@ -1,4 +1,30 @@
 # 🏛️ SINAPSYS — Foundations Blueprint (le fondamenta che reggono tutto l'edificio)
+
+> ## 📊 2026-08-23 — le fondamenta OGGI (misurate sul DB live)
+> Le tabelle-mattone sono tutte create e **popolate**. Numeri reali:
+> `memory_lifecycle` **34.309** righe (850 `long`, 1.517 rinforzate) ·
+> `lessons` **68** (erano 6 il 2026-08-07) · `entities` 12.582 · `facts` 20.416 ·
+> `events` 15.687 (1.708 `bug`, 18 `principle`) · `relations` 7.958 · DB **2,80 GB**.
+>
+> **Mattone NUOVO (2026-08-23): `recall_ledger`** — una riga per ogni ricordo *davvero
+> iniettato* in un turno, scritta non giudicata dal recall e chiusa dalla cattura, con le
+> parole che hanno deciso il verdetto. È la base del **verdetto di utilità**: prima d'ora
+> nulla distingueva "recuperato" da "usato". Vedi
+> [vision/STATO-REALE.md](vision/STATO-REALE.md) §4-ter.
+>
+> **Cambiamento strutturale importante:** `memory_lifecycle` non è più solo *scritto* dal
+> consolidamento — dal 2026-08-07 è anche **LETTO dal recall** (`candidateLifecycle` +
+> `consolidationScore` in `retrieval.ts`). Il Mattone 1 è finalmente collegato all'uscita.
+> ⚠️ L'anello di ritorno *usato → rinforza / rumore → decade* **non è ancora collegato**,
+> di proposito: prima si misura, poi si agisce.
+>
+> ⚠️ **Trappola da conoscere:** `insertEvent` scrive SOLO la riga evento. `kb_fts`/`kb_vec`
+> li scrive lo step di embedding di `kb-writer`, e `reindexKb` enumera gli owner **FROM
+> `kb_fts`** (`sqlite.ts:2091`). Un evento inserito direttamente resta quindi invisibile a
+> ricerca e clustering finché non gli si crea la riga FTS.
+>
+> Stato completo e cosa manca: → [vision/STATO-REALE.md](vision/STATO-REALE.md)
+
 > v1 — 24 giugno 2026 — Lorenzo + Socio. Schema validato e COSTRUITO.
 > **STATO 2026-06-24 sera:** fondamenta LIVE · Fase A live · Fase B **B1 (`a3c81c4`) + B2a (`2a4cc5c`) costruite e live**. Dettaglio moduli/stato: `docs/superpowers/specs/2026-06-24-track-b-mistake-notebook-design.md` + `docs/HANDOFF-2026-06-24-trackB.md`.
 > Principio: ogni fase futura (A→E) e ogni angolo vendibile si aggancia a queste fondamenta SENZA demolire. Tutto additivo (`IF NOT EXISTS` / `ALTER TABLE ADD COLUMN`), stile `initKbSchema()` esistente. Il KB live non si rompe mai.

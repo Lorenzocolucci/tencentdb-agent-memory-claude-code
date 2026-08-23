@@ -1,94 +1,166 @@
-# 🗺️ Mappa delle Interconnessioni (viva — aggiornare ad ogni cambio strutturale)
-> Ultimo aggiornamento: 24 giugno 2026. Regola: questo file si aggiorna PRIMA di considerare completo un cambio di struttura.
+# 🗺️ Mappa delle Interconnessioni
 
-> **⚠️ NOTA 2026-07-18 (unificazione D-A3):** questa mappa è fotografata al commit `0f9f913` (24/06) — **116 commit indietro** rispetto a HEAD (`8556c31`, branch `feat/sinapsys-l4-consolidation`). Le sezioni A-D sotto restano valide come STRUTTURA, ma NON coprono tutto ciò che è stato costruito dopo. Verificato oggi: **le 5 idee originali (Parte 3 del blueprint) sono TUTTE implementate**, più Grounded Trust (Idea 6) e un L4 v1 contradiction-detector. Moduli mancanti da questa mappa (elenco da verdicts-sinapsys, 2026-07-18):
-> - `src/core/kb/navigable-index.ts` — indice HNSW in-house (Incremento C del recall redesign, root `HANDOFF.md` del repo).
-> - `src/core/kb/contradiction-detector.ts` — L4 v1, 3° passo del Consolidation Engine (commit `44a1625`).
-> - `src/core/kb/{provenance,stakes,grounded-trust-ask}.ts` — Grounded Trust (Idea 6), 4 fasi.
-> - `src/core/kb/{implicit-priming,spreading-activation}.ts` — Implicit Priming (Idea 2) + il cuore associativo, via co-occorrenza (non solo `relations` esplicite).
-> - `src/core/distinctiveness/*` — Distinctive Terms (Idea 5), cornerstone.
-> - `src/core/kb/{principle-*,usage-*}.ts` — Pilastro C (distillazione principi) + Behavioral Notebook (tendenze d'uso).
-> - `src/core/continuity/*` — "Dove eravamo" (session-continuity recap).
-> - `src/core/kb/situation-cue.ts` + wiring in `auto-recall.ts` — recall associativo-first (situazione semina lo spreading activation).
+> **Aggiornata 2026-08-23** — riscritta sui flussi REALI. Regola: questo file si aggiorna PRIMA di considerare completo
+> un cambio di struttura.
 >
-> Stato dettagliato per-modulo: `docs/SINAPSYS-ARCHITECTURE.md` (nel repo). Il corpo sotto (sezioni A-D) resta valido come mappa storica della struttura fino al 24/06.
+> Stato/numeri: [../STATO-REALE.md](../STATO-REALE.md) · Moduli: [../../SINAPSYS-ARCHITECTURE.md](../../SINAPSYS-ARCHITECTURE.md)
 
-## A — Documenti dell'hub (come si legano)
-```
-README → CODE-POINTER → (repo git)
-       → 00-charter/COME-LAVORIAMO-SOCIO       (come lavoriamo)
-       → 01-vision-and-plan/SINAPSYS-PLAN ──── basato su ── MEMORIA-BLUEPRINT
-       → 02-architecture/FOUNDATIONS-POINTER ── punta a ── repo/docs/SINAPSYS_FOUNDATIONS
-       → 03-research/round1 + round2 ───────── alimentano ── SINAPSYS-PLAN (PARTE 7-9)
-       → 04-decisions/ADR-0001, ADR-0002      (vincoli a verbale)
-```
+---
 
-## B — Codice: moduli esistenti (KB) e loro flusso
+## A — Documenti: come si legano
+
 ```
-Stop hook → /capture → kb-extractor (LLM→KbDelta) → kb-writer.applyKbDelta
-                                                       ├─ entities  (resolveOrCreateEntity)
-                                                       ├─ events    (insertEvent, APPEND-ONLY)
-                                                       ├─ facts     (kb-queries supersession, HEAD fact)
-                                                       └─ relations (idempotent edge)
-                                                          → embed → kb_vec / kb_fts
-UserPromptSubmit hook → /recall → kbRecall (FTS + vec + entity → RRF → calibrate)
-SessionStart → projections (persona.md + scene_blocks, deterministico, anti-segreti)
+STATO-REALE  ◄── punto d'ingresso, l'unico che si aggiorna ogni sessione
+   ├─► README ──────────────► CODE-POINTER ──► (repo git, gateway, strumenti)
+   ├─► 00-charter/COME-LAVORIAMO-SOCIO            (il patto di lavoro)
+   ├─► 01-vision-and-plan/MEMORIA-BLUEPRINT       (LA VISIONE: 5 idee + Grounded Trust)
+   │        └─ SINAPSYS-PLAN  (piano storico per fasi)
+   │        └─ PIANO-FILO-CONSOLIDAMENTO-RECALL   (aperto → misurato → acceso)
+   │        └─ PUNTO5-SINAPSYS-IN-ARGUS-RENDER    ◄── IL PROSSIMO PASSO
+   ├─► 02-architecture/INTERCONNECTION-MAP (questo) + FOUNDATIONS-POINTER
+   ├─► 03-research/round1+round2                  (alimentano il blueprint)
+   └─► 04-decisions/ADR-0001, ADR-0002            (vincoli a verbale)
 ```
 
-## C — Fondamenta nuove → quali moduli le useranno (da costruire)
-| Fondamenta (tabella) | Modulo che la scrive | Modulo che la legge |
-|---|---|---|
-| `memory_lifecycle` | Fase A (L4 consolidation runner) | kbRecall (reweight), proiezioni |
-| `lessons` | Fase B (distillatore in A) | Fase C (injection), kbRecall |
-| `memory_audit` | A + kb-writer (supersession) | debug / UI futura |
-| `context_fingerprints` | Fase C (hook PostToolUse + matcher) | Fase C (injection) |
-| `relations.weight` | A (rinforzo) | Fase D (spreading activation) |
+---
 
-## C.1 — Fondamenta: IMPLEMENTATE (24 giugno 2026)
-- **`repo/src/core/kb/foundations-schema.ts`** → `initFoundationsSchema(db, logger)` crea i 5 mattoni (additivo, best-effort, mai throw). Una funzione pubblica, ~190 righe.
-- **Chiamato da** `repo/src/core/store/sqlite.ts` → `initKbSchema()` (1 riga, dopo le `relations`, prima di `kbReady=true`).
-- **Test:** `repo/src/core/kb/__tests__/foundations-schema.test.ts` (6 test verdi: tabelle create, weight additivo, idempotenza, righe preservate, PK composta, best-effort senza relations). Suite KB: 80/80 verde. Typecheck pulito.
-- **Stato runtime:** applicato al DB live al prossimo build+restart del gateway (additivo, sicuro). NON ancora deployato.
+## B — Il flusso VIVO, oggi (Claude Code sul portatile)
 
-## C.2 — Fase A parte 1: lifecycle access layer (IMPLEMENTATO, commit bc0fb5e)
-- **`repo/src/core/kb/memory-audit.ts`** → `recordAudit(db, entry, now)` (append-only su memory_audit).
-- **`repo/src/core/kb/lifecycle-writer.ts`** → `ensureLifecycle` / `getLifecycle` / `reinforce` / `computePermanence`. `reinforce` applica la promozione a 2 condizioni (short→long) e scrive audit.
-- **Test:** `__tests__/lifecycle-writer.test.ts` (5 test). Suite KB 85/85 verde, typecheck pulito.
-## C.3 — Fase A parte 2: consolidamento deterministico (IMPLEMENTATO, commit f6dede2)
-- **`repo/src/core/kb/lifecycle-decay.ts`** → `decay` + `applyStaleness` (i ricordi non rinforzati sbiadiscono long→short→dormant; mai cancellati).
-- **`repo/src/core/kb/consolidation-runner.ts`** → `runConsolidation(db, {sessionKey, now})`: rinforza eventi+fatti della sessione, poi decade gli stantii. Deterministico, no LLM.
-- **Test:** `__tests__/consolidation-runner.test.ts` (2). Suite KB 87/87 verde, typecheck pulito.
+```
+ ┌─ ogni tuo messaggio ────────────────────────────────────────────────┐
+ │ UserPromptSubmit hook → POST /recall                                │
+ │   → performAutoRecall → kbRecall  (FTS + vettori + entità → RRF     │
+ │       → recency/importanza (+ CONSOLIDAMENTO, acceso 2026-08-07)    │
+ │       → Implicit Priming (spreading activation) → top-K calibrato)  │
+ │   → composeRecallContext: principi + persona + scene + ricordi      │
+ │   → hook estrae il banner "🧠" e lo emette come systemMessage       │
+ │     (VISIBILE all'utente; prima era solo un'istruzione al modello)  │
+ └─────────────────────────────────────────────────────────────────────┘
 
-## C.4 — Fase A parte 3: aggancio live + deploy (IMPLEMENTATO+DEPLOYATO, commit 93abfad)
-- **`repo/src/core/kb/consolidation-scheduler.ts`** → `scheduleConsolidation({store, sessionKey, now, register, unregister, logger})`: fire-and-forget via `setImmediate` (la risposta `/session/end` esce prima della sweep sincrona); traccia il task in `bgTasks` così `destroy()` lo drena prima di chiudere il DB; ingoia+logga gli errori; no-op se lo store non può consolidare (TCVDB/degraded).
-- **`repo/src/core/store/sqlite.ts`** → `VectorStore.consolidateSession(params)` wrappa `runConsolidation(this.db, …)`; no-op se `!kbReady`. Firma opzionale su `IMemoryStore` (`store/types.ts`).
-- **`repo/src/core/tdai-core.ts`** → `handleSessionEnd` flusha la sessione (se c'è scheduler) poi chiama `scheduleConsolidation`. Unico punto d'aggancio (copre gateway).
-- **Test:** `kb/__tests__/consolidation-scheduler.test.ts`, `store/__tests__/consolidate-session.test.ts`, `__tests__/consolidation-wiring.test.ts` (drain-before-close provato). Suite motore 162/162. **Live:** gateway PID 6232, verificato end-to-end (265 memorie rinforzate su sessione reale).
-- **Deferred (con trigger):** vedi scheda `sinapsys-phase-a-deferred` (coalesce decay sweep; namespace propagation — oggi prematuro, DB tutto `default`).
+ ┌─ mentre l'agente lavora (PostToolUse: Bash|Read|Edit|Write|…) ──────┐
+ │ POST /observe → handleToolObservation                               │
+ │   ├─ se il tool è FALLITO → friction-capture (OFFICINA)             │
+ │   │     ├─ firma normalizzata (numeri/hash/path collassati)         │
+ │   │     ├─ 1ª volta → evento `bug`                                  │
+ │   │     ├─ 3ª volta uguale → LOOP: evento + ⚠️ avviso iniettato     │
+ │   │     └─ segreti redatti PRIMA di salvare; cap 40/sessione        │
+ │   ├─ iniezione per FILE (una volta per file per sessione)           │
+ │   └─ iniezione per SITUAZIONE (Context Fingerprint)                 │
+ │   → l'avviso di LOOP va SEMPRE per PRIMO (rompe il loop adesso)     │
+ └─────────────────────────────────────────────────────────────────────┘
 
-## C.5 — Fase B: Mistake Notebook (IN RIDISEGNO — non ancora mappato)
-- ⚠️ Primo tentativo (clustering `bug→fix` per vicinanza temporale intra-sessione) **SCARTATO**: produce aneddoti, non lezioni. Il blueprint vuole clustering **per dominio, cross-sessione, con evidence_count**, trigger = Context Fingerprint, injection-ready. Mattoni riusabili: `lessons-writer.ts` (lezioni versionate, supersede), `lessons-distiller.ts` (LLM→struttura). Da rifare: `lessons-candidates.ts`. Vedi scheda `sinapsys-phase-b-direction`.
+ ┌─ a fine turno ──────────────────────────────────────────────────────┐
+ │ Stop hook → POST /capture → L0 (conversazioni grezze)               │
+ │   → estrazione L1 (LLM → KbDelta) → applyKbDelta:                   │
+ │        entities · events(APPEND-ONLY) · facts(supersession) ·        │
+ │        relations → embed → kb_vec + kb_fts                          │
+ └─────────────────────────────────────────────────────────────────────┘
 
-## C.6 — Track A: Proactive Injection — slice 1 (LIVE+VERIFICATO, commit 413ddbb)
-- **Scoperta:** nel path gateway, `performAutoRecall` calcola DUE parti — `appendSystemContext` (stabile: persona/scene/guide) e `prependContext` (i `<relevant-memories>` mirati al prompt) — ma `handleRecall` rispediva **solo** la parte stabile. I ricordi rilevanti venivano buttati al confine HTTP → proactive injection di fatto SPENTA (solo profilo+lista scene).
-- **`repo/src/gateway/recall-context.ts`** → `composeRecallContext({appendSystemContext, prependContext})`: unisce le due parti (stabile prima, ricordi dopo). **`server.ts` handleRecall** ora la usa.
-- **Test:** `gateway/__tests__/recall-context.test.ts` (4, incl. il caso "solo memorie"). Suite motore 186/186.
-- **Verifica live:** gateway PID 23744; `POST /recall "circuit breaker errorFilter Sofia"` → `memory_count=5`, blocco `<relevant-memories>` (relevance 0.54–0.63). Prima: scartato.
-### Track A slice 2 — iniezione dei principi vincolanti (LIVE+VERIFICATO, commit 4d6f273)
-- **`repo/src/core/hooks/principles.ts`** → `loadPrinciples(dataDir)` (legge `<dataDir>/principles.md`, curato/fidato) + `formatPrinciplesBlock` (blocco `<governing-principles>` con cornice BINDING — opposto al "solo riferimento" dei fatti). **`auto-recall.ts`** lo carica e lo mette PRIMO in `stableParts` (prima di persona/scene).
-- **Dato vivo:** `<dataDir>/principles.md` (NON nel repo — è runtime, come il DB): non-negoziabili universali + ambition bar Sinapsys del focus attuale. Sorgente di verità della visione = blueprint + schede `sinapsys-*`; questo file è il riassunto iniettato.
-- **Test:** `hooks/__tests__/principles.test.ts` (4). Suite 190/190. **Verifica live:** `/recall` → `<governing-principles>` in posizione 0 (prima di persona@2168, memorie@6111).
-### Track A slice 3+4 — Proactive Injection per SITUAZIONE (LIVE motore, commit 0f9f913)
-- **`repo/src/core/hooks/situation.ts`** → `extractSituation` (file in gioco da un evento PostToolUse; normalizza a posix con `split/join`, NON regex — il bundler mangiava la regex backslash).
-- **`repo/src/core/hooks/situation-injection.ts`** → `buildFileInjection`: risolve l'entità file (chiave full-path → fallback basename; la KB salva i file in entrambi i modi) e rende fatti+eventi come blocco `<file-memory>`, oppure `null` (SILENZIO) se file ignoto/nulla di rilevante.
-- **`tdai-core.ts`** → `handleToolObservation` (extract → dedup una-volta-per-file-per-sessione → buildFileInjection; mai throw). **`gateway/server.ts`** → `POST /observe`. **Plugin:** `handlePostToolUse` → `/observe` → `additionalContext`; `gateway-client.observe`; `hooks.json` registra PostToolUse (matcher Read|Edit|Write|MultiEdit|NotebookEdit, NON async così può iniettare).
-- **Test:** `hooks/__tests__/situation*.test.ts` (9). Suite 199/199. **Verifica live (motore):** `/observe` con path Windows reale (JSON valido) → blocco `<file-memory>` 449 char per whatsapp-sofia.ts; file ignoto/tool non-file/secondo tocco → silenzio.
-- ⚠️ **Il hook PostToolUse si attiva alla PROSSIMA sessione Claude Code** (carica il nuovo hooks.json). La verifica "apri un file → arriva la memoria" la fa Lorenzo in una chat nuova.
-- ⚠️ **Trappola di test (lezione):** payload JSON con backslash costruiti nella shell collassano `\\`→`\` → JSON invalido → falso "rotto". Costruisci i path con `String.fromCharCode(92)` + `JSON.stringify`. Il vero hook usa JSON.stringify → sempre valido.
-- **Restano:** principi PER-PROGETTO (oggi principles.md è globale); accumulo `context_fingerprints` (Idea 1, cross-sessione) — la tabella è ancora vuota. Vedi `sinapsys-dual-track-direction`.
+ ┌─ in sottofondo (sleep-time) ────────────────────────────────────────┐
+ │ scheduleConsolidation → runConsolidation                            │
+ │     rinforza ciò che ricorre · fa sbiadire lo stantio · contraddiz. │
+ │            └──► memory_lifecycle ──► LETTO dal recall (§B, acceso)  │
+ │ distillLessons: bug → cluster (≥2 bug, ≥2 sessioni) → LEZIONI       │
+ │     (fix 2026-08-07: i cluster già distillati non consumano più     │
+ │      il budget → le lezioni sono passate da 6 a 68)                 │
+ │     ⚠️ i tre passi di distillazione CEDONO il ciclo eventi prima di │
+ │        partire e girano al massimo 1 volta ogni 30 min: prima       │
+ │        bloccavano il primo turno per 11,5 s (budget hook: 6 s)      │
+ └─────────────────────────────────────────────────────────────────────┘
+```
 
-## D — Regole di dipendenza (per restare manutenibili)
-- `events` = APPEND-ONLY. Nessun modulo lo muta. Il "vivo" sta in `memory_lifecycle`.
-- `facts` = NO DELETE. Solo supersession.
+### Il verdetto di utilità (2026-08-23) — l'unico anello che misura
+
+```
+ recall  ──► scrive nel recall_ledger CIÒ CHE HA DAVVERO INIETTATO
+             (una riga per ricordo, NON giudicata)
+ capture ──► giudica: il ricordo è USATO solo se nella risposta compaiono
+             parole distintive che vengono dal RICORDO e NON dal prompt
+             (senza quella sottrazione si misura un'eco)
+             └─► salva le parole che hanno deciso → verificabile
+ report  ──► npx tsx tools/memory-verdict.mts        (10% al 2026-08-23)
+
+ ⚠️ ASIMMETRIA DA CONOSCERE: `reinforceRecalledOwners` rinforza ciò che il
+    recall PESCA. Quindi un ricordo iniettato e ignorato diventa più forte.
+    Il verdetto esiste per correggerlo, ma l'anello di ritorno
+    (usato → rinforza / rumore → decade) NON è ancora collegato: prima
+    si misura su traffico vero, poi si agisce.
+```
+
+### Le 7 trappole "mai in silenzio" (2026-08-22/23)
+
+```
+ data-dir-lost · gateway-unreachable · capture-failed · capture-empty
+ memory-stale  · memory-degraded     · writing-to-backup
+        │
+        └─► briciola in alarms.json ─► il primo UserPromptSubmit la mostra
+            come systemMessage (l'unico canale che CC rende all'utente)
+            UN ALLARME BATTE SEMPRE IL BANNER: la falsa rassicurazione è
+            ciò che ha nascosto 10 giorni di cattura morta.
+
+ Rete INDIPENDENTE dal plugin (se il plugin è rotto non può lamentarsi):
+ ~/.claude/scripts/hooks/session-start-tdai-health.js confronta
+ /health.last_capture_at con l'ultima sessione realmente avvenuta.
+```
+
+---
+
+## C — Chi scrive e chi legge le fondamenta
+
+| Tabella | Chi la SCRIVE | Chi la LEGGE | Stato |
+|---|---|---|---|
+| `l0_conversations` | auto-capture | recall di riserva, digest | vivo |
+| `entities` / `facts` / `events` / `relations` | `kb-writer.applyKbDelta`, `recordFriction` | `kbRecall`, proiezioni, cluster | vivo |
+| `kb_vec` / `kb_fts` | embed step di kb-writer, `reindexKb` | `kbRecall` (vettori + BM25) | vivo |
+| `memory_lifecycle` | `runConsolidation`, `reinforceRecalledOwners` | **`kbRecall` (dal 2026-08-07)** | **filo attaccato** |
+| `lessons` | `distillLessons` | injection, `kbRecall` | vivo (68) |
+| **`recall_ledger`** | `kbRecall` (scrive non giudicato) | `judgePendingRecalls` alla cattura, `memory-verdict` | **vivo (2026-08-23)** |
+| `memory_audit` | consolidamento + supersession | debug | vivo |
+| `context_fingerprints` | hook PostToolUse | `fingerprint-injection` | vivo |
+
+---
+
+## D — Le due catene di apprendimento (Complementary Learning Systems)
+
+```
+ VELOCE (Track A)                          LENTA (Track B)
+ ───────────────                           ───────────────
+ cattura → estrazione → recall             fallimenti → cluster per dominio
+ valore SUBITO, ogni turno                  → lezione generalizzata
+ + interruzione dei LOOP (subito)           accumulo lento, MAI aneddoti
+                                            (serve ricorrenza in ≥2 sessioni)
+```
+
+**Perché due:** un loop va rotto **adesso** (Track A); un pattern che torna nelle settimane
+diventa una **lezione** (Track B). Confonderli produce o rumore o cecità.
+Il fix del 2026-08-07 nasce esattamente da lì: il clustering richiede ≥2 sessioni, quindi
+5 errori uguali **in una sola sessione** non producevano nulla → ora li intercetta Track A.
+
+---
+
+## E — Dove si innesta Argus (prossimo passo)
+
+```
+  argus-brain   ┐
+  argus-maker   ├─► http://sinapsys-memory:8421  ─► [disco] vectors.db
+  argus-nightly ┘   (servizio privato Render)
+     (worker/cron: possono INVIARE, non ricevere → forma compatibile)
+
+  punto d'innesto unico in Argus: askLLM — C:\Argus\engine\lib\llm.mjs:115
+```
+
+Vincolo verificato: un disco Render appartiene a **un solo servizio** e i **cron non possono
+usarlo**. Argus è tre servizi → il disco NON può stare su Argus.
+Dettagli, costi e fasi: [../01-vision-and-plan/PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md](../01-vision-and-plan/PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md)
+
+---
+
+## F — Regole di dipendenza (per restare manutenibili)
+
+- `events` = **APPEND-ONLY**. Nessun modulo lo muta. Il "vivo" sta in `memory_lifecycle`.
+- `facts` = **NO DELETE**. Solo supersession (HEAD + storia).
+- La memoria **non rompe mai** la conversazione: fail-open ovunque, errori ingoiati e loggati.
 - Ogni nuovo modulo: una funzione per file, ~200 righe max.
 - Ogni auto-modifica passa da `memory_audit` (tracciabilità obbligatoria).
+- ⚠️ **`insertEvent` NON crea `kb_fts`/`kb_vec`**: chi scrive eventi fuori da `kb-writer` deve
+  aggiungerli, altrimenti il ricordo è invisibile a ricerca e clustering (lezione del backfill).

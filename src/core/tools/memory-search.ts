@@ -100,6 +100,8 @@ export async function executeMemorySearch(params: {
   rerank?: boolean;
   /** Namespace scope for KB recall (default "default"). */
   namespace?: string;
+  /** Consolidation → recall wire (default false). Only used when recallSource = "kb". */
+  consolidationBoost?: boolean;
 }): Promise<MemorySearchResult> {
   const {
     query,
@@ -112,6 +114,7 @@ export async function executeMemorySearch(params: {
     recallSource = "l1",
     rerank = false,
     namespace = "default",
+    consolidationBoost = false,
   } = params;
 
   logger?.debug?.(
@@ -143,6 +146,7 @@ export async function executeMemorySearch(params: {
       embeddingService,
       rerank,
       namespace,
+      consolidationBoost,
       logger,
     });
     return kbResults;
@@ -303,9 +307,10 @@ async function executeKbMemorySearch(params: {
   embeddingService?: EmbeddingService;
   rerank: boolean;
   namespace: string;
+  consolidationBoost?: boolean;
   logger?: Logger;
 }): Promise<MemorySearchResult> {
-  const { query, limit, vectorStore, embeddingService, rerank, namespace, logger } = params;
+  const { query, limit, vectorStore, embeddingService, rerank, namespace, consolidationBoost, logger } = params;
   try {
     const kbResults = await kbRecall(query, {
       store: vectorStore,
@@ -313,6 +318,7 @@ async function executeKbMemorySearch(params: {
       namespace,
       maxResults: limit,
       rerank,
+      consolidationBoost,
       logger,
     });
     const results: MemorySearchResultItem[] = kbResults.map((r) => ({

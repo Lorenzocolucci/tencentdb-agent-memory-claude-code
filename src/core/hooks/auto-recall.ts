@@ -665,6 +665,8 @@ export async function runKbRecall(
       // associative recall. The explicit memory-search tool keeps the vector
       // source for on-demand deep retrieval (System 2).
       skipVector: true,
+      // Consolidation → recall wire (config-gated, default OFF).
+      consolidationBoost: cfg.recall.consolidationBoost ?? false,
       logger,
     });
 
@@ -772,6 +774,34 @@ export async function runKbRecall(
           logger?.debug?.(`${TAG} [kb] recall thin (${conf.reason}) → deeper associative pass (hops=3, maxNodes=16)`);
         }
       }
+    }
+
+    // ── LEDGER — write down what we are about to put in front of the agent ──
+    // Note the asymmetry with the block below: hebbian reinforcement rewards
+    // RETRIEVAL, which is why an ignored memory used to grow stronger forever.
+    // This only takes note; the verdict is settled at capture time, when the
+    // agent's reply exists and usefulness can be measured instead of assumed.
+    const recordLedger = (vectorStore as {
+      recordRecallInjections?: (p: {
+        sessionKey: string; namespace?: string; now: string;
+        injections: Array<{ ownerId: string; ownerKind: string; score: number; associative: boolean; memoryText: string }>;
+      }) => number;
+    }).recordRecallInjections;
+    if (typeof recordLedger === "function" && sit?.sessionKey) {
+      try {
+        recordLedger.call(vectorStore, {
+          sessionKey: sit.sessionKey,
+          namespace: sit.namespace,
+          now: new Date().toISOString(),
+          injections: visible.map((r) => ({
+            ownerId: r.owner_id,
+            ownerKind: r.owner_kind,
+            score: r.score,
+            associative: !!r.associative,
+            memoryText: r.text,
+          })),
+        });
+      } catch { /* best-effort: bookkeeping never breaks recall */ }
     }
 
     // ── B2a — HEBBIAN reinforcement: every recall strengthens what it surfaced ──

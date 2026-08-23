@@ -13,10 +13,13 @@ import { GatewayClient, RECALL_TIMEOUT_MS, CAPTURE_TIMEOUT_MS } from "./gateway-
 import { getSessionKey, getProjectName } from "./session-key.js";
 import { readAllTurns } from "./transcript.js";
 import { DaemonManager, readDaemonState, clearDaemonState } from "./daemon.js";
+import { resolveDataDirDetailed, type DataDirSource } from "./data-dir.js";
+import { raiseAlarm, clearAlarm, drainAlarms } from "./alarm.js";
+import { assessStaleness, describeStaleness, newestTranscriptMs } from "./staleness.js";
 import { appendFile, mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
-import { createReadStream, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
-import { basename, dirname, join } from "node:path";
+import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -37,19 +40,22 @@ export interface HookInput {
   stdin: string;
   client: GatewayClient;
   args?: string[];
+  /** Where alarms and cursors live. Defaults to the discovered data dir. */
+  dataDir?: string;
 }
 
 export async function handleHook(event: HookEvent, input: HookInput): Promise<string> {
   const data = parseStdin(input.stdin);
+  const dataDir = input.dataDir ?? resolveDataDir();
   switch (event) {
     case "session-start":
-      return handleSessionStart(data, input.client);
+      return handleSessionStart(data, input.client, dataDir);
     case "user-prompt-submit":
-      return handleUserPromptSubmit(data, input.client);
+      return handleUserPromptSubmit(data, input.client, dataDir);
     case "post-tool-use":
       return handlePostToolUse(data, input.client);
     case "stop":
-      return handleStop(data, input.client);
+      return handleStop(data, input.client, dataDir);
     case "search":
       return handleSearch(input.args ?? [], input.client);
     case "search-stdin":
@@ -86,15 +92,64 @@ function parseStdin(raw: string): HookStdin {
   }
 }
 
-async function handleSessionStart(_data: HookStdin, client: GatewayClient): Promise<string> {
-  await client.health();
+async function handleSessionStart(
+  _data: HookStdin,
+  client: GatewayClient,
+  dataDir: string,
+): Promise<string> {
+  // NO SILENT FAILURE: an unreachable gateway used to produce one line in
+  // hook.log. It cost 5 days of lost memory (2026-08-13 → 2026-08-18).
+  const health = await client.healthDetailed();
+  if (!health) {
+    await raiseAlarm(
+      dataDir,
+      "gateway-unreachable",
+      "il gateway non risponde — NULLA viene salvato in memoria",
+    );
+    return "";
+  }
+  await clearAlarm(dataDir, "gateway-unreachable");
+
+  // Reachable but unhappy is a THIRD state, not a synonym for "down". The
+  // gateway answers 503 while its embedding provider is refusing calls
+  // (DeepInfra: "429 engine_overloaded") even though /recall still works.
+  // Say what is actually true — and clear it the moment it recovers, so a
+  // transient provider hiccup costs one honest line, not a standing siren.
+  if (health.status === "degraded" || health.embedding === "failing") {
+    await raiseAlarm(
+      dataDir,
+      "memory-degraded",
+      "l'embedder non risponde bene — la memoria funziona ma richiama peggio",
+    );
+  } else {
+    await clearAlarm(dataDir, "memory-degraded");
+  }
+
+  // The hole detector: memory silent while work kept happening.
+  const verdict = assessStaleness(
+    health.last_capture_at,
+    newestTranscriptMs(join(homedir(), ".claude", "projects")),
+    Date.now(),
+  );
+  if (verdict.stale) {
+    await raiseAlarm(dataDir, "memory-stale", describeStaleness(verdict));
+  } else {
+    await clearAlarm(dataDir, "memory-stale");
+  }
   return "";
 }
 
-async function handleUserPromptSubmit(data: HookStdin, client: GatewayClient): Promise<string> {
+async function handleUserPromptSubmit(
+  data: HookStdin,
+  client: GatewayClient,
+  dataDir: string,
+): Promise<string> {
   const prompt = data.prompt ?? "";
   const cwd = data.cwd ?? process.cwd();
-  if (!prompt) return "";
+  // NO SILENT FAILURE: this hook is the only channel Claude Code renders
+  // straight to the user, so every failure recorded elsewhere surfaces here.
+  const alarmLine = await drainAlarms(dataDir);
+  if (!prompt) return alarmLine ? JSON.stringify({ systemMessage: alarmLine }) : "";
 
   const sessionKey = getSessionKey(cwd);
   const project = getProjectName(cwd);
@@ -128,19 +183,68 @@ async function handleUserPromptSubmit(data: HookStdin, client: GatewayClient): P
     }
   }
 
-  if (!context) return "";
+  if (!context) return alarmLine ? JSON.stringify({ systemMessage: alarmLine }) : "";
+
+  // Banner visibility fix: the session-open banner ("🧠 …") lives inside
+  // `context`, which is delivered as additionalContext — model-only. The model
+  // has to voluntarily echo it, which it often does not, so the user never sees
+  // that memory loaded. Extract the banner line (BEFORE truncation) and ALSO
+  // emit it as a top-level `systemMessage`, which Claude Code renders directly
+  // to the user — guaranteed visible, once per session (the gateway only puts
+  // the banner block in the context on the first turn).
+  const bannerMatch = context.match(/<session-open-banner>[\s\S]*?<\/session-open-banner>/);
+  const bannerLine = bannerMatch
+    ? (bannerMatch[0]
+        .split("\n")
+        .map((s) => s.trim())
+        .filter((s) => s && !s.startsWith("<") && !s.startsWith("FIRST TURN"))[0] ?? "")
+    : "";
 
   if (context.length > MAX_INJECT_CHARS) {
     context =
       context.slice(0, MAX_INJECT_CHARS - 100) +
       "\n\n[…recall truncated — use /memory-search for full results…]";
   }
-  return JSON.stringify({
+  const out: {
+    hookSpecificOutput: { hookEventName: string; additionalContext: string };
+    systemMessage?: string;
+  } = {
     hookSpecificOutput: {
       hookEventName: "UserPromptSubmit",
       additionalContext: context,
     },
-  });
+  };
+  // An alarm always wins the systemMessage slot: "memory is broken" matters
+  // more than "memory remembers you", and showing the banner while capture is
+  // dead is exactly the false reassurance that hid this outage for 10 days.
+  const message = alarmLine || bannerLine;
+  if (message) out.systemMessage = message;
+  return JSON.stringify(out);
+}
+
+/** Max characters of failed-tool output forwarded to the gateway. */
+const MAX_TOOL_OUTPUT_CHARS = 2_000;
+
+/**
+ * Best-effort stringification of a tool result for friction capture. Returns
+ * undefined when there is nothing usable — the caller then sends nothing and
+ * behaviour is exactly as before.
+ */
+function stringifyToolOutput(resp: unknown): string | undefined {
+  if (resp == null) return undefined;
+  let text: string;
+  if (typeof resp === "string") {
+    text = resp;
+  } else {
+    try {
+      text = JSON.stringify(resp) ?? "";
+    } catch {
+      return undefined;
+    }
+  }
+  text = text.trim();
+  if (!text) return undefined;
+  return text.length > MAX_TOOL_OUTPUT_CHARS ? text.slice(0, MAX_TOOL_OUTPUT_CHARS) : text;
 }
 
 async function handlePostToolUse(data: HookStdin, client: GatewayClient): Promise<string> {
@@ -152,11 +256,21 @@ async function handlePostToolUse(data: HookStdin, client: GatewayClient): Promis
   const cwd = data.cwd ?? process.cwd();
   const sessionKey = getSessionKey(cwd);
 
+  // Friction capture: on a FAILED tool call, forward a bounded slice of the raw
+  // output so the gateway can record it as a `bug` event. This is the ONLY way
+  // memory ever sees the workshop — readAllTurns (capture) drops tool traffic by
+  // design, so before this a repeated technical failure was invisible to the
+  // Mistake Notebook. Bounded here (not just gateway-side) to keep the hook
+  // payload small; secrets are redacted gateway-side before anything is stored.
+  const toolOutputText =
+    data.tool_output_is_error === true ? stringifyToolOutput(data.tool_response) : undefined;
+
   let context = await client.observe({
     toolName,
     sessionKey,
     toolInput: data.tool_input,
     toolOutputIsError: data.tool_output_is_error,
+    toolOutputText,
   });
   if (!context) return "";
 
@@ -171,7 +285,11 @@ async function handlePostToolUse(data: HookStdin, client: GatewayClient): Promis
   });
 }
 
-async function handleStop(data: HookStdin, client: GatewayClient): Promise<string> {
+async function handleStop(
+  data: HookStdin,
+  client: GatewayClient,
+  dataDirIn: string,
+): Promise<string> {
   if (data.stop_hook_active === true) return "";
   if (!data.transcript_path) return "";
 
@@ -182,19 +300,33 @@ async function handleStop(data: HookStdin, client: GatewayClient): Promise<strin
   await waitForTranscriptStable(data.transcript_path, 2_000);
 
   const allTurns = await readAllTurns(data.transcript_path);
-  if (allTurns.length === 0) return "";
+  if (allTurns.length === 0) {
+    // Audit trail: a Stop that captures nothing must still say so. Silence
+    // here is exactly how 10 days of memory went missing unnoticed.
+    await safeLog(
+      join(dataDirIn, "hook.log"),
+      `stop: 0 turni leggibili da ${data.transcript_path} — niente da salvare`,
+    );
+    return "";
+  }
 
   // Persist a per-session cursor so the next Stop only sends turns appended
   // after this one. Without it, every Stop posts the latest N turns and the
   // Gateway writes them to L0 again, duplicating long sessions across calls.
-  const dataDir = resolveDataDir();
+  const dataDir = dataDirIn;
   const cursorId = sanitizeCursorId(
     data.session_id ?? (basename(data.transcript_path).replace(/\.jsonl$/, "") || "default"),
   );
   const lastSent = await readCursor(dataDir, cursorId);
 
   let newTurns = allTurns.slice(lastSent);
-  if (newTurns.length === 0) return "";
+  if (newTurns.length === 0) {
+    await safeLog(
+      join(dataDirIn, "hook.log"),
+      `stop: nessun turno nuovo (${allTurns.length} totali, cursore a ${lastSent})`,
+    );
+    return "";
+  }
 
   // Bound the first capture so a pre-existing long transcript doesn't dump
   // hundreds of turns in a single /capture request.
@@ -222,18 +354,36 @@ async function handleStop(data: HookStdin, client: GatewayClient): Promise<strin
     session_id: data.session_id,
   });
   if (captureResult === null) {
-    // Phase 3: NO SILENT FAILURE — write to stderr so Claude Code surfaces
-    // this in the UI instead of silently writing to a log nobody reads.
-    process.stderr.write(
-      "⚠️ TencentDB: session NOT saved — gateway may be down or the token is stale. " +
-      "Run C:\\Users\\lo\\tdai-gateway\\start-gateway.ps1 to restart it.\n",
+    // NO SILENT FAILURE: stderr now, and a breadcrumb that the NEXT prompt
+    // turns into a systemMessage the user cannot miss.
+    await raiseAlarm(
+      dataDir,
+      "capture-failed",
+      `sessione NON salvata (${newTurns.length} turni persi) — gateway giù o token scaduto`,
     );
-    // Also log to hook.log so the failure is visible in /memory-status.
     await safeLog(join(dataDir, "hook.log"), "stop: captureTurn failed after retry — session not saved");
     // Do NOT advance the cursor: next Stop will retry the unsent turns.
     return "";
   }
+  // A 200 response is not proof of a write: the gateway reports how many L0
+  // rows it actually persisted. Zero means the turns evaporated, which is the
+  // failure mode most likely to go unnoticed — so it gets its own alarm and
+  // the cursor does NOT advance.
+  if (captureResult.l0_recorded === 0) {
+    await raiseAlarm(
+      dataDir,
+      "capture-empty",
+      `il gateway ha risposto OK ma non ha scritto nulla (${newTurns.length} turni)`,
+    );
+    return "";
+  }
+  await clearAlarm(dataDir, "capture-failed");
+  await clearAlarm(dataDir, "capture-empty");
   await writeCursor(dataDir, cursorId, allTurns.length);
+  await safeLog(
+    join(dataDir, "hook.log"),
+    `stop: salvati ${captureResult.l0_recorded} messaggi (${newTurns.length} turni) — cursore ${lastSent}→${allTurns.length}`,
+  );
   return "";
 }
 
@@ -258,95 +408,28 @@ async function waitForTranscriptStable(path: string, maxMs: number): Promise<voi
   }
 }
 
-const PLUGIN_NAME = "tdai-memory";
-
-interface DataDirCandidate {
+/**
+ * Resolve the gateway data directory. See ./data-dir.ts for the full story —
+ * in short, this used to count `..` hops and broke the day Claude Code changed
+ * the plugin install layout, which silently stopped capture for 10 days.
+ */
+function resolveDataDirWithSource(): {
   dir: string;
-  pid: number;
-  mtimeMs: number;
+  source: DataDirSource;
+  isBackup: boolean;
+} {
+  let scriptPath: string;
+  try {
+    scriptPath = fileURLToPath(import.meta.url);
+  } catch {
+    scriptPath = process.argv[1] ?? "";
+  }
+  const res = resolveDataDirDetailed({ scriptPath });
+  return { dir: res.dir, source: res.source, isBackup: res.chosenIsBackup };
 }
 
-/**
- * Resolve the gateway data directory.
- *
- * We cannot trust process.env.CLAUDE_PLUGIN_DATA here: Claude Code injects a
- * single plugin's CLAUDE_PLUGIN_DATA into the generic Bash environment, and for
- * slash-command / skill invocations (e.g. /memory-search) it routinely points
- * at a DIFFERENT plugin's data dir. Hooks receive the correct per-plugin value,
- * skills do not — so trusting the env var alone makes every manual search and
- * status check resolve to the wrong dir and return empty.
- *
- * Instead we discover our own data dirs from this script's real on-disk
- * location (env-independent) and pick the one whose daemon PID is actually
- * alive — the gateway that is really running. Ties, and the case where no PID
- * is alive, fall back to the most recently updated state.json.
- */
 function resolveDataDir(): string {
-  const candidates = findOwnDataDirs();
-  if (candidates.length > 0) {
-    const alive = candidates.filter((c) => isPidAlive(c.pid));
-    const pool = alive.length > 0 ? alive : candidates;
-    pool.sort((a, b) => b.mtimeMs - a.mtimeMs);
-    return pool[0].dir;
-  }
-  // Nothing discoverable on disk: trust the env var only if it is ours,
-  // otherwise the home-dir fallback (never a foreign plugin's dir).
-  const env = process.env.CLAUDE_PLUGIN_DATA;
-  if (env && basename(env).startsWith(PLUGIN_NAME)) return env;
-  return join(homedir(), ".tdai-memory");
-}
-
-/**
- * Discover this plugin's data dirs under <plugins>/data, located via the
- * script's own path: <plugins>/<marketplace>/plugin/dist/lib/hook.mjs.
- */
-function findOwnDataDirs(): DataDirCandidate[] {
-  const root = pluginsDataRoot();
-  if (!root) return [];
-  let names: string[];
-  try {
-    names = readdirSync(root);
-  } catch {
-    return [];
-  }
-  const out: DataDirCandidate[] = [];
-  for (const name of names) {
-    if (!name.startsWith(PLUGIN_NAME)) continue;
-    const dir = join(root, name);
-    const statePath = join(dir, "state.json");
-    try {
-      const mtimeMs = statSync(statePath).mtimeMs;
-      const parsed = JSON.parse(readFileSync(statePath, "utf-8")) as { pid?: unknown };
-      const pid = typeof parsed.pid === "number" ? parsed.pid : 0;
-      out.push({ dir, pid, mtimeMs });
-    } catch {
-      // No readable state.json → not a usable candidate.
-    }
-  }
-  return out;
-}
-
-function pluginsDataRoot(): string | null {
-  try {
-    const self = fileURLToPath(import.meta.url);
-    // dist/lib/hook.mjs -> up 4 (lib, dist, plugin, <marketplace>) -> <plugins> -> data
-    const root = join(dirname(self), "..", "..", "..", "..", "data");
-    return existsSync(root) ? root : null;
-  } catch {
-    return null;
-  }
-}
-
-/** True if a process with this PID currently exists (POSIX + Windows). */
-function isPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    // EPERM => the process exists but we lack permission to signal it.
-    return (err as NodeJS.ErrnoException).code === "EPERM";
-  }
+  return resolveDataDirWithSource().dir;
 }
 
 function sanitizeCursorId(id: string): string {
@@ -557,8 +640,37 @@ async function main(): Promise<void> {
   const event = (process.argv[2] ?? "") as HookEvent;
   const args = process.argv.slice(3);
 
-  const dataDir = resolveDataDir();
+  const { dir: dataDir, source: dataDirSource, isBackup: dataDirIsBackup } =
+    resolveDataDirWithSource();
   const logPath = join(dataDir, "hook.log");
+
+  // NO SILENT FAILURE #1: losing our own data dir is what actually happened on
+  // 2026-08-13 (Claude Code changed the plugin install layout). Everything
+  // downstream then failed with "no daemon, skipped" in a log nobody reads.
+  if (dataDirSource === "fallback") {
+    await raiseAlarm(
+      dataDir,
+      "data-dir-lost",
+      "il plugin non trova la cartella del gateway — cattura e recall SPENTI",
+    );
+  } else {
+    await clearAlarm(dataDir, "data-dir-lost");
+  }
+
+  // NO SILENT FAILURE #1b: landing on an ARCHIVE is worse than landing nowhere.
+  // On 2026-08-23 the live state.json was truncated to 0 bytes while the gateway
+  // was running, and a two-month-old `*.BACKUP-*` dir became the only parseable
+  // candidate. Writing there would bury every new memory in a stale database
+  // while everything looked healthy.
+  if (dataDirIsBackup) {
+    await raiseAlarm(
+      dataDir,
+      "writing-to-backup",
+      "la memoria sta puntando a una cartella di BACKUP — i nuovi ricordi finirebbero in un archivio vecchio",
+    );
+  } else {
+    await clearAlarm(dataDir, "writing-to-backup");
+  }
 
   try {
     const stdin = await readStdin();
@@ -598,6 +710,22 @@ async function main(): Promise<void> {
 
     if (!state) {
       await safeLog(logPath, `${event}: no daemon, skipped`);
+      // NO SILENT FAILURE #2: "no daemon, skipped" means memory is OFF. It was
+      // logged 6 times over 10 days and nobody ever saw it. `user-prompt-submit`
+      // is excluded only because it is the hook that DELIVERS alarms — it
+      // already reports the condition below, without recording itself.
+      if (event !== "user-prompt-submit") {
+        await raiseAlarm(
+          dataDir,
+          "gateway-unreachable",
+          "nessun gateway attivo — la sessione NON viene salvata",
+        );
+      } else {
+        const line = await drainAlarms(dataDir);
+        const msg =
+          line || "🚨 SINAPSYS — la memoria NON sta funzionando: nessun gateway attivo";
+        process.stdout.write(JSON.stringify({ systemMessage: msg }));
+      }
       return;
     }
 
@@ -617,11 +745,51 @@ async function main(): Promise<void> {
       tokenPath: state.tokenPath,
     });
 
-    const out = await handleHook(event, { stdin, client, args });
+    const out = await handleHook(event, { stdin, client, args, dataDir });
     if (out) process.stdout.write(out);
   } catch (err) {
     await safeLog(logPath, `${event}: ${(err as Error).message}`);
+    // NO SILENT FAILURE #3: this catch used to STOP at the line above. Every
+    // exception raised after the data dir was resolved — a missing token file,
+    // a corrupted state.json, a bug in any handler — turned recall AND capture
+    // off while writing one line into the file nobody reads. Same shape as the
+    // 2026-08-13 → 08-22 outage; none of the seven tripwires can see it,
+    // because they all live inside the try block that never completes.
+    // Verified live on 2026-08-23: with the token file removed, session-start,
+    // user-prompt-submit and stop all exited 0 and said nothing at all.
+    await reportHookCrash(dataDir, event, err);
+    // The prompt hook is the only channel Claude Code renders to the user, so
+    // when IT is the one that crashed, it must still speak before it dies.
+    if (event === "user-prompt-submit") {
+      try {
+        const line = await drainAlarms(dataDir);
+        if (line) process.stdout.write(JSON.stringify({ systemMessage: line }));
+      } catch {
+        // fail-open: an alarm that breaks the conversation is worse than the bug.
+      }
+    }
   }
+}
+
+/** Max chars of an error message forwarded to the user-facing alarm. */
+const MAX_CRASH_MESSAGE_CHARS = 200;
+
+/**
+ * Turn an unexpected exception into a signal Lorenzo actually sees.
+ * Never throws: reporting a failure must not become one.
+ */
+export async function reportHookCrash(
+  dataDir: string,
+  event: string,
+  err: unknown,
+): Promise<void> {
+  const raw = err instanceof Error ? err.message : String(err);
+  const detail = raw.slice(0, MAX_CRASH_MESSAGE_CHARS);
+  await raiseAlarm(
+    dataDir,
+    "hook-crashed",
+    `la memoria si è fermata con un errore (${event}) — nulla viene salvato né richiamato: ${detail}`,
+  );
 }
 
 function readStdin(): Promise<string> {

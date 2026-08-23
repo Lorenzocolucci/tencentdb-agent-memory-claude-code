@@ -29,6 +29,14 @@ export interface HealthResponse {
    * The result is cached (see HEALTH_EMBEDDING_TTL_MS) so /health stays cheap.
    */
   embedding: "ok" | "failing";
+  /**
+   * ISO timestamp of the newest captured message, or null when unknown/empty.
+   *
+   * NO SILENT FAILURE: "the gateway answers" and "the gateway is still being
+   * fed" are different questions. From 2026-08-13 to 08-22 the first was true
+   * and the second false, and nothing in /health could tell them apart.
+   */
+  last_capture_at?: string | null;
 }
 
 // ============================
@@ -60,6 +68,12 @@ export interface ObserveRequest {
   tool_name: string;
   tool_input?: unknown;
   tool_output_is_error?: boolean;
+  /**
+   * Raw tool output when the call FAILED. Feeds friction capture (the workshop
+   * view): the failure becomes a `bug` event so recurring technical failures can
+   * finally cluster into lessons. Ignored when tool_output_is_error is not true.
+   */
+  tool_output_text?: string;
 }
 
 export interface ObserveResponse {

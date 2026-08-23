@@ -106,7 +106,33 @@ export interface KbRecallOptions {
    * source. First step of the associative-first recall redesign, NOT a DB patch.
    */
   skipVector?: boolean;
+  /**
+   * Ablation flag (default false). When true, kbRecall runs as a FLAT hybrid
+   * retriever: only the FTS + vector candidate sources fuse via RRF, with the
+   * entity-name graph source (Source C) AND Implicit Priming / spreading
+   * activation DISABLED. This is the "what a normal RAG memory does" baseline
+   * used by the LongMemEval harness to isolate Sinapsys's associative edge
+   * (full − flat). Not used by any live path; default keeps full behavior.
+   */
+  flat?: boolean;
+  /**
+   * Consolidation → recall wire (default false / OFF, live behaviour unchanged).
+   * When true, each candidate's `memory_lifecycle` row (reinforcement count +
+   * tier, written by runConsolidation) is read in ONE batched query and folded
+   * into the importance boost, so what recurs over time ranks higher. Purely
+   * additive: a candidate with no reinforcement scores exactly as it does today.
+   * Fail-open: if the store cannot answer, ranking is unchanged.
+   */
+  consolidationBoost?: boolean;
   logger?: Logger;
+}
+
+/** Lifecycle signal used by the consolidation boost (subset of memory_lifecycle). */
+interface LifecycleSignal {
+  reinforcementCount: number;
+  tier: string;
+  permanence: number;
+  state: string;
 }
 
 // ============================
@@ -415,6 +441,37 @@ function eventImportance(): number {
   return 0.5;
 }
 
+/**
+ * Consolidation term in [0,1] — the READ side of the consolidation → recall wire.
+ *
+ * `runConsolidation` reinforces what recurs and promotes durable memories to the
+ * `long` tier, but the ranking never read any of it: a fact confirmed 332 times
+ * ranked exactly like one said once by mistake. This turns that stored evidence
+ * into a ranking signal.
+ *
+ * Log-scaled with diminishing returns (r=0 → 0, r=3 → ~0.58, r≥10 → 1) so a
+ * single hot memory cannot run away with the ranking, plus a flat bonus for the
+ * `long` tier (it survived the promotion thresholds). Non-active memories score
+ * 0 — decayed/archived material must never be boosted.
+ */
+function consolidationScore(life: LifecycleSignal | undefined): number {
+  if (!life) return 0;
+  if (life.state !== "active") return 0;
+  const repetition = clamp01(Math.log1p(Math.max(0, life.reinforcementCount)) / Math.log1p(10));
+  const durable = life.tier === "long" ? 1 : 0;
+  return clamp01(0.7 * repetition + 0.3 * durable);
+}
+
+/**
+ * Blend the consolidation term into a base importance, ADDITIVELY: it closes part
+ * of the gap to the maximum and can never lower a score. consolidation = 0 leaves
+ * the value bit-identical to the pre-wire behaviour, so an un-reinforced corpus
+ * ranks exactly as before (no regression by construction).
+ */
+function withConsolidation(base: number, consolidation: number): number {
+  return clamp01(base + consolidation * (1 - base));
+}
+
 // ============================
 // Calibration (0-1 interpretable relevance — NEVER raw RRF)
 // ============================
@@ -465,6 +522,8 @@ export async function kbRecall(
     rerank = false,
     embeddingTimeoutMs,
     skipVector = false,
+    flat = false,
+    consolidationBoost = false,
     logger,
   } = options;
 
@@ -490,7 +549,11 @@ export async function kbRecall(
     skipVector
       ? Promise.resolve<RankedCandidate[]>([])
       : recallVector(store, embeddingService, cleanQuery, candidateLimit, embeddingCallOpts, logger),
-    Promise.resolve(recallEntityMatch(store, cleanQuery, namespace, candidateLimit, logger)),
+    // Source C (entity-name graph match) is the associative seed. `flat` disables
+    // it so the ablation baseline is pure FTS+vector hybrid RRF.
+    flat
+      ? Promise.resolve<RankedCandidate[]>([])
+      : Promise.resolve(recallEntityMatch(store, cleanQuery, namespace, candidateLimit, logger)),
   ]);
 
   if (
@@ -532,17 +595,27 @@ export async function kbRecall(
   // ── Reweight by recency + importance (relevance stays primary), then sort.
   //    The recency/importance boosts apply to the RRF magnitude for ORDERING;
   //    the user-facing score is the separate calibrated 0-1 value below.
+  //    When the consolidation wire is on, fold each candidate's stored
+  //    reinforcement/tier into its importance FIRST (one batched read).
+  const lifecycle = consolidationBoost
+    ? readCandidateLifecycle(store, rendered, namespace, logger)
+    : undefined;
+
   const nowMs = Date.now();
   const reweighted = rendered.map((r) => {
     const recencyBoosted = applyRecencyBoost(r.fused.rrfScore, r.ts, nowMs);
-    const ranking = recencyBoosted * (1 + IMPORTANCE_WEIGHT * r.importance);
+    const importance = lifecycle
+      ? withConsolidation(r.importance, consolidationScore(lifecycle.get(r.result.owner_id)))
+      : r.importance;
+    const ranking = recencyBoosted * (1 + IMPORTANCE_WEIGHT * importance);
     return { rendered: r, ranking };
   });
 
   // ── Implicit Priming (Idea 2): BEFORE the cut, let sub-threshold candidates amplify
   //    graph-connected ones (co-occurrence ∪ relations) so a weak-but-connected memory
   //    can cross into the top-K — the primer stays invisible. Best-effort, fail-open.
-  primeRankings(reweighted, store, namespace, logger);
+  //    Disabled under `flat` (ablation baseline = no associative amplification).
+  if (!flat) primeRankings(reweighted, store, namespace, logger);
 
   reweighted.sort((a, b) => b.ranking - a.ranking);
 
@@ -575,6 +648,32 @@ function clamp01(value: number): number {
 /** Normalize a raw owner_kind string to the two kinds kbRecall returns. */
 function normalizeOwnerKind(kind: string): KbRecallOwnerKind {
   return kind === "event" ? "event" : "fact";
+}
+
+/**
+ * Read the lifecycle rows for every rendered candidate in ONE batched query.
+ * Duck-typed + fail-open (same contract as candidateAdjacency): a store without
+ * the method, or any failure, yields undefined → ranking stays exactly as it is
+ * without the consolidation wire.
+ */
+function readCandidateLifecycle(
+  store: IMemoryStore,
+  rendered: RenderedCandidate[],
+  namespace: string,
+  logger?: Logger,
+): Map<string, LifecycleSignal> | undefined {
+  try {
+    const fn = (store as {
+      candidateLifecycle?: (ids: string[], ns: string) => Map<string, LifecycleSignal>;
+    }).candidateLifecycle;
+    if (typeof fn !== "function") return undefined;
+    const ids = rendered.map((r) => r.result.owner_id).filter(Boolean);
+    if (ids.length === 0) return undefined;
+    return fn.call(store, ids, namespace);
+  } catch (err) {
+    logger?.warn?.(`${TAG} consolidation lifecycle read failed (non-fatal): ${errMsg(err)}`);
+    return undefined;
+  }
 }
 
 /**

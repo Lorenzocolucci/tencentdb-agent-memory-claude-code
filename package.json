@@ -29,7 +29,8 @@
     "test:cc-plugin": "vitest run claude-code-plugin/tests/",
     "build:all": "npm run build && npm run build:cc-plugin",
     "test:cc-plugin:e2e": "vitest run -c claude-code-plugin/vitest.e2e.config.ts",
-    "postinstall": "bash scripts/openclaw-after-tool-call-messages.patch.sh 2>/dev/null || true"
+    "postinstall": "bash scripts/openclaw-after-tool-call-messages.patch.sh 2>/dev/null || true",
+    "install:cc-plugin": "node scripts/install-cc-plugin.mjs"
   },
   "files": [
     "dist/",

@@ -45,11 +45,13 @@ import {
 import { inferTaskType } from "./hooks/task-type.js";
 import { buildSituationInjection } from "./hooks/fingerprint-injection.js";
 import { canonicalKey } from "./kb/kb-queries.js";
+import { buildFrictionEvent, createFrictionState, type FrictionState } from "./kb/friction-capture.js";
 import { applyKbDelta, type KbWriterStore, type ApplyKbDeltaResult } from "./kb/kb-writer.js";
 import type { KbDelta } from "./kb/extraction-schema.js";
 import { performAutoRecall } from "./hooks/auto-recall.js";
 import { SessionBannerTracker } from "./hooks/session-banner.js";
 import { CornerstoneInjectionTracker, buildCornerstones } from "./distinctiveness/cornerstone-runner.js";
+import { beginHeavyTask, endHeavyTask } from "./diagnostics/inflight-registry.js";
 import { CornerstoneSessionCache } from "./distinctiveness/cornerstone-cache.js";
 import { renderGroundedTrustInterrupt } from "./kb/grounded-trust-ask.js";
 import { performAutoCapture } from "./hooks/auto-capture.js";
@@ -69,6 +71,31 @@ import { MemoryPipelineManager } from "../utils/pipeline-manager.js";
 import { CheckpointManager } from "../utils/checkpoint.js";
 import { SessionFilter } from "../utils/session-filter.js";
 import { StandaloneLLMRunnerFactory } from "../adapters/standalone/llm-runner.js";
+
+/**
+ * Hand control back to the event loop. Used before any step that does
+ * seconds of SYNCHRONOUS work, so the current response flushes first.
+ */
+/**
+ * Minimum gap between distillation passes.
+ *
+ * They used to fire on the FIRST TURN OF EVERY SESSION. Each of the three steps
+ * re-clusters the whole failure corpus from scratch — pairwise comparison over
+ * 1.706 bug events, ~6 s of synchronous work each, ~18 s in total (measured on
+ * the live DB, 2026-08-22). Deferring that to a macrotask stops it blocking the
+ * turn that scheduled it, but it still blocks every OTHER request while it runs:
+ * first-turn recall went 11,5 s → 1,9 s for the first session and 18 s for the
+ * next, because the previous session's passes were still churning.
+ *
+ * The passes are also idempotent and their input moves on a scale of days, so
+ * running them once per session was pure waste. Half an hour keeps the Mistake
+ * Notebook growing while making a collision with a live turn rare.
+ */
+const DISTILLATION_COOLDOWN_MS = 30 * 60 * 1000;
+
+function yieldToMacrotask(): Promise<void> {
+  return new Promise<void>((resolve) => setImmediate(resolve));
+}
 
 const TAG = "[memory-tdai] [core]";
 
@@ -167,6 +194,12 @@ export class TdaiCore {
    * of currently-running background tasks.
    */
   private readonly bgTasks = new Set<Promise<void>>();
+  /**
+   * When the distillation passes may next run. See DISTILLATION_COOLDOWN_MS —
+   * they are expensive and their input (recurring-failure clusters) changes over
+   * days, not over minutes.
+   */
+  private distillationNextAllowedAt = 0;
 
   /**
    * Files whose proactive memory has already been injected in a given session
@@ -188,6 +221,8 @@ export class TdaiCore {
    * across both injection paths. Cleared in {@link handleSessionEnd}.
    */
   private readonly injectedOwnersBySession = new Map<string, Set<string>>();
+  /** Per-session friction de-dup + flood budget (see friction-capture.ts). */
+  private readonly frictionStateBySession = new Map<string, FrictionState>();
 
   /**
    * Tracks which sessionKeys have already fired the session-open banner.
@@ -446,6 +481,12 @@ export class TdaiCore {
     await this.storeReady?.catch(() => {});
     await this.ensureSchedulerStarted();
 
+    // USEFULNESS VERDICT: the turn is the first moment the agent's reply exists,
+    // so it is the only moment memory can be judged on what it CHANGED rather
+    // than on what it retrieved. Cheap (string work over ≤25 rows), synchronous,
+    // and swallowed on failure — a verdict must never cost a capture.
+    this.judgeRecallUsefulness(turn);
+
     return performAutoCapture({
       messages: turn.messages,
       sessionKey: turn.sessionKey,
@@ -461,6 +502,54 @@ export class TdaiCore {
       embeddingService: this.embeddingService,
       bgTaskRegistry: this.bgTasks,
     });
+  }
+
+  /**
+   * Settle the recall ledger for this session against the turn just committed.
+   *
+   * Uses the WHOLE turn as evidence — every user message concatenated as the
+   * prompt, every assistant message as the reply — because a memory injected on
+   * one prompt often pays off two replies later. The judgement subtracts the
+   * user's own vocabulary, so an echo can never be counted as usefulness
+   * (see kb/recall-usage.ts).
+   */
+  private judgeRecallUsefulness(turn: CompletedTurn): void {
+    const store = this.vectorStore as {
+      judgePendingRecalls?: (p: {
+        sessionKey: string; userText: string; assistantText: string; now: string;
+      }) => { injected: number; used: number; unjudgeable: number; expired: number };
+    } | undefined;
+    if (!store || typeof store.judgePendingRecalls !== "function" || !turn.sessionKey) return;
+
+    try {
+      const messages = turn.messages ?? [];
+      const userText = [
+        turn.userText ?? "",
+        ...messages.filter((m) => m.role === "user").map((m) => m.content ?? ""),
+      ].join("\n");
+      const assistantText = messages
+        .filter((m) => m.role === "assistant")
+        .map((m) => m.content ?? "")
+        .join("\n");
+      if (!assistantText) return;
+
+      const v = store.judgePendingRecalls({
+        sessionKey: turn.sessionKey,
+        userText,
+        assistantText,
+        now: new Date().toISOString(),
+      });
+      if (v.injected > 0 || v.expired > 0) {
+        this.logger.debug?.(
+          `${TAG} [verdict] ${v.used}/${v.injected} ricordi usati ` +
+            `(non giudicabili=${v.unjudgeable}, scaduti=${v.expired})`,
+        );
+      }
+    } catch (err) {
+      this.logger.warn(
+        `${TAG} [verdict] judging failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   /**
@@ -480,6 +569,7 @@ export class TdaiCore {
       // (default "l1" → existing behavior unchanged).
       recallSource: this.cfg.recall.source,
       rerank: this.cfg.recall.rerank,
+      consolidationBoost: this.cfg.recall.consolidationBoost,
     });
 
     return {
@@ -666,13 +756,24 @@ export class TdaiCore {
    * no cluster → no LLM; idempotent (already-distilled skipped) → safe on both.
    */
   private scheduleBackgroundDistillation(): void {
+    // Cooldown BEFORE anything else: cheapest possible no-op on the hot path.
+    const now = Date.now();
+    if (now < this.distillationNextAllowedAt) {
+      this.logger.debug?.(`${TAG} [distillation] skipped (cooldown)`);
+      return;
+    }
+    this.distillationNextAllowedAt = now + DISTILLATION_COOLDOWN_MS;
+
     const runnerFactory = this.runnerFactory;
     const logger = this.logger;
+
+    /** Heavy steps, run one at a time AFTER the caller's response has flushed. */
+    const steps: Array<{ name: string; run: () => Promise<void> }> = [];
 
     // Track B (Mistake Notebook): recurring-failure clusters → lessons.
     if (this.vectorStore?.runLessonDistillation) {
       const store = this.vectorStore;
-      const distillTask = (async () => {
+      steps.push({ name: "lessons", run: async () => {
         try {
           const runner = runnerFactory.createRunner({ enableTools: false });
           const stats = await store.runLessonDistillation!(runner, {
@@ -692,9 +793,7 @@ export class TdaiCore {
             `${TAG} [lessons] distillation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
           );
         }
-      })();
-      this.bgTasks.add(distillTask);
-      void distillTask.then(() => this.bgTasks.delete(distillTask));
+      } });
     }
 
     // Pilastro C Fase 2 ("dimenticare con gusto"): recurring cross-session
@@ -702,7 +801,7 @@ export class TdaiCore {
     // via Fase 1, never deleted).
     if (typeof this.vectorStore?.insertEvent === "function" && typeof this.vectorStore?.listRecentEvents === "function") {
       const store = this.vectorStore;
-      const principleTask = (async () => {
+      steps.push({ name: "principles", run: async () => {
         try {
           const runner = runnerFactory.createRunner({ enableTools: false });
           const stats = await distillPrinciples(store, runner, {
@@ -722,9 +821,7 @@ export class TdaiCore {
             `${TAG} [principles] distillation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
           );
         }
-      })();
-      this.bgTasks.add(principleTask);
-      void principleTask.then(() => this.bgTasks.delete(principleTask));
+      } });
     }
 
     // Percorso B (behavioral notebook) — recurring cross-session BEHAVIORAL
@@ -733,7 +830,7 @@ export class TdaiCore {
     // Deterministic, no LLM. CONSERVATIVE: additive only. Fire-and-forget.
     if (typeof this.vectorStore?.runUsageDistillation === "function") {
       const store = this.vectorStore;
-      const usageTask = (async () => {
+      steps.push({ name: "usage", run: async () => {
         try {
           const runner = runnerFactory.createRunner({ enableTools: false });
           const stats = await store.runUsageDistillation!(runner, {
@@ -757,9 +854,43 @@ export class TdaiCore {
             `${TAG} [usage] distillation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
           );
         }
+      } });
+    }
+
+    if (steps.length === 0) return;
+
+    // WHY THE YIELD (measured 2026-08-22, live DB)
+    // -------------------------------------------
+    // "Detached" was a lie. An async function body runs SYNCHRONOUSLY until its
+    // first await — and `await store.runLessonDistillation(...)` must first
+    // EVALUATE that call, whose own body reaches `selectFailureClusters(db, …)`,
+    // which is fully synchronous and took **6.2 s** on the live DB (1.699 bug
+    // events). Three such steps ran back to back on the caller's stack, so the
+    // first turn of every session paid ~11 s: /recall answered in 274 ms
+    // internally but 11.500 ms at the socket, blowing the plugin's 6 s budget.
+    // Result: the session-open injection — banner included — was dropped in
+    // EVERY project. Yielding to a macrotask first hands the response back to
+    // the socket before any of this runs; stepping one at a time (with a yield
+    // between) keeps at most one blocking stretch in flight, so a live recall
+    // can slip in between them. Same pattern as scheduleConsolidation.
+    // Each step keeps its OWN bgTasks entry (a shutdown drain must still await
+    // each one), but they are chained so only one blocking stretch is ever in
+    // flight, with a macrotask yield before each.
+    let previous: Promise<void> = Promise.resolve();
+    for (const step of steps) {
+      const task = (async () => {
+        await previous;
+        await yieldToMacrotask();
+        const token = beginHeavyTask(`distillation:${step.name}`);
+        try {
+          await step.run();
+        } finally {
+          endHeavyTask(token);
+        }
       })();
-      this.bgTasks.add(usageTask);
-      void usageTask.then(() => this.bgTasks.delete(usageTask));
+      previous = task;
+      this.bgTasks.add(task);
+      void task.then(() => this.bgTasks.delete(task));
     }
   }
 
@@ -859,6 +990,79 @@ export class TdaiCore {
   }
 
   /**
+   * Friction capture (the "workshop" view): persist a FAILED tool call as a
+   * `bug` event so recurring technical failures can finally cluster into
+   * lessons. Synchronous + fully guarded — the caller wraps it in try/catch and
+   * the turn proceeds regardless.
+   *
+   * Design notes:
+   *  - one-off failures are harmless: the Mistake Notebook only distils a lesson
+   *    when the same failure recurs across >= 2 sessions;
+   *  - dedupe + per-session cap live in friction-capture.ts (pure, unit-tested);
+   *  - the failing file, when known, is linked as an entity so the proactive
+   *    file injection can surface the lesson exactly when that file is touched.
+   */
+  private recordFriction(
+    store: IMemoryStore,
+    obs: { sessionKey: string; toolName: string; toolInput: unknown; toolOutputText?: string },
+  ): string | undefined {
+    if (typeof store.insertEvent !== "function") return undefined;
+
+    let state = this.frictionStateBySession.get(obs.sessionKey);
+    if (!state) {
+      state = createFrictionState();
+      this.frictionStateBySession.set(obs.sessionKey, state);
+    }
+
+    const ev = buildFrictionEvent(
+      {
+        sessionKey: obs.sessionKey,
+        toolName: obs.toolName,
+        toolInput: obs.toolInput,
+        errorText: obs.toolOutputText,
+        atMs: Date.now(),
+      },
+      state,
+    );
+    if (!ev) return undefined;
+
+    // Link the failing file (when there is one) so the lesson can later be
+    // surfaced by the file-touch injection path.
+    const entities: string[] = [];
+    if (ev.filePath && typeof store.resolveOrCreateEntity === "function") {
+      try {
+        const ent = store.resolveOrCreateEntity({
+          type: "file",
+          name: ev.filePath,
+          now: new Date().toISOString(),
+        });
+        if (ent?.id) entities.push(ent.id);
+      } catch {
+        /* entity resolution is best-effort */
+      }
+    }
+
+    const now = new Date().toISOString();
+    store.insertEvent({
+      ts: now,
+      recordedAt: now,
+      sessionKey: obs.sessionKey,
+      namespace: NAMESPACE,
+      type: "bug",
+      text: ev.text,
+      entities,
+    });
+    this.logger.debug?.(`${TAG} [friction] recorded: ${ev.text.slice(0, 80)}`);
+    if (ev.isLoop) {
+      this.logger.info(
+        `${TAG} [friction] LOOP detected (${ev.repeatCount}x) — warning injected: ${ev.text.slice(0, 80)}`,
+      );
+    }
+    // Only a LOOP talks back: a first-time failure is normal work, a thrash is not.
+    return ev.warning;
+  }
+
+  /**
    * Handle a PostToolUse observation. Two proactive-injection paths, both
    * silent-unless-relevant and never throwing (memory must not break the turn):
    *
@@ -877,11 +1081,30 @@ export class TdaiCore {
     toolName: string;
     toolInput: unknown;
     toolOutputIsError?: boolean;
+    /** Raw output of a FAILED tool call (friction capture input). */
+    toolOutputText?: string;
   }): Promise<{ inject?: string }> {
     if (!obs.sessionKey) return {};
     await this.storeReady?.catch(() => {});
     const store = this.vectorStore;
     if (!store) return {};
+
+    // ── Friction capture: let memory SEE the workshop ──
+    // A failed tool call becomes a `bug` event — the exact input bug-clusters
+    // already consumes. One-offs stay harmless noise; only failures that recur
+    // across sessions become a lesson (EVIDENCE_MIN/SESSION_MIN), which is the
+    // "patterns, never anecdotes" rule. Never on the critical path: fully
+    // guarded, errors swallowed, recall/injection continues regardless.
+    let frictionWarning: string | undefined;
+    if (obs.toolOutputIsError === true && obs.toolOutputText) {
+      try {
+        frictionWarning = this.recordFriction(store, obs);
+      } catch (err) {
+        this.logger.debug?.(
+          `${TAG} [friction] capture failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
 
     const situation = extractSituation({
       toolName: obs.toolName,
@@ -989,7 +1212,11 @@ export class TdaiCore {
       }
     }
 
-    return blocks.length > 0 ? { inject: blocks.join("\n\n") } : {};
+    // A detected LOOP goes FIRST and always: the whole point is to break the
+    // thrash mid-turn, before the agent retries the same failing move again.
+    // Cross-session lessons arrive weeks later; a loop needs an answer NOW.
+    const out = frictionWarning ? [frictionWarning, ...blocks] : blocks;
+    return out.length > 0 ? { inject: out.join("\n\n") } : {};
   }
 
   // ============================

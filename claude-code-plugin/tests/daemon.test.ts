@@ -49,16 +49,25 @@ describe("DaemonManager token file", () => {
     const tokenPath = await mgr.generateToken();
     const content = await readFile(tokenPath, "utf-8");
     expect(content).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    const st = await stat(tokenPath);
-    expect(st.mode & 0o777).toBe(0o600);
+    // POSIX modes do not exist on Windows: fs.chmod is a no-op there and the
+    // implementation skips the same check (lib/daemon.ts:87). Assert what the
+    // platform can actually enforce — the token itself is checked above on
+    // every platform.
+    if (process.platform !== "win32") {
+      const st = await stat(tokenPath);
+      expect(st.mode & 0o777).toBe(0o600);
+    }
   });
 
-  it("readToken throws when permission is too loose", async () => {
-    const tokenPath = join(dataDir, "token");
-    await writeFile(tokenPath, "abc", { mode: 0o644 });
-    const mgr = new DaemonManager({ dataDir });
-    await expect(mgr.readToken(tokenPath)).rejects.toThrow(/permission/i);
-  });
+  it.skipIf(process.platform === "win32")(
+    "readToken throws when permission is too loose",
+    async () => {
+      const tokenPath = join(dataDir, "token");
+      await writeFile(tokenPath, "abc", { mode: 0o644 });
+      const mgr = new DaemonManager({ dataDir });
+      await expect(mgr.readToken(tokenPath)).rejects.toThrow(/permission/i);
+    },
+  );
 
   it("readToken returns the trimmed token when permission is 600", async () => {
     const tokenPath = join(dataDir, "token");

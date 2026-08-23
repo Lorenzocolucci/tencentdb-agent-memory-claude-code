@@ -24,6 +24,16 @@ import { createRequire } from "node:module";
 import type { DatabaseSync, StatementSync } from "node:sqlite";
 import type { MemoryRecord } from "../record/l1-writer.js";
 import { initFoundationsSchema } from "../kb/foundations-schema.js";
+import {
+  recordInjections,
+  judgePending,
+  readVerdict,
+  type RecordInjectionsParams,
+  type JudgePendingParams,
+  type JudgePendingResult,
+  type ReadVerdictParams,
+  type RecallVerdict,
+} from "../kb/recall-ledger.js";
 import { ensureMergedIntoColumn } from "../kb/entity-merge.js";
 import { runConsolidation, type ConsolidationStats } from "../kb/consolidation-runner.js";
 import {
@@ -2040,6 +2050,29 @@ export class VectorStore implements IMemoryStore {
     }
   }
 
+  /**
+   * ISO timestamp of the most recent L0 message, or null when memory is empty.
+   *
+   * Exposed on /health so a client can tell "the gateway is up" apart from
+   * "the gateway is up AND still being fed". Between 2026-08-13 and 08-22 the
+   * gateway answered 200 while nothing whatsoever was being written, and there
+   * was no way to see it. **Fault-tolerant**: returns null on failure.
+   */
+  lastCaptureAt(): string | null {
+    if (this.degraded) return null;
+    try {
+      const row = this.db
+        .prepare("SELECT MAX(recorded_at) AS last FROM l0_conversations")
+        .get() as { last: string | null };
+      return row?.last ?? null;
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} lastCaptureAt failed (non-fatal, returning null): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    }
+  }
+
   // ── Re-index operations ──────────────────────────────────
 
   /**
@@ -2512,6 +2545,37 @@ export class VectorStore implements IMemoryStore {
   }
 
   /**
+   * Record what recall actually injected into a turn (unjudged).
+   *
+   * Deliberately separate from reinforceRecalledOwners below: that one rewards
+   * RETRIEVAL, this one only takes note, so usefulness can later be measured
+   * instead of assumed. Never throws.
+   */
+  recordRecallInjections(params: RecordInjectionsParams): number {
+    if (this.degraded || !this.kbReady) return 0;
+    return recordInjections(this.db, params);
+  }
+
+  /** Settle the pending ledger rows of a session against the turn just captured. */
+  judgePendingRecalls(params: JudgePendingParams): JudgePendingResult {
+    if (this.degraded || !this.kbReady) {
+      return { injected: 0, used: 0, unjudgeable: 0, perMemory: [], expired: 0 };
+    }
+    return judgePending(this.db, params, this.logger);
+  }
+
+  /** Aggregate the ledger into the usefulness verdict. Read-only. */
+  readRecallVerdict(params: ReadVerdictParams = {}): RecallVerdict {
+    if (this.degraded || !this.kbReady) {
+      return {
+        judged: 0, used: 0, unjudgeable: 0, pending: 0, noise: 0,
+        usefulness: null, topUsed: [], topNoise: [],
+      };
+    }
+    return readVerdict(this.db, params);
+  }
+
+  /**
    * Hebbian reinforcement (Incremento B2a) — "ogni richiamo rinforza" (CMA:
    * every access reinforces). Bumps each surfaced owner's lifecycle reinforcement
    * (count → permanence → long-term promotion) so memories that keep being
@@ -2601,6 +2665,60 @@ export class VectorStore implements IMemoryStore {
     } catch (err) {
       this.logger?.warn?.(
         `[memory-tdai][assoc] candidateAdjacency failed (non-fatal): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return new Map();
+    }
+  }
+
+  /**
+   * Batched lifecycle read for the recall path (consolidation → recall wire).
+   *
+   * `runConsolidation` writes reinforcement/tier into `memory_lifecycle`, but the
+   * ranking in kbRecall never read it — so repetition over time had ZERO effect on
+   * what gets recalled. This is the read side of that wire.
+   *
+   * ONE query with an IN clause (the PK is (owner_id, owner_kind), so the lookup
+   * is indexed). Batched on purpose: recall is on the critical path and a
+   * per-candidate `getLifecycle()` would fire dozens of queries per recall.
+   *
+   * Never throws: any failure degrades to an empty map, i.e. exactly the
+   * pre-existing ranking behaviour (fail-open, like every other store read).
+   */
+  candidateLifecycle(
+    ownerIds: string[],
+    namespace = "default",
+  ): Map<string, { reinforcementCount: number; tier: string; permanence: number; state: string }> {
+    const out = new Map<string, { reinforcementCount: number; tier: string; permanence: number; state: string }>();
+    try {
+      const ids = [...new Set((ownerIds ?? []).filter(Boolean))];
+      if (ids.length === 0) return out;
+      const placeholders = ids.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(
+          `SELECT owner_id, reinforcement_count, tier, permanence_score, state
+             FROM memory_lifecycle
+            WHERE namespace = ? AND owner_id IN (${placeholders})`,
+        )
+        .all(namespace, ...ids) as Array<{
+        owner_id: string;
+        reinforcement_count: number;
+        tier: string;
+        permanence_score: number;
+        state: string;
+      }>;
+      for (const r of rows) {
+        out.set(r.owner_id, {
+          reinforcementCount: Number(r.reinforcement_count) || 0,
+          tier: String(r.tier ?? "short"),
+          permanence: Number(r.permanence_score) || 0,
+          state: String(r.state ?? "active"),
+        });
+      }
+      return out;
+    } catch (err) {
+      this.logger?.warn?.(
+        `[memory-tdai][assoc] candidateLifecycle failed (non-fatal): ` +
           `${err instanceof Error ? err.message : String(err)}`,
       );
       return new Map();
@@ -3988,6 +4106,8 @@ export class VectorStore implements IMemoryStore {
       now: opts.now,
       namespace: opts.namespace,
       maxClusters: opts.maxClusters,
+      // Pass the store's logger so a capped pairwise pass says so out loud.
+      logger: this.logger,
     });
     return {
       candidates: stats.candidates,

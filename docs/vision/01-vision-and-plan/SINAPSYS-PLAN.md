@@ -2,6 +2,12 @@
 > v1 — 23 giugno 2026 — Lorenzo + Claude
 > Companion di MEMORIA-BLUEPRINT.md (16/06). Il blueprint è il "cosa/perché"; questo è il "come/quanto/quando", aggiornato con ricerca web di giugno 2026.
 
+> ## ⚠️ 2026-08-07 — questo è un piano STORICO
+> Le fasi qui descritte sono **tutte costruite**. Lo stato reale, i numeri misurati e
+> **cosa manca davvero** non stanno più qui: → **[../STATO-REALE.md](../STATO-REALE.md)**.
+> Il prossimo passo è [PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md](PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md).
+> Il testo sottostante resta come traccia del ragionamento originale, non come stato.
+
 ---
 
 ## Stato implementativo (aggiornato 2026-07-18 — nota conservativa, il PIANO sotto resta invariato e vincolante)

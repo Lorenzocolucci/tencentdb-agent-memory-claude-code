@@ -1,13 +1,13 @@
 import http from "node:http";
-import { appendFile, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { URL, fileURLToPath, pathToFileURL } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, parse, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { createReadStream, existsSync, openSync, readFileSync, readdirSync, statSync } from "node:fs";
 import net from "node:net";
-import { createInterface } from "node:readline";
 import { homedir } from "node:os";
+import { createInterface } from "node:readline";
 //#region lib/gateway-client.ts
 /**
 * HTTP client for the TDAI Gateway, with Bearer token authentication and
@@ -74,6 +74,27 @@ var GatewayClient = class {
 	describeStatus(status, body) {
 		return `HTTP ${status} ${body.length > 200 ? body.slice(0, 200) + "…" : body}`;
 	}
+	/**
+	* /health with its body, so callers can see `last_capture_at`.
+	* Returns null when the gateway cannot be reached or answers non-200.
+	*/
+	async healthDetailed() {
+		try {
+			const token = await this.freshToken();
+			const { status, body } = await this.rawRequest("GET", "/health", void 0, token);
+			if (status !== 200 && status !== 503) {
+				await this.logFailure("GET", "/health", this.describeStatus(status, body));
+				return null;
+			}
+			return {
+				...JSON.parse(body),
+				reachable: true
+			};
+		} catch (err) {
+			await this.logFailure("GET", "/health", err instanceof Error ? err.message : String(err));
+			return null;
+		}
+	}
 	async health() {
 		try {
 			const token = await this.freshToken();
@@ -122,6 +143,7 @@ var GatewayClient = class {
 				session_key: payload.sessionKey,
 				tool_name: payload.toolName,
 				tool_input: payload.toolInput,
+				tool_output_text: payload.toolOutputText,
 				tool_output_is_error: payload.toolOutputIsError
 			}, token, RECALL_TIMEOUT_MS);
 			if (status !== 200) {
@@ -612,6 +634,311 @@ var DaemonManager = class {
 function sleep(ms) {
 	return new Promise((r) => setTimeout(r, ms));
 }
+/**
+* Find the plugins `data` root by walking up from the script path.
+*
+* An ancestor qualifies when `<ancestor>/data` exists AND contains at least
+* one entry whose name starts with the plugin name. Requiring one of OUR dirs
+* avoids latching onto some unrelated `data/` folder that happens to sit on
+* the path (e.g. a repo checkout with its own `data/`).
+*/
+function findPluginsDataRoot(scriptPath) {
+	let cur = dirname(scriptPath);
+	const { root } = parse(cur);
+	for (let hops = 0; hops < 32; hops++) {
+		const candidate = join(cur, "data");
+		try {
+			if (existsSync(candidate) && statSync(candidate).isDirectory()) {
+				if (readdirSync(candidate).some((n) => n.startsWith("tdai-memory"))) return candidate;
+			}
+		} catch {}
+		if (cur === root) break;
+		const parent = dirname(cur);
+		if (parent === cur) break;
+		cur = parent;
+	}
+	return null;
+}
+/**
+* True for a directory that is an archived copy, not the live store.
+*
+* WHY THIS MATTERS (found the hard way, 2026-08-23): the live dir's state.json
+* was truncated to 0 bytes while the gateway was still running, so it stopped
+* being a candidate — and a `*.BACKUP-20260614-pre-reindex` dir, whose stale
+* state.json still parsed, won the election. The plugin would then have written
+* every new memory into a two-month-old database, silently. A backup must never
+* outrank a live directory, whatever their timestamps say.
+*/
+function isBackupDir(dir) {
+	return /\.(BACKUP|bak)[-_.]/i.test(basename(dir));
+}
+/**
+* Enumerate our data dirs under a plugins `data` root, best candidate first.
+*
+* Order: PID alive, then non-backup, then newest state.json. A backup is kept
+* in the list (it may legitimately be the only thing left) but can only win
+* when nothing better exists — and the caller is told, via `chosenIsBackup`.
+*/
+function findOwnDataDirs(dataRoot) {
+	let names;
+	try {
+		names = readdirSync(dataRoot);
+	} catch {
+		return [];
+	}
+	const out = [];
+	for (const name of names) {
+		if (!name.startsWith("tdai-memory")) continue;
+		const dir = join(dataRoot, name);
+		const statePath = join(dir, "state.json");
+		try {
+			const mtimeMs = statSync(statePath).mtimeMs;
+			const parsed = JSON.parse(readFileSync(statePath, "utf-8"));
+			const pid = typeof parsed.pid === "number" ? parsed.pid : 0;
+			out.push({
+				dir,
+				pid,
+				mtimeMs,
+				isBackup: isBackupDir(dir)
+			});
+		} catch {}
+	}
+	out.sort((a, b) => Number(a.isBackup) - Number(b.isBackup) || b.mtimeMs - a.mtimeMs);
+	return out;
+}
+/** True if a process with this PID currently exists (POSIX + Windows). */
+function defaultIsPidAlive(pid) {
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return err.code === "EPERM";
+	}
+}
+/**
+* Resolve the data dir, reporting HOW it was found.
+*
+* Order:
+*   1. on-disk discovery (authoritative — prefers a dir whose PID is alive);
+*   2. `CLAUDE_PLUGIN_DATA`, but only when it is one of OUR dirs (Claude Code
+*      injects a single plugin's value into the generic Bash environment, so
+*      for skill/slash-command invocations it routinely names another plugin);
+*   3. `~/.tdai-memory` — a last resort that means "we are lost". Callers MUST
+*      treat `source === "fallback"` as a failure worth shouting about.
+*/
+function resolveDataDirDetailed(opts) {
+	const env = opts.env ?? process.env;
+	const home = opts.home ?? homedir();
+	const isAlive = opts.isPidAlive ?? defaultIsPidAlive;
+	const root = findPluginsDataRoot(opts.scriptPath);
+	const candidates = root ? findOwnDataDirs(root) : [];
+	if (candidates.length > 0) {
+		const alive = candidates.filter((c) => isAlive(c.pid));
+		const winner = (alive.length > 0 ? alive : candidates)[0];
+		return {
+			dir: winner.dir,
+			source: "discovered",
+			candidates,
+			chosenIsBackup: winner.isBackup
+		};
+	}
+	const fromEnv = env.CLAUDE_PLUGIN_DATA;
+	if (fromEnv && basename(fromEnv).startsWith("tdai-memory")) return {
+		dir: fromEnv,
+		source: "env",
+		candidates,
+		chosenIsBackup: isBackupDir(fromEnv)
+	};
+	return {
+		dir: join(home, ".tdai-memory"),
+		source: "fallback",
+		candidates,
+		chosenIsBackup: false
+	};
+}
+//#endregion
+//#region lib/alarm.ts
+/**
+* NO SILENT FAILURE.
+*
+* Sinapsys stopped capturing on 2026-08-13 and nobody noticed until 2026-08-22,
+* because every failure mode wrote to a log file nobody reads:
+*
+*   - the gateway was down for 5 days      → "connect ECONNREFUSED" in hook.log
+*   - the data dir could not be resolved   → "no daemon, skipped" in hook.log
+*   - a capture could be dropped gateway-side with nothing written at all
+*
+* A log file is not a signal. This module turns a failure into something the
+* USER sees, using the only channel Claude Code renders directly to them: the
+* `systemMessage` field of a UserPromptSubmit hook.
+*
+* Because a hook process is short-lived and a failure usually happens in a
+* DIFFERENT hook (stop / session-start) than the one that can speak
+* (user-prompt-submit), alarms are persisted as a breadcrumb file and drained
+* on the next prompt. Nothing is ever lost and nothing is ever silent.
+*/
+const ALARM_FILE = "alarms.json";
+/** Human-facing prefix. Deliberately loud — this is the whole point. */
+const PREFIX = "🚨 SINAPSYS";
+async function readAlarms(dataDir) {
+	try {
+		const raw = await readFile(join(dataDir, ALARM_FILE), "utf-8");
+		const parsed = JSON.parse(raw);
+		if (!Array.isArray(parsed)) return [];
+		return parsed.filter(isAlarmRecord);
+	} catch {
+		return [];
+	}
+}
+function isAlarmRecord(v) {
+	if (!v || typeof v !== "object") return false;
+	const o = v;
+	return typeof o.code === "string" && typeof o.message === "string";
+}
+/**
+* Record a failure. Never throws: an alarm that crashes the hook would be a
+* worse bug than the one it reports.
+*
+* Repeats of the same code are collapsed into one record with a counter, so a
+* gateway that has been down for five days produces one clear line
+* ("×512 volte, dal 13/08") instead of five days of noise.
+*/
+async function raiseAlarm(dataDir, code, message, now = /* @__PURE__ */ new Date()) {
+	const iso = now.toISOString();
+	try {
+		const existing = await readAlarms(dataDir);
+		const next = existing.find((a) => a.code === code) ? existing.map((a) => a.code === code ? {
+			...a,
+			message,
+			lastSeen: iso,
+			count: a.count + 1
+		} : a) : [...existing, {
+			code,
+			message,
+			firstSeen: iso,
+			lastSeen: iso,
+			count: 1
+		}];
+		const path = join(dataDir, ALARM_FILE);
+		await mkdir(dirname(path), { recursive: true });
+		await writeFile(path, JSON.stringify(next, null, 1), { mode: 384 });
+	} catch {}
+	try {
+		process.stderr.write(`${PREFIX}: ${message}\n`);
+	} catch {}
+}
+/** Clear a specific alarm once the underlying condition is healthy again. */
+async function clearAlarm(dataDir, code) {
+	try {
+		const existing = await readAlarms(dataDir);
+		const next = existing.filter((a) => a.code !== code);
+		if (next.length === existing.length) return;
+		const path = join(dataDir, ALARM_FILE);
+		if (next.length === 0) {
+			await rm(path, { force: true });
+			return;
+		}
+		await writeFile(path, JSON.stringify(next, null, 1), { mode: 384 });
+	} catch {}
+}
+/**
+* Render pending alarms as a single user-facing line, then clear them.
+*
+* Returns "" when everything is healthy, so the caller can simply skip the
+* `systemMessage` field.
+*/
+async function drainAlarms(dataDir) {
+	const alarms = await readAlarms(dataDir);
+	if (alarms.length === 0) return "";
+	const parts = alarms.map((a) => {
+		const times = a.count > 1 ? ` (×${a.count}, dal ${a.firstSeen.slice(0, 16).replace("T", " ")})` : "";
+		return `${a.message}${times}`;
+	});
+	try {
+		await rm(join(dataDir, ALARM_FILE), { force: true });
+	} catch {}
+	return `${PREFIX} — la memoria NON sta funzionando: ${parts.join(" · ")}`;
+}
+//#endregion
+//#region lib/staleness.ts
+/**
+* The last tripwire: "memory has a HOLE".
+*
+* The other alarms fire when something reports an error. This one fires when
+* nothing reports anything — the failure mode that actually happened. A hook
+* that is never called cannot complain; a gateway that is up but starving
+* answers 200 forever. So we compare two independent facts:
+*
+*   A. the newest message memory has stored     (from /health last_capture_at)
+*   B. the newest Claude Code session on disk   (transcript mtimes)
+*
+* If sessions kept happening well after memory stopped recording, there is a
+* hole — regardless of which component broke, or whether it ever said so.
+*
+* Crucially this does NOT fire during a holiday: with no new sessions, B stops
+* advancing too, and the two stay in step.
+*/
+/** A gap this large between work and memory is a fault, not a lull. */
+const STALE_GAP_MS = 1440 * 60 * 1e3;
+/** mtime of the most recently written transcript under ~/.claude/projects. */
+function newestTranscriptMs(projectsRoot) {
+	let newest = 0;
+	let dirs;
+	try {
+		dirs = readdirSync(projectsRoot);
+	} catch {
+		return 0;
+	}
+	for (const d of dirs) {
+		const dir = join(projectsRoot, d);
+		let files;
+		try {
+			if (!statSync(dir).isDirectory()) continue;
+			files = readdirSync(dir);
+		} catch {
+			continue;
+		}
+		for (const f of files) {
+			if (!f.endsWith(".jsonl")) continue;
+			try {
+				const m = statSync(join(dir, f)).mtimeMs;
+				if (m > newest) newest = m;
+			} catch {}
+		}
+	}
+	return newest;
+}
+/**
+* Decide whether memory is lagging behind real work.
+*
+* Unknowns are never treated as faults: a missing `last_capture_at` (old
+* gateway, alternative store) or an unreadable projects dir yields `stale:false`.
+* A false alarm would train the user to ignore alarms, which is the one thing
+* this whole mechanism cannot afford.
+*/
+function assessStaleness(lastCaptureIso, newestSessionMs, nowMs, gapMs = STALE_GAP_MS) {
+	const captureMs = lastCaptureIso ? Date.parse(lastCaptureIso) : NaN;
+	if (!Number.isFinite(captureMs) || newestSessionMs <= 0) return {
+		stale: false,
+		gapMs: 0,
+		lastCapture: null,
+		lastSession: null
+	};
+	const session = Math.min(newestSessionMs, nowMs);
+	const gap = session - captureMs;
+	return {
+		stale: gap > gapMs,
+		gapMs: Math.max(0, gap),
+		lastCapture: new Date(captureMs),
+		lastSession: new Date(session)
+	};
+}
+function describeStaleness(v) {
+	const days = Math.floor(v.gapMs / (1440 * 60 * 1e3));
+	const hours = Math.floor(v.gapMs / (3600 * 1e3)) % 24;
+	return `BUCO nella memoria: hai lavorato per ${days > 0 ? `${days} giorni e ${hours} ore` : `${hours} ore`} dopo l'ultimo ricordo salvato (${v.lastCapture ? v.lastCapture.toISOString().slice(0, 16).replace("T", " ") : "mai"})`;
+}
 //#endregion
 //#region lib/hook.ts
 /**
@@ -628,11 +955,12 @@ const MAX_INJECT_CHARS = 1e4;
 const MAX_CAPTURE_TURNS = 50;
 async function handleHook(event, input) {
 	const data = parseStdin(input.stdin);
+	const dataDir = input.dataDir ?? resolveDataDir();
 	switch (event) {
-		case "session-start": return handleSessionStart(data, input.client);
-		case "user-prompt-submit": return handleUserPromptSubmit(data, input.client);
+		case "session-start": return handleSessionStart(data, input.client, dataDir);
+		case "user-prompt-submit": return handleUserPromptSubmit(data, input.client, dataDir);
 		case "post-tool-use": return handlePostToolUse(data, input.client);
-		case "stop": return handleStop(data, input.client);
+		case "stop": return handleStop(data, input.client, dataDir);
 		case "search": return handleSearch(input.args ?? [], input.client);
 		case "search-stdin": return handleSearchStdin(input.stdin, input.client);
 		case "status": return handleStatus(input.client);
@@ -648,14 +976,25 @@ function parseStdin(raw) {
 		return {};
 	}
 }
-async function handleSessionStart(_data, client) {
-	await client.health();
+async function handleSessionStart(_data, client, dataDir) {
+	const health = await client.healthDetailed();
+	if (!health) {
+		await raiseAlarm(dataDir, "gateway-unreachable", "il gateway non risponde — NULLA viene salvato in memoria");
+		return "";
+	}
+	await clearAlarm(dataDir, "gateway-unreachable");
+	if (health.status === "degraded" || health.embedding === "failing") await raiseAlarm(dataDir, "memory-degraded", "l'embedder non risponde bene — la memoria funziona ma richiama peggio");
+	else await clearAlarm(dataDir, "memory-degraded");
+	const verdict = assessStaleness(health.last_capture_at, newestTranscriptMs(join(homedir(), ".claude", "projects")), Date.now());
+	if (verdict.stale) await raiseAlarm(dataDir, "memory-stale", describeStaleness(verdict));
+	else await clearAlarm(dataDir, "memory-stale");
 	return "";
 }
-async function handleUserPromptSubmit(data, client) {
+async function handleUserPromptSubmit(data, client, dataDir) {
 	const prompt = data.prompt ?? "";
 	const cwd = data.cwd ?? process.cwd();
-	if (!prompt) return "";
+	const alarmLine = await drainAlarms(dataDir);
+	if (!prompt) return alarmLine ? JSON.stringify({ systemMessage: alarmLine }) : "";
 	const sessionKey = getSessionKey(cwd);
 	const project = getProjectName(cwd);
 	let context = (await client.recall(prompt, sessionKey, project, data.session_id)).context ?? "";
@@ -670,22 +1009,49 @@ async function handleUserPromptSubmit(data, client) {
 		const dataDir = process.env.TDAI_DATA_DIR;
 		if (dataDir) context = await searchL0JsonlDirect(join(dataDir, "conversations"), prompt, sessionKey, 3);
 	}
-	if (!context) return "";
+	if (!context) return alarmLine ? JSON.stringify({ systemMessage: alarmLine }) : "";
+	const bannerMatch = context.match(/<session-open-banner>[\s\S]*?<\/session-open-banner>/);
+	const bannerLine = bannerMatch ? bannerMatch[0].split("\n").map((s) => s.trim()).filter((s) => s && !s.startsWith("<") && !s.startsWith("FIRST TURN"))[0] ?? "" : "";
 	if (context.length > MAX_INJECT_CHARS) context = context.slice(0, MAX_INJECT_CHARS - 100) + "\n\n[…recall truncated — use /memory-search for full results…]";
-	return JSON.stringify({ hookSpecificOutput: {
+	const out = { hookSpecificOutput: {
 		hookEventName: "UserPromptSubmit",
 		additionalContext: context
-	} });
+	} };
+	const message = alarmLine || bannerLine;
+	if (message) out.systemMessage = message;
+	return JSON.stringify(out);
+}
+/** Max characters of failed-tool output forwarded to the gateway. */
+const MAX_TOOL_OUTPUT_CHARS = 2e3;
+/**
+* Best-effort stringification of a tool result for friction capture. Returns
+* undefined when there is nothing usable — the caller then sends nothing and
+* behaviour is exactly as before.
+*/
+function stringifyToolOutput(resp) {
+	if (resp == null) return void 0;
+	let text;
+	if (typeof resp === "string") text = resp;
+	else try {
+		text = JSON.stringify(resp) ?? "";
+	} catch {
+		return;
+	}
+	text = text.trim();
+	if (!text) return void 0;
+	return text.length > MAX_TOOL_OUTPUT_CHARS ? text.slice(0, MAX_TOOL_OUTPUT_CHARS) : text;
 }
 async function handlePostToolUse(data, client) {
 	const toolName = data.tool_name ?? "";
 	if (!toolName) return "";
 	const sessionKey = getSessionKey(data.cwd ?? process.cwd());
+	const toolOutputText = data.tool_output_is_error === true ? stringifyToolOutput(data.tool_response) : void 0;
 	let context = await client.observe({
 		toolName,
 		sessionKey,
 		toolInput: data.tool_input,
-		toolOutputIsError: data.tool_output_is_error
+		toolOutputIsError: data.tool_output_is_error,
+		toolOutputText
 	});
 	if (!context) return "";
 	if (context.length > MAX_INJECT_CHARS) context = context.slice(0, MAX_INJECT_CHARS - 100) + "\n\n[…truncated…]";
@@ -694,17 +1060,23 @@ async function handlePostToolUse(data, client) {
 		additionalContext: context
 	} });
 }
-async function handleStop(data, client) {
+async function handleStop(data, client, dataDirIn) {
 	if (data.stop_hook_active === true) return "";
 	if (!data.transcript_path) return "";
 	await waitForTranscriptStable(data.transcript_path, 2e3);
 	const allTurns = await readAllTurns(data.transcript_path);
-	if (allTurns.length === 0) return "";
-	const dataDir = resolveDataDir();
+	if (allTurns.length === 0) {
+		await safeLog(join(dataDirIn, "hook.log"), `stop: 0 turni leggibili da ${data.transcript_path} — niente da salvare`);
+		return "";
+	}
+	const dataDir = dataDirIn;
 	const cursorId = sanitizeCursorId(data.session_id ?? (basename(data.transcript_path).replace(/\.jsonl$/, "") || "default"));
 	const lastSent = await readCursor(dataDir, cursorId);
 	let newTurns = allTurns.slice(lastSent);
-	if (newTurns.length === 0) return "";
+	if (newTurns.length === 0) {
+		await safeLog(join(dataDirIn, "hook.log"), `stop: nessun turno nuovo (${allTurns.length} totali, cursore a ${lastSent})`);
+		return "";
+	}
 	if (newTurns.length > MAX_CAPTURE_TURNS) newTurns = newTurns.slice(-MAX_CAPTURE_TURNS);
 	const sessionKey = getSessionKey(data.cwd ?? process.cwd());
 	const messages = newTurns.flatMap((t) => [{
@@ -715,18 +1087,26 @@ async function handleStop(data, client) {
 		content: t.assistant
 	}]);
 	const lastTurn = newTurns[newTurns.length - 1];
-	if (await client.captureTurn({
+	const captureResult = await client.captureTurn({
 		user_content: lastTurn.user,
 		assistant_content: lastTurn.assistant,
 		messages,
 		session_key: sessionKey,
 		session_id: data.session_id
-	}) === null) {
-		process.stderr.write("⚠️ TencentDB: session NOT saved — gateway may be down or the token is stale. Run C:\\Users\\lo\\tdai-gateway\\start-gateway.ps1 to restart it.\n");
+	});
+	if (captureResult === null) {
+		await raiseAlarm(dataDir, "capture-failed", `sessione NON salvata (${newTurns.length} turni persi) — gateway giù o token scaduto`);
 		await safeLog(join(dataDir, "hook.log"), "stop: captureTurn failed after retry — session not saved");
 		return "";
 	}
+	if (captureResult.l0_recorded === 0) {
+		await raiseAlarm(dataDir, "capture-empty", `il gateway ha risposto OK ma non ha scritto nulla (${newTurns.length} turni)`);
+		return "";
+	}
+	await clearAlarm(dataDir, "capture-failed");
+	await clearAlarm(dataDir, "capture-empty");
 	await writeCursor(dataDir, cursorId, allTurns.length);
+	await safeLog(join(dataDir, "hook.log"), `stop: salvati ${captureResult.l0_recorded} messaggi (${newTurns.length} turni) — cursore ${lastSent}→${allTurns.length}`);
 	return "";
 }
 async function waitForTranscriptStable(path, maxMs) {
@@ -747,82 +1127,27 @@ async function waitForTranscriptStable(path, maxMs) {
 		await new Promise((r) => setTimeout(r, 100));
 	}
 }
-const PLUGIN_NAME = "tdai-memory";
 /**
-* Resolve the gateway data directory.
-*
-* We cannot trust process.env.CLAUDE_PLUGIN_DATA here: Claude Code injects a
-* single plugin's CLAUDE_PLUGIN_DATA into the generic Bash environment, and for
-* slash-command / skill invocations (e.g. /memory-search) it routinely points
-* at a DIFFERENT plugin's data dir. Hooks receive the correct per-plugin value,
-* skills do not — so trusting the env var alone makes every manual search and
-* status check resolve to the wrong dir and return empty.
-*
-* Instead we discover our own data dirs from this script's real on-disk
-* location (env-independent) and pick the one whose daemon PID is actually
-* alive — the gateway that is really running. Ties, and the case where no PID
-* is alive, fall back to the most recently updated state.json.
+* Resolve the gateway data directory. See ./data-dir.ts for the full story —
+* in short, this used to count `..` hops and broke the day Claude Code changed
+* the plugin install layout, which silently stopped capture for 10 days.
 */
+function resolveDataDirWithSource() {
+	let scriptPath;
+	try {
+		scriptPath = fileURLToPath(import.meta.url);
+	} catch {
+		scriptPath = process.argv[1] ?? "";
+	}
+	const res = resolveDataDirDetailed({ scriptPath });
+	return {
+		dir: res.dir,
+		source: res.source,
+		isBackup: res.chosenIsBackup
+	};
+}
 function resolveDataDir() {
-	const candidates = findOwnDataDirs();
-	if (candidates.length > 0) {
-		const alive = candidates.filter((c) => isPidAlive(c.pid));
-		const pool = alive.length > 0 ? alive : candidates;
-		pool.sort((a, b) => b.mtimeMs - a.mtimeMs);
-		return pool[0].dir;
-	}
-	const env = process.env.CLAUDE_PLUGIN_DATA;
-	if (env && basename(env).startsWith(PLUGIN_NAME)) return env;
-	return join(homedir(), ".tdai-memory");
-}
-/**
-* Discover this plugin's data dirs under <plugins>/data, located via the
-* script's own path: <plugins>/<marketplace>/plugin/dist/lib/hook.mjs.
-*/
-function findOwnDataDirs() {
-	const root = pluginsDataRoot();
-	if (!root) return [];
-	let names;
-	try {
-		names = readdirSync(root);
-	} catch {
-		return [];
-	}
-	const out = [];
-	for (const name of names) {
-		if (!name.startsWith(PLUGIN_NAME)) continue;
-		const dir = join(root, name);
-		const statePath = join(dir, "state.json");
-		try {
-			const mtimeMs = statSync(statePath).mtimeMs;
-			const parsed = JSON.parse(readFileSync(statePath, "utf-8"));
-			const pid = typeof parsed.pid === "number" ? parsed.pid : 0;
-			out.push({
-				dir,
-				pid,
-				mtimeMs
-			});
-		} catch {}
-	}
-	return out;
-}
-function pluginsDataRoot() {
-	try {
-		const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..", "data");
-		return existsSync(root) ? root : null;
-	} catch {
-		return null;
-	}
-}
-/** True if a process with this PID currently exists (POSIX + Windows). */
-function isPidAlive(pid) {
-	if (!Number.isInteger(pid) || pid <= 0) return false;
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (err) {
-		return err.code === "EPERM";
-	}
+	return resolveDataDirWithSource().dir;
 }
 function sanitizeCursorId(id) {
 	return id.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64) || "default";
@@ -988,8 +1313,12 @@ async function searchL0JsonlDirect(convDir, query, sessionKey, limit) {
 async function main() {
 	const event = process.argv[2] ?? "";
 	const args = process.argv.slice(3);
-	const dataDir = resolveDataDir();
+	const { dir: dataDir, source: dataDirSource, isBackup: dataDirIsBackup } = resolveDataDirWithSource();
 	const logPath = join(dataDir, "hook.log");
+	if (dataDirSource === "fallback") await raiseAlarm(dataDir, "data-dir-lost", "il plugin non trova la cartella del gateway — cattura e recall SPENTI");
+	else await clearAlarm(dataDir, "data-dir-lost");
+	if (dataDirIsBackup) await raiseAlarm(dataDir, "writing-to-backup", "la memoria sta puntando a una cartella di BACKUP — i nuovi ricordi finirebbero in un archivio vecchio");
+	else await clearAlarm(dataDir, "writing-to-backup");
 	try {
 		const stdin = await readStdin();
 		const mgr = new DaemonManager({ dataDir });
@@ -1008,6 +1337,11 @@ async function main() {
 		}
 		if (!state) {
 			await safeLog(logPath, `${event}: no daemon, skipped`);
+			if (event !== "user-prompt-submit") await raiseAlarm(dataDir, "gateway-unreachable", "nessun gateway attivo — la sessione NON viene salvata");
+			else {
+				const msg = await drainAlarms(dataDir) || "🚨 SINAPSYS — la memoria NON sta funzionando: nessun gateway attivo";
+				process.stdout.write(JSON.stringify({ systemMessage: msg }));
+			}
 			return;
 		}
 		const token = await mgr.readToken(state.tokenPath);
@@ -1020,12 +1354,27 @@ async function main() {
 				logPath,
 				tokenPath: state.tokenPath
 			}),
-			args
+			args,
+			dataDir
 		});
 		if (out) process.stdout.write(out);
 	} catch (err) {
 		await safeLog(logPath, `${event}: ${err.message}`);
+		await reportHookCrash(dataDir, event, err);
+		if (event === "user-prompt-submit") try {
+			const line = await drainAlarms(dataDir);
+			if (line) process.stdout.write(JSON.stringify({ systemMessage: line }));
+		} catch {}
 	}
+}
+/** Max chars of an error message forwarded to the user-facing alarm. */
+const MAX_CRASH_MESSAGE_CHARS = 200;
+/**
+* Turn an unexpected exception into a signal Lorenzo actually sees.
+* Never throws: reporting a failure must not become one.
+*/
+async function reportHookCrash(dataDir, event, err) {
+	await raiseAlarm(dataDir, "hook-crashed", `la memoria si è fermata con un errore (${event}) — nulla viene salvato né richiamato: ${(err instanceof Error ? err.message : String(err)).slice(0, MAX_CRASH_MESSAGE_CHARS)}`);
 }
 function readStdin() {
 	return new Promise((resolve) => {
@@ -1046,4 +1395,4 @@ async function safeLog(path, msg) {
 }
 if (!!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main().catch(() => process.exit(0));
 //#endregion
-export { handleHook };
+export { handleHook, reportHookCrash };

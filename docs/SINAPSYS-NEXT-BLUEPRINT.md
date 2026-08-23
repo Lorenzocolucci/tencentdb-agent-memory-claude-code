@@ -1,5 +1,13 @@
 # Sinapsys — Next Blueprint (Judgment + Chat) — 2026-07-01
 
+> ## ⚠️ 2026-08-07 — leggere insieme allo STATO REALE
+> Questo documento resta valido come **direzione** ("Sinapsys è un socio, non un
+> bibliotecario"), e la sua tesi è stata **confermata dai numeri**: su LongMemEval il
+> recall associativo NON batte il RAG piatto (0 di edge, −10 sotto distrattori) — cioè
+> vincere quel benchmark non è il nostro mestiere. Stato, misure e cosa manca:
+> → **[vision/STATO-REALE.md](vision/STATO-REALE.md)**. Prossimo passo:
+> [vision/01-vision-and-plan/PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md](vision/01-vision-and-plan/PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md).
+
 > **Chi legge questo file a freddo (memoria non arrivata):** questo documento è
 > auto-verificabile. Segui la Parte 0 per ricostruire lo stato da zero, la Parte 1
 > per le regole di costruzione dei file, poi le Parti 2–3 per il lavoro. Ogni claim

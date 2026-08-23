@@ -2,3 +2,7 @@
 data/
 runs/
 *.json.tmp
+official/
+*.eval-results-*
+__pycache__/
+.venv/

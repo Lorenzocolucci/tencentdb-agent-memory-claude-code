@@ -2,6 +2,23 @@
 > **🔱 Fork — Windows / ARM64 + Claude Code.**
 > This is a community fork maintained by [Lorenzo Colucci](https://github.com/Lorenzocolucci) that makes TencentDB Agent Memory run end-to-end on **Windows 11 (incl. ARM64)** with **Claude Code**. For what this fork adds and how to install it, see **[claude-code-plugin/README.md](./claude-code-plugin/README.md)**. The original project and its documentation (below) are by Tencent — all credit and the MIT license are preserved.
 
+<!-- SINAPSYS NOTICE -->
+> **🧠 This fork is also where Sinapsys is built.**
+> Sinapsys is **associative** long-term memory for AI agents: a graph where one memory
+> *triggers* another and the relevant ones *come to the agent unbidden* — reconstruction, not
+> lookup. It adds six pillars on top of this codebase (Context Fingerprint, Implicit Priming,
+> Mistake Notebook, Proactive Injection, Distinctive Terms, Grounded Trust) plus a measured
+> **usefulness verdict** that scores memory on what it *changed*, not on what it retrieved.
+>
+> | Start here | What it is |
+> | :-- | :-- |
+> | **[docs/vision/STATO-REALE.md](./docs/vision/STATO-REALE.md)** | **Read this first.** Measured state, what is live, what is missing, what is next |
+> | [docs/SINAPSYS-ARCHITECTURE.md](./docs/SINAPSYS-ARCHITECTURE.md) | Source-grounded map of every subsystem |
+> | [docs/SINAPSYS_FOUNDATIONS.md](./docs/SINAPSYS_FOUNDATIONS.md) | The database bricks it stands on |
+> | [docs/vision/README.md](./docs/vision/README.md) | Vision hub: plans, research, decisions (ADRs) |
+>
+> Rule of that documentation set: **every number is measured, never remembered.**
+
 ---
 
 <div align="center">
