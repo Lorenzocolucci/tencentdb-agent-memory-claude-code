@@ -32,7 +32,7 @@ un altro e i ricordi **arrivano all'agente** senza che li cerchi. Non un motore 
 
 **Salute al 2026-08-22:** gateway `status: ok`, `embedding: ok`, recall live via `strategy=kb`
 (**0,5 s a caldo**, 13,6 s la prima query a freddo), `/health` riporta ora anche `last_capture_at`.
-**1.014 test verdi, 0 rossi** (2 saltati: solo-POSIX su Windows).
+**1.028 test verdi, 0 rossi** (2 saltati: solo-POSIX su Windows).
 
 ---
 
@@ -96,6 +96,7 @@ Ogni guasto scriveva in un file di log che nessuno legge. **Un log non è un seg
 | `capture-empty` | il gateway risponde OK ma scrive **0 righe** | `lib/hook.ts` (stop) |
 | `memory-stale` | hai lavorato **>24 h** dopo l'ultimo ricordo salvato | `lib/staleness.ts` + `/health.last_capture_at` |
 | `memory-degraded` | il gateway risponde ma l'embedder no (503) — richiamo peggiore, non morte | `lib/hook.ts` (session-start) |
+| `writing-to-backup` | la cartella scelta è un **archivio** — i nuovi ricordi finirebbero in un DB vecchio | `lib/data-dir.ts` |
 
 Come arrivano a Lorenzo: un allarme viene scritto come briciola (`alarms.json`) e il primo
 `UserPromptSubmit` successivo lo mostra come **`systemMessage`**, l'unico canale che Claude Code
@@ -134,6 +135,43 @@ idempotenti e il loro input cambia in giorni, non in minuti.
 
 **Misurato dopo:** Argus 444/285 ms · Sinapsys 302/284 ms · Sofia-AI 317/376 ms.
 **Banner verificato dal vivo attraverso il plugin installato**, su Argus, sessione nuova.
+
+---
+
+### Il debito di prestazione, chiuso (2026-08-23)
+
+Il confronto a coppie fra tutti gli errori era **O(N²) sincrono**: 1.706 errori → **4.726 ms**
+di ciclo eventi bloccato, e cresceva con la memoria.
+
+Il rimedio ovvio (copiare `usage-clusters`: "tieni i 300 più recenti") **sarebbe stato sbagliato
+qui**: 68 lezioni citano 612 errori, quindi **1.094 non sono citati da nessuno**. Un taglio per
+sola recenza avrebbe sepolto quell'arretrato — proprio nel pilastro per cui esiste tutto questo.
+
+**`src/core/kb/bug-working-set.ts`** — una finestra che *si consuma*: precedenza agli errori che
+nessuna lezione ha mai citato, dal più recente; il **25% del budget resta riservato** a errori già
+coperti, perché senza di loro un guasto nuovo non potrebbe agganciarsi a un gruppo vecchio e
+genererebbe una lezione doppia. Budget **400 → ~240 ms**.
+
+**Limite dichiarato** (nel modulo e in un test): la finestra scorre solo quando un errore *diventa
+coperto*, cioè quando produce una lezione. Misurato oggi: 67 gruppi sul corpus intero, 15 nella
+finestra, **zero nuovi in entrambi i casi** — il Quaderno è a regime, quindi il taglio oggi non
+perde nulla. Se un giorno servisse, il rimedio è una finestra a rotazione.
+
+**Provato dal vivo:** 8 recall lanciati *mentre* la distillazione girava → peggiore **970 ms**
+(prima ~18.000 ms). Primo turno: 2.213 ms a freddo, poi 377–490 ms.
+
+### Il rischio scoperto riavviando: scrivere in un ARCHIVIO
+
+`state.json` della cartella viva si è troncato a **0 byte** con il gateway acceso. Non era più un
+candidato, e ha vinto una cartella `*.BACKUP-20260614-pre-reindex` il cui file vecchio si leggeva
+ancora: i nuovi ricordi sarebbero finiti in un database di due mesi prima, **senza un segnale**.
+
+Tre rimedi: le cartelle si ordinano ora per *(PID vivo → NON-archivio → recenza)*; l'allarme
+`writing-to-backup`; e `start-gateway.ps1` ricostruisce `state.json` anche quando il gateway è
+già acceso (prima usciva senza toccarlo, quindi un file rotto non veniva mai riparato).
+
+> ⚠️ Trappola PowerShell: un `.ps1` senza BOM viene letto come ANSI. Un trattino lungo UTF-8
+> diventa `â€”`, e `”` **apre una stringa**: lo script non si compila più. I `.ps1` restano ASCII.
 
 ---
 
