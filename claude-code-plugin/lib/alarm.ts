@@ -30,7 +30,8 @@ export type AlarmCode =
   | "capture-failed"
   | "capture-empty"
   | "memory-stale"
-  | "memory-degraded";
+  | "memory-degraded"
+  | "writing-to-backup";
 
 export interface AlarmRecord {
   code: AlarmCode;

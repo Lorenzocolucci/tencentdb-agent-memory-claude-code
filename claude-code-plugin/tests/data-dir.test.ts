@@ -17,6 +17,7 @@ import {
   findPluginsDataRoot,
   findOwnDataDirs,
   resolveDataDirDetailed,
+  isBackupDir,
 } from "../lib/data-dir.js";
 
 let tmp: string;
@@ -95,6 +96,56 @@ describe("findOwnDataDirs", () => {
     expect(found.map((c) => c.dir)).toContain(newer);
     expect(found.some((c) => c.dir.endsWith("tdai-memory-no-state"))).toBe(false);
     expect(found.some((c) => c.dir.endsWith("unrelated-plugin"))).toBe(false);
+  });
+});
+
+describe("a BACKUP dir must never outrank the live one", () => {
+  it("skips the live dir when its state.json is EMPTY, but still refuses the backup", () => {
+    // Exactly what happened on 2026-08-23: the live state.json was truncated to
+    // 0 bytes while the gateway was up, and a two-month-old
+    // `*.BACKUP-20260614-pre-reindex` dir won because its stale file parsed.
+    const { scriptPath, dataRoot } = makeLayout(["cache", "m", "p", "1.0.0"]);
+    const live = join(dataRoot, "tdai-memory-tdai-local");
+    mkdirSync(live, { recursive: true });
+    writeFileSync(join(live, "state.json"), ""); // truncated
+    const backup = makeDataDir(dataRoot, "tdai-memory-tdai-local.BACKUP-20260614-pre-reindex", 0);
+
+    const res = resolveDataDirDetailed({ scriptPath, env: {}, home: tmp });
+    // The backup is the only parseable candidate, so it is chosen — but the
+    // caller is TOLD, and can refuse to write two months into the past.
+    expect(res.dir).toBe(backup);
+    expect(res.chosenIsBackup).toBe(true);
+  });
+
+  it("prefers the live dir over a NEWER backup", () => {
+    const { scriptPath, dataRoot } = makeLayout(["cache", "m", "p", "1.0.0"]);
+    const live = makeDataDir(dataRoot, "tdai-memory-tdai-local", 0);
+    // Written after → newer mtime, which used to win outright.
+    makeDataDir(dataRoot, "tdai-memory-tdai-local.BACKUP-20260614-pre-reindex", 0);
+
+    const res = resolveDataDirDetailed({ scriptPath, env: {}, home: tmp });
+    expect(res.dir).toBe(live);
+    expect(res.chosenIsBackup).toBe(false);
+  });
+
+  it("a live PID still beats everything, backup or not", () => {
+    const { scriptPath, dataRoot } = makeLayout(["cache", "m", "p", "1.0.0"]);
+    makeDataDir(dataRoot, "tdai-memory-tdai-local", 111);
+    const backupAlive = makeDataDir(dataRoot, "tdai-memory-tdai-local.BACKUP-x", 222);
+
+    const res = resolveDataDirDetailed({
+      scriptPath, env: {}, home: tmp,
+      isPidAlive: (pid) => pid === 222,
+    });
+    expect(res.dir).toBe(backupAlive);
+    expect(res.chosenIsBackup).toBe(true);
+  });
+
+  it("recognises the archive naming variants", () => {
+    expect(isBackupDir("C:/x/tdai-memory-tdai-local.BACKUP-20260614-pre-reindex")).toBe(true);
+    expect(isBackupDir("/x/tdai-memory.bak-2026")).toBe(true);
+    expect(isBackupDir("/x/tdai-memory-tdai-local")).toBe(false);
+    expect(isBackupDir("/x/tdai-memory-backupsystem")).toBe(false);
   });
 });
 

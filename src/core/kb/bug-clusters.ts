@@ -11,6 +11,9 @@ import type { DatabaseSync } from "node:sqlite";
 import { EVIDENCE_MIN } from "./bug-similarity.js";
 import { createKbVecEmbeddingReader, type EmbeddingReader } from "./bug-embeddings.js";
 import { buildComponents, buildClusters, type BugEventNode } from "./bug-cluster-graph.js";
+import { selectBugWorkingSet, MAX_PAIRWISE_BUG_EVENTS } from "./bug-working-set.js";
+
+const TAG = "[bug-clusters]";
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -44,6 +47,10 @@ export interface SelectFailureClustersParams {
    * (dims=1536). Tests should pass fakeEmbeddingReader from bug-embeddings.ts.
    */
   embeddingReader?: EmbeddingReader;
+  /** Cap on the pairwise working set (default MAX_PAIRWISE_BUG_EVENTS). */
+  maxPairwise?: number;
+  /** Optional sink so a capped pass is never silent (no hard dep on Logger). */
+  logger?: { warn?(msg: string): void };
 }
 
 // ── Internal DB row types ─────────────────────────────────────────────────────
@@ -70,6 +77,28 @@ function parseStringArray(json: string): string[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Ids of bug events already cited as evidence by some lesson.
+ *
+ * One query over a small table (68 rows on the live DB), not the per-id LIKE
+ * scan the runner does later. Failure here is non-fatal: an empty set simply
+ * means "treat everything as backlog", which is the conservative direction.
+ */
+function readCoveredBugEventIds(db: DatabaseSync): Set<string> {
+  const covered = new Set<string>();
+  try {
+    const rows = db
+      .prepare("SELECT evidence_event_ids_json FROM lessons WHERE superseded_by IS NULL")
+      .all() as Array<{ evidence_event_ids_json: string }>;
+    for (const row of rows) {
+      for (const id of parseStringArray(row.evidence_event_ids_json)) covered.add(id);
+    }
+  } catch {
+    // lessons table absent (tests) or unreadable — non-fatal.
+  }
+  return covered;
 }
 
 // ── Main export ───────────────────────────────────────────────────────────────
@@ -120,7 +149,27 @@ function _selectFailureClusters(
     entityMap.set(row.id, parseStringArray(row.entities_json));
   }
 
-  const processable = rows.filter((r) => embeddings.has(r.id));
+  const withEmbedding = rows.filter((r) => embeddings.has(r.id));
+  if (withEmbedding.length < EVIDENCE_MIN) return [];
+
+  // ── 2-bis. Bound the O(N²) pairwise cost ──────────────────────────────────
+  // Measured on the live corpus (2026-08-23): N=400 → 237 ms, N=1706 → 4726 ms
+  // of SYNCHRONOUS work, which starved live recall. The window prioritises bug
+  // events no lesson cites yet, so the backlog drains instead of being stranded
+  // — see bug-working-set.ts for why a plain recency cap is wrong here.
+  const workingSet = selectBugWorkingSet(
+    withEmbedding,
+    readCoveredBugEventIds(db),
+    params.maxPairwise ?? MAX_PAIRWISE_BUG_EVENTS,
+  );
+  const processable = workingSet.selected;
+  if (workingSet.dropped > 0) {
+    params.logger?.warn?.(
+      `${TAG} capped pairwise input: kept ${processable.length} of ${withEmbedding.length} ` +
+        `bug event(s) (${workingSet.uncoveredSelected} without a lesson yet), ` +
+        `dropped ${workingSet.dropped} for this pass`,
+    );
+  }
   if (processable.length < EVIDENCE_MIN) return [];
 
   // ── 3. Resolve file entities (type='file') ────────────────────────────────

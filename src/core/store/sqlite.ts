@@ -4065,6 +4065,8 @@ export class VectorStore implements IMemoryStore {
       now: opts.now,
       namespace: opts.namespace,
       maxClusters: opts.maxClusters,
+      // Pass the store's logger so a capped pairwise pass says so out loud.
+      logger: this.logger,
     });
     return {
       candidates: stats.candidates,

@@ -660,11 +660,24 @@ function findPluginsDataRoot(scriptPath) {
 	return null;
 }
 /**
-* Enumerate our data dirs under a plugins `data` root, newest state.json first.
+* True for a directory that is an archived copy, not the live store.
 *
-* Backup directories (`*.BACKUP-*`) are deliberately included: they still start
-* with the plugin name and could in principle hold a live gateway. Liveness of
-* the recorded PID is what actually decides, not the name.
+* WHY THIS MATTERS (found the hard way, 2026-08-23): the live dir's state.json
+* was truncated to 0 bytes while the gateway was still running, so it stopped
+* being a candidate — and a `*.BACKUP-20260614-pre-reindex` dir, whose stale
+* state.json still parsed, won the election. The plugin would then have written
+* every new memory into a two-month-old database, silently. A backup must never
+* outrank a live directory, whatever their timestamps say.
+*/
+function isBackupDir(dir) {
+	return /\.(BACKUP|bak)[-_.]/i.test(basename(dir));
+}
+/**
+* Enumerate our data dirs under a plugins `data` root, best candidate first.
+*
+* Order: PID alive, then non-backup, then newest state.json. A backup is kept
+* in the list (it may legitimately be the only thing left) but can only win
+* when nothing better exists — and the caller is told, via `chosenIsBackup`.
 */
 function findOwnDataDirs(dataRoot) {
 	let names;
@@ -685,11 +698,12 @@ function findOwnDataDirs(dataRoot) {
 			out.push({
 				dir,
 				pid,
-				mtimeMs
+				mtimeMs,
+				isBackup: isBackupDir(dir)
 			});
 		} catch {}
 	}
-	out.sort((a, b) => b.mtimeMs - a.mtimeMs);
+	out.sort((a, b) => Number(a.isBackup) - Number(b.isBackup) || b.mtimeMs - a.mtimeMs);
 	return out;
 }
 /** True if a process with this PID currently exists (POSIX + Windows). */
@@ -721,22 +735,26 @@ function resolveDataDirDetailed(opts) {
 	const candidates = root ? findOwnDataDirs(root) : [];
 	if (candidates.length > 0) {
 		const alive = candidates.filter((c) => isAlive(c.pid));
+		const winner = (alive.length > 0 ? alive : candidates)[0];
 		return {
-			dir: (alive.length > 0 ? alive : candidates)[0].dir,
+			dir: winner.dir,
 			source: "discovered",
-			candidates
+			candidates,
+			chosenIsBackup: winner.isBackup
 		};
 	}
 	const fromEnv = env.CLAUDE_PLUGIN_DATA;
 	if (fromEnv && basename(fromEnv).startsWith("tdai-memory")) return {
 		dir: fromEnv,
 		source: "env",
-		candidates
+		candidates,
+		chosenIsBackup: isBackupDir(fromEnv)
 	};
 	return {
 		dir: join(home, ".tdai-memory"),
 		source: "fallback",
-		candidates
+		candidates,
+		chosenIsBackup: false
 	};
 }
 //#endregion
@@ -1124,7 +1142,8 @@ function resolveDataDirWithSource() {
 	const res = resolveDataDirDetailed({ scriptPath });
 	return {
 		dir: res.dir,
-		source: res.source
+		source: res.source,
+		isBackup: res.chosenIsBackup
 	};
 }
 function resolveDataDir() {
@@ -1294,10 +1313,12 @@ async function searchL0JsonlDirect(convDir, query, sessionKey, limit) {
 async function main() {
 	const event = process.argv[2] ?? "";
 	const args = process.argv.slice(3);
-	const { dir: dataDir, source: dataDirSource } = resolveDataDirWithSource();
+	const { dir: dataDir, source: dataDirSource, isBackup: dataDirIsBackup } = resolveDataDirWithSource();
 	const logPath = join(dataDir, "hook.log");
 	if (dataDirSource === "fallback") await raiseAlarm(dataDir, "data-dir-lost", "il plugin non trova la cartella del gateway — cattura e recall SPENTI");
 	else await clearAlarm(dataDir, "data-dir-lost");
+	if (dataDirIsBackup) await raiseAlarm(dataDir, "writing-to-backup", "la memoria sta puntando a una cartella di BACKUP — i nuovi ricordi finirebbero in un archivio vecchio");
+	else await clearAlarm(dataDir, "writing-to-backup");
 	try {
 		const stdin = await readStdin();
 		const mgr = new DaemonManager({ dataDir });

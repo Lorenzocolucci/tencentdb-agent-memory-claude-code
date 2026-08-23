@@ -413,7 +413,11 @@ async function waitForTranscriptStable(path: string, maxMs: number): Promise<voi
  * in short, this used to count `..` hops and broke the day Claude Code changed
  * the plugin install layout, which silently stopped capture for 10 days.
  */
-function resolveDataDirWithSource(): { dir: string; source: DataDirSource } {
+function resolveDataDirWithSource(): {
+  dir: string;
+  source: DataDirSource;
+  isBackup: boolean;
+} {
   let scriptPath: string;
   try {
     scriptPath = fileURLToPath(import.meta.url);
@@ -421,7 +425,7 @@ function resolveDataDirWithSource(): { dir: string; source: DataDirSource } {
     scriptPath = process.argv[1] ?? "";
   }
   const res = resolveDataDirDetailed({ scriptPath });
-  return { dir: res.dir, source: res.source };
+  return { dir: res.dir, source: res.source, isBackup: res.chosenIsBackup };
 }
 
 function resolveDataDir(): string {
@@ -636,7 +640,8 @@ async function main(): Promise<void> {
   const event = (process.argv[2] ?? "") as HookEvent;
   const args = process.argv.slice(3);
 
-  const { dir: dataDir, source: dataDirSource } = resolveDataDirWithSource();
+  const { dir: dataDir, source: dataDirSource, isBackup: dataDirIsBackup } =
+    resolveDataDirWithSource();
   const logPath = join(dataDir, "hook.log");
 
   // NO SILENT FAILURE #1: losing our own data dir is what actually happened on
@@ -650,6 +655,21 @@ async function main(): Promise<void> {
     );
   } else {
     await clearAlarm(dataDir, "data-dir-lost");
+  }
+
+  // NO SILENT FAILURE #1b: landing on an ARCHIVE is worse than landing nowhere.
+  // On 2026-08-23 the live state.json was truncated to 0 bytes while the gateway
+  // was running, and a two-month-old `*.BACKUP-*` dir became the only parseable
+  // candidate. Writing there would bury every new memory in a stale database
+  // while everything looked healthy.
+  if (dataDirIsBackup) {
+    await raiseAlarm(
+      dataDir,
+      "writing-to-backup",
+      "la memoria sta puntando a una cartella di BACKUP — i nuovi ricordi finirebbero in un archivio vecchio",
+    );
+  } else {
+    await clearAlarm(dataDir, "writing-to-backup");
   }
 
   try {

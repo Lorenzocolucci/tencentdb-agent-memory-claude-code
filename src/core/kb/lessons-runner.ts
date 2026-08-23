@@ -35,6 +35,8 @@ export interface DistillLessonsParams {
   distill?: DistillOptions;
   /** Injectable embedding reader for tests (omit to use live sqlite-vec). */
   embeddingReader?: EmbeddingReader;
+  /** Optional sink so a capped pairwise pass is never silent. */
+  logger?: { warn?(msg: string): void };
 }
 
 export interface LessonsRunStats {
@@ -179,6 +181,7 @@ export async function distillLessons(
     namespace: params.namespace,
     sinceTs: params.sinceTs,
     embeddingReader: params.embeddingReader,
+    logger: params.logger,
   });
   // Drop clusters that already have a lesson BEFORE applying the maxClusters
   // cap. Without this the cap always re-selected the SAME first N clusters —

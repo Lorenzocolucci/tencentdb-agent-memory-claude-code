@@ -36,14 +36,18 @@ export type DataDirSource = "discovered" | "env" | "fallback";
 export interface DataDirResolution {
   dir: string;
   source: DataDirSource;
-  /** Candidates seen during discovery, newest state.json first. */
+  /** Candidates seen during discovery, best first. */
   candidates: DataDirCandidate[];
+  /** True when the winner is an ARCHIVE. Writing here would bury new memories. */
+  chosenIsBackup: boolean;
 }
 
 export interface DataDirCandidate {
   dir: string;
   pid: number;
   mtimeMs: number;
+  /** True for `*.BACKUP-*` archives — never allowed to outrank a live dir. */
+  isBackup: boolean;
 }
 
 export interface ResolveOptions {
@@ -88,11 +92,25 @@ export function findPluginsDataRoot(scriptPath: string): string | null {
 }
 
 /**
- * Enumerate our data dirs under a plugins `data` root, newest state.json first.
+ * True for a directory that is an archived copy, not the live store.
  *
- * Backup directories (`*.BACKUP-*`) are deliberately included: they still start
- * with the plugin name and could in principle hold a live gateway. Liveness of
- * the recorded PID is what actually decides, not the name.
+ * WHY THIS MATTERS (found the hard way, 2026-08-23): the live dir's state.json
+ * was truncated to 0 bytes while the gateway was still running, so it stopped
+ * being a candidate — and a `*.BACKUP-20260614-pre-reindex` dir, whose stale
+ * state.json still parsed, won the election. The plugin would then have written
+ * every new memory into a two-month-old database, silently. A backup must never
+ * outrank a live directory, whatever their timestamps say.
+ */
+export function isBackupDir(dir: string): boolean {
+  return /\.(BACKUP|bak)[-_.]/i.test(basename(dir));
+}
+
+/**
+ * Enumerate our data dirs under a plugins `data` root, best candidate first.
+ *
+ * Order: PID alive, then non-backup, then newest state.json. A backup is kept
+ * in the list (it may legitimately be the only thing left) but can only win
+ * when nothing better exists — and the caller is told, via `chosenIsBackup`.
  */
 export function findOwnDataDirs(dataRoot: string): DataDirCandidate[] {
   let names: string[];
@@ -110,12 +128,12 @@ export function findOwnDataDirs(dataRoot: string): DataDirCandidate[] {
       const mtimeMs = statSync(statePath).mtimeMs;
       const parsed = JSON.parse(readFileSync(statePath, "utf-8")) as { pid?: unknown };
       const pid = typeof parsed.pid === "number" ? parsed.pid : 0;
-      out.push({ dir, pid, mtimeMs });
+      out.push({ dir, pid, mtimeMs, isBackup: isBackupDir(dir) });
     } catch {
-      // No readable state.json → not a usable candidate.
+      // No readable state.json (missing, empty, truncated) → not usable.
     }
   }
-  out.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  out.sort((a, b) => Number(a.isBackup) - Number(b.isBackup) || b.mtimeMs - a.mtimeMs);
   return out;
 }
 
@@ -152,13 +170,24 @@ export function resolveDataDirDetailed(opts: ResolveOptions): DataDirResolution 
   if (candidates.length > 0) {
     const alive = candidates.filter((c) => isAlive(c.pid));
     const pool = alive.length > 0 ? alive : candidates;
-    return { dir: pool[0].dir, source: "discovered", candidates };
+    const winner = pool[0];
+    return {
+      dir: winner.dir,
+      source: "discovered",
+      candidates,
+      chosenIsBackup: winner.isBackup,
+    };
   }
 
   const fromEnv = env.CLAUDE_PLUGIN_DATA;
   if (fromEnv && basename(fromEnv).startsWith(PLUGIN_NAME)) {
-    return { dir: fromEnv, source: "env", candidates };
+    return { dir: fromEnv, source: "env", candidates, chosenIsBackup: isBackupDir(fromEnv) };
   }
 
-  return { dir: join(home, ".tdai-memory"), source: "fallback", candidates };
+  return {
+    dir: join(home, ".tdai-memory"),
+    source: "fallback",
+    candidates,
+    chosenIsBackup: false,
+  };
 }
