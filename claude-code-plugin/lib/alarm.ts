@@ -31,7 +31,15 @@ export type AlarmCode =
   | "capture-empty"
   | "memory-stale"
   | "memory-degraded"
-  | "writing-to-backup";
+  | "writing-to-backup"
+  /**
+   * The eighth failure mode, found on 2026-08-23 while auditing the other
+   * seven: an exception anywhere inside `main()` (unreadable token file,
+   * corrupted state.json, a bug in a handler) used to end in ONE line of
+   * hook.log — memory fully off, no signal. The other tripwires cannot catch
+   * it because they all live inside the try block that never finishes.
+   */
+  | "hook-crashed";
 
 export interface AlarmRecord {
   code: AlarmCode;

@@ -749,7 +749,47 @@ async function main(): Promise<void> {
     if (out) process.stdout.write(out);
   } catch (err) {
     await safeLog(logPath, `${event}: ${(err as Error).message}`);
+    // NO SILENT FAILURE #3: this catch used to STOP at the line above. Every
+    // exception raised after the data dir was resolved — a missing token file,
+    // a corrupted state.json, a bug in any handler — turned recall AND capture
+    // off while writing one line into the file nobody reads. Same shape as the
+    // 2026-08-13 → 08-22 outage; none of the seven tripwires can see it,
+    // because they all live inside the try block that never completes.
+    // Verified live on 2026-08-23: with the token file removed, session-start,
+    // user-prompt-submit and stop all exited 0 and said nothing at all.
+    await reportHookCrash(dataDir, event, err);
+    // The prompt hook is the only channel Claude Code renders to the user, so
+    // when IT is the one that crashed, it must still speak before it dies.
+    if (event === "user-prompt-submit") {
+      try {
+        const line = await drainAlarms(dataDir);
+        if (line) process.stdout.write(JSON.stringify({ systemMessage: line }));
+      } catch {
+        // fail-open: an alarm that breaks the conversation is worse than the bug.
+      }
+    }
   }
+}
+
+/** Max chars of an error message forwarded to the user-facing alarm. */
+const MAX_CRASH_MESSAGE_CHARS = 200;
+
+/**
+ * Turn an unexpected exception into a signal Lorenzo actually sees.
+ * Never throws: reporting a failure must not become one.
+ */
+export async function reportHookCrash(
+  dataDir: string,
+  event: string,
+  err: unknown,
+): Promise<void> {
+  const raw = err instanceof Error ? err.message : String(err);
+  const detail = raw.slice(0, MAX_CRASH_MESSAGE_CHARS);
+  await raiseAlarm(
+    dataDir,
+    "hook-crashed",
+    `la memoria si è fermata con un errore (${event}) — nulla viene salvato né richiamato: ${detail}`,
+  );
 }
 
 function readStdin(): Promise<string> {
