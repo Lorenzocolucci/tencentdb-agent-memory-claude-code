@@ -106,6 +106,27 @@ describe("file injection is project-scoped (README canary leak)", () => {
     expect(buildFileInjection(store, "C:\\Sofia-AI\\src\\types.ts", { project: "Sofia-AI" })).toBeNull();
   });
 
+  it("nemmeno un ALIAS fa attraversare il confine di progetto a un file", () => {
+    // L'entità viva ent_5df45b96cfdb8ed5 porta l'alias "sofia-ai:README.md".
+    // Un alias è l'altra porta della stessa stanza: se cattura per nome, la
+    // chiave scoped non serve a niente.
+    const a = store.resolveOrCreateEntity!({
+      type: "file",
+      name: "note.md",
+      aliases: ["appunti.md"],
+      project: "Sofia-AI",
+      now: NOW,
+    });
+    const b = store.resolveOrCreateEntity!({
+      type: "file",
+      name: "appunti.md",
+      project: "Argus",
+      now: NOW,
+    });
+    expect(b.id).not.toBe(a.id);
+    expect(b.project).toBe("Argus");
+  });
+
   it("un percorso ASSOLUTO identifica il file da solo: resta visibile senza tag progetto", () => {
     // Le entità con percorso assoluto nominano UN file su questa macchina:
     // non c'è ambiguità da risolvere, quindi non le zittiamo.

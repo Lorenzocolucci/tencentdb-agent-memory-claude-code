@@ -444,6 +444,17 @@ export function resolveOrCreateEntity(
     .prepare("SELECT * FROM entities WHERE namespace = ? AND type = ?")
     .all(namespace, normType) as Array<Record<string, unknown>>;
   for (const cand of candidates) {
+    // Un alias non scavalca il confine di progetto per un FILE: "readme.md"
+    // registrato come alias del README di un altro repo non deve catturare
+    // questo. (L'entità viva ent_5df45b96cfdb8ed5 porta davvero l'alias
+    // "sofia-ai:README.md": è l'altra porta della stessa stanza.) Per gli altri
+    // tipi l'alias resta trasversale — è lì che l'associatività deve vivere.
+    if (
+      normType === "file" &&
+      normalizeProjectTag(cand.project as string) !== normalizeProjectTag(project)
+    ) {
+      continue;
+    }
     const aliases = parseJsonArray(cand.aliases_json).map((a) => normalizeBase(a));
     if (aliases.includes(normName)) {
       // Follow merged_into to the canonical, then merge the incoming display
