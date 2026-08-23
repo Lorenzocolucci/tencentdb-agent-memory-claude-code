@@ -1034,6 +1034,9 @@ export class TdaiCore {
         const ent = store.resolveOrCreateEntity({
           type: "file",
           name: ev.filePath,
+          // Without the project tag this created another GLOBAL `file:<name>`
+          // entity — the shape that leaks one repo's facts into every other.
+          project: store.getSessionProject?.(obs.sessionKey),
           now: new Date().toISOString(),
         });
         if (ent?.id) entities.push(ent.id);
@@ -1112,6 +1115,10 @@ export class TdaiCore {
       toolOutputIsError: obs.toolOutputIsError,
     });
 
+    // Which project are we in? File memory is project-local: without this the
+    // basename fallback surfaces another repo's facts about a same-named file.
+    const project = store.getSessionProject?.(obs.sessionKey);
+
     // Fold this event into the session's rolling situation (immutable).
     const fileKey = situation.filePath ? canonicalKey("file", situation.filePath) : undefined;
     const errorSignature = situation.isError ? `${obs.toolName}:error` : undefined;
@@ -1150,11 +1157,12 @@ export class TdaiCore {
           const block = buildFileInjection(store, situation.filePath, {
             sessionId: obs.sessionKey,
             actionContent,
+            project,
           });
           if (block) {
             injectedFiles.add(fileKey);
             blocks.push(block);
-            const ownerId = resolveFileOwnerId(store, situation.filePath);
+            const ownerId = resolveFileOwnerId(store, situation.filePath, project);
             if (ownerId && !owners.has(ownerId)) {
               owners.add(ownerId);
               surfacedNow.push(ownerId);

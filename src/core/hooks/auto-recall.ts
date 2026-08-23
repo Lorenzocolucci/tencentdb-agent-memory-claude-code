@@ -745,6 +745,8 @@ export async function runKbRecall(
           sessionKey: sit.sessionKey,
           namespace: sit.namespace,
           situation: sit.situation,
+          // File seeds must be THIS project's files (see situation-cue.project).
+          project: projectName,
           logger,
         });
         situationSeedIds = seeds.map((s) => s.id);

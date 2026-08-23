@@ -66,12 +66,21 @@ describe("buildFileInjection", () => {
     expect(out).toContain("errorFilter");
   });
 
-  it("matches a file the KB stored by basename when touched via full path", () => {
-    // The live KB sometimes stores file entities by basename only.
-    const ent = store.resolveOrCreateEntity!({ type: "file", name: "whatsapp-sofia.ts", now: NOW });
+  it("matches a file the KB stored by basename when touched via full path — WITHIN the project", () => {
+    // The live KB sometimes stores file entities by basename only. The fallback
+    // is kept, but scoped: a bare basename is not an identity across projects
+    // (see situation-injection-project-scope.test.ts for the leak it caused).
+    const ent = store.resolveOrCreateEntity!({
+      type: "file",
+      name: "whatsapp-sofia.ts",
+      project: "Sofia-AI",
+      now: NOW,
+    });
     store.upsertFact!({ entityId: ent.id, attribute: "channel", value: "WhatsApp", now: NOW });
 
-    const out = buildFileInjection(store, "C:\\Sofia-AI\\src\\services\\whatsapp-sofia.ts");
+    const out = buildFileInjection(store, "C:\\Sofia-AI\\src\\services\\whatsapp-sofia.ts", {
+      project: "Sofia-AI",
+    });
     expect(out).not.toBeNull();
     expect(out).toContain("channel");
   });
