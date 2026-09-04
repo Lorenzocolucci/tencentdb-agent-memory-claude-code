@@ -1,5 +1,11 @@
 # 🧠 Il Sistema di Memoria — Blueprint
 
+> **Vedi anche**: gli altri documenti vivi di Sinapsys — [STATO-REALE](../STATO-REALE.md) ·
+> [CODE-POINTER](../CODE-POINTER.md) · [INTERCONNECTION-MAP](../02-architecture/INTERCONNECTION-MAP.md) ·
+> [SINAPSYS-ARCHITECTURE](../../SINAPSYS-ARCHITECTURE.md) ·
+> [SINAPSYS_FOUNDATIONS](../../SINAPSYS_FOUNDATIONS.md). Il quadro di tutti e 5 i sistemi:
+> `C:\RISTRUTTURAZIONE\04-I-CINQUE-SISTEMI.md`. Dove siamo adesso: `C:\RISTRUTTURAZIONE\00-STATO.md`.
+
 > Creato da Lorenzo Colucci e Claude, 16 giugno 2026
 > Versione 1.0 — documento vivo, aggiornare ad ogni progresso
 >
