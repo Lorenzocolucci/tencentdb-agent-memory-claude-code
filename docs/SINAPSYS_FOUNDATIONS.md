@@ -1,5 +1,11 @@
 # 🏛️ SINAPSYS — Foundations Blueprint (le fondamenta che reggono tutto l'edificio)
 
+> **Vedi anche**: gli altri documenti vivi di Sinapsys — [STATO-REALE](vision/STATO-REALE.md) ·
+> [MEMORIA-BLUEPRINT](vision/01-vision-and-plan/MEMORIA-BLUEPRINT.md) · [CODE-POINTER](vision/CODE-POINTER.md) ·
+> [INTERCONNECTION-MAP](vision/02-architecture/INTERCONNECTION-MAP.md) ·
+> [SINAPSYS-ARCHITECTURE](SINAPSYS-ARCHITECTURE.md). Il quadro di tutti e 5 i sistemi:
+> `C:\RISTRUTTURAZIONE\04-I-CINQUE-SISTEMI.md`. Dove siamo adesso: `C:\RISTRUTTURAZIONE\00-STATO.md`.
+
 > ## 📊 2026-08-23 — le fondamenta OGGI (misurate sul DB live)
 > Le tabelle-mattone sono tutte create e **popolate**. Numeri reali:
 > `memory_lifecycle` **34.309** righe (850 `long`, 1.517 rinforzate) ·

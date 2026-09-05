@@ -1,5 +1,11 @@
 # Sinapsys — Architecture Map
 
+> **Vedi anche**: gli altri documenti vivi di Sinapsys — [STATO-REALE](vision/STATO-REALE.md) ·
+> [MEMORIA-BLUEPRINT](vision/01-vision-and-plan/MEMORIA-BLUEPRINT.md) · [CODE-POINTER](vision/CODE-POINTER.md) ·
+> [INTERCONNECTION-MAP](vision/02-architecture/INTERCONNECTION-MAP.md) ·
+> [SINAPSYS_FOUNDATIONS](SINAPSYS_FOUNDATIONS.md). Il quadro di tutti e 5 i sistemi:
+> `C:\RISTRUTTURAZIONE\04-I-CINQUE-SISTEMI.md`. Dove siamo adesso: `C:\RISTRUTTURAZIONE\00-STATO.md`.
+
 > **What it is.** Sinapsys is **associative long-term memory for AI agents**. Not a
 > vector database you query — a graph where one memory *triggers* another and the
 > relevant memories *come to the agent unbidden* (proactive injection). Reconstruction,

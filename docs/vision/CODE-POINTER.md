@@ -1,5 +1,11 @@
 # 📍 Dove vive il CODICE
 
+> **Vedi anche**: gli altri documenti vivi di Sinapsys — [STATO-REALE](STATO-REALE.md) ·
+> [MEMORIA-BLUEPRINT](01-vision-and-plan/MEMORIA-BLUEPRINT.md) · [INTERCONNECTION-MAP](02-architecture/INTERCONNECTION-MAP.md) ·
+> [SINAPSYS-ARCHITECTURE](../SINAPSYS-ARCHITECTURE.md) ·
+> [SINAPSYS_FOUNDATIONS](../SINAPSYS_FOUNDATIONS.md). Il quadro di tutti e 5 i sistemi:
+> `C:\RISTRUTTURAZIONE\04-I-CINQUE-SISTEMI.md`. Dove siamo adesso: `C:\RISTRUTTURAZIONE\00-STATO.md`.
+
 > Aggiornato **2026-08-23** (verificato, non a memoria). Stato del progetto: [STATO-REALE.md](STATO-REALE.md).
 
 Il codice di Sinapsys si costruisce **sopra TencentDB Agent Memory** (decisione [ADR-0001](04-decisions/ADR-0001-build-on-tencentdb.md)).
