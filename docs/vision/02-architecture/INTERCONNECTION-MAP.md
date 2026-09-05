@@ -1,5 +1,11 @@
 # 🗺️ Mappa delle Interconnessioni
 
+> **Vedi anche**: gli altri documenti vivi di Sinapsys — [STATO-REALE](../STATO-REALE.md) ·
+> [MEMORIA-BLUEPRINT](../01-vision-and-plan/MEMORIA-BLUEPRINT.md) · [CODE-POINTER](../CODE-POINTER.md) ·
+> [SINAPSYS-ARCHITECTURE](../../SINAPSYS-ARCHITECTURE.md) ·
+> [SINAPSYS_FOUNDATIONS](../../SINAPSYS_FOUNDATIONS.md). Il quadro di tutti e 5 i sistemi:
+> `C:\RISTRUTTURAZIONE\04-I-CINQUE-SISTEMI.md`. Dove siamo adesso: `C:\RISTRUTTURAZIONE\00-STATO.md`.
+
 > **Aggiornata 2026-08-23** — riscritta sui flussi REALI. Regola: questo file si aggiorna PRIMA di considerare completo
 > un cambio di struttura.
 >

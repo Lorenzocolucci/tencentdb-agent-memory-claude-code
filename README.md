@@ -3,6 +3,9 @@
 > This is a community fork maintained by [Lorenzo Colucci](https://github.com/Lorenzocolucci) that makes TencentDB Agent Memory run end-to-end on **Windows 11 (incl. ARM64)** with **Claude Code**. For what this fork adds and how to install it, see **[claude-code-plugin/README.md](./claude-code-plugin/README.md)**. The original project and its documentation (below) are by Tencent — all credit and the MIT license are preserved.
 
 <!-- SINAPSYS NOTICE -->
+> ℹ️ **Dal 04/09/2026 esiste anche `CLAUDE.md`** in questa stessa cartella: si carica da solo
+> all'apertura di una sessione qui. Leggilo per primo, poi questo README.
+>
 > **🧠 This fork is also where Sinapsys is built.**
 > Sinapsys is **associative** long-term memory for AI agents: a graph where one memory
 > *triggers* another and the relevant ones *come to the agent unbidden* — reconstruction, not

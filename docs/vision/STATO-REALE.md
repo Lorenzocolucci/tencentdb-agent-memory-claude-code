@@ -1,5 +1,11 @@
 # 🧭 SINAPSYS — STATO REALE
 
+> **Vedi anche**: gli altri documenti vivi di Sinapsys — [MEMORIA-BLUEPRINT](01-vision-and-plan/MEMORIA-BLUEPRINT.md) ·
+> [CODE-POINTER](CODE-POINTER.md) · [INTERCONNECTION-MAP](02-architecture/INTERCONNECTION-MAP.md) ·
+> [SINAPSYS-ARCHITECTURE](../SINAPSYS-ARCHITECTURE.md) ·
+> [SINAPSYS_FOUNDATIONS](../SINAPSYS_FOUNDATIONS.md). Il quadro di tutti e 5 i sistemi:
+> `C:\RISTRUTTURAZIONE\04-I-CINQUE-SISTEMI.md`. Dove siamo adesso: `C:\RISTRUTTURAZIONE\00-STATO.md`.
+
 > **Aggiornato: 2026-08-23.** Ogni numero qui è stato **misurato**, non ricordato.
 > **Questo è il documento da leggere PER PRIMO.** Tutti gli altri partono da qui.
 >
