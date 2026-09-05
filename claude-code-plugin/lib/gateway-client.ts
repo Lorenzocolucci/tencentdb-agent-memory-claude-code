@@ -73,6 +73,15 @@ export interface SearchResult {
   strategy?: string;
 }
 
+/** Risk tag on /observe. Only one value for now (shared contract, 2026-09-05). */
+export type ToolRisk = "destructive";
+
+/** Result of POST /memory/confirm | /memory/reject. */
+export interface GatedMemoryResult {
+  ok: boolean;
+  text: string;
+}
+
 /** What /health actually tells us. `null` from healthDetailed() = unreachable. */
 export interface HealthDetail {
   status?: "ok" | "degraded";
@@ -205,8 +214,14 @@ export class GatewayClient {
     sessionKey: string;
     toolInput?: unknown;
     toolOutputIsError?: boolean;
-    /** Raw output of a FAILED tool call — feeds friction capture. */
+    /**
+     * Raw output of a FAILED tool call — feeds friction capture. When
+     * `toolRisk` is set it is instead the first 400 chars of a SUCCESSFUL
+     * destructive command's output.
+     */
     toolOutputText?: string;
+    /** Set when a successful Bash command matched the destructive list. */
+    toolRisk?: ToolRisk;
   }): Promise<string> {
     try {
       const token = await this.freshToken();
@@ -219,6 +234,7 @@ export class GatewayClient {
           tool_input: payload.toolInput,
           tool_output_text: payload.toolOutputText,
           tool_output_is_error: payload.toolOutputIsError,
+          tool_risk: payload.toolRisk,
         },
         token,
         RECALL_TIMEOUT_MS,
@@ -340,6 +356,43 @@ export class GatewayClient {
       }
     } catch (err) {
       await this.logFailure("POST", "/session/end", err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /**
+   * POST /memory/confirm | /memory/reject — resolve a grounded-trust gate from
+   * Claude Code. 200 and 409 both carry `{ok, text}` (409 = the store could
+   * not apply it); 400 carries `{error}` and is mapped to `{ok:false, text}`.
+   * Returns null only on transport failure or an unexpected status, so the
+   * caller can say "not applied" instead of pretending.
+   */
+  async resolveGatedMemory(
+    decision: "confirm" | "reject",
+    ownerId: string,
+    ownerKind: "fact" | "event",
+  ): Promise<GatedMemoryResult | null> {
+    const path = `/memory/${decision}`;
+    try {
+      const token = await this.freshToken();
+      const { status, body } = await this.rawRequest(
+        "POST",
+        path,
+        { owner_id: ownerId, owner_kind: ownerKind },
+        token,
+      );
+      if (status === 200 || status === 409) {
+        const parsed = JSON.parse(body) as { ok?: boolean; text?: string };
+        return { ok: parsed.ok === true, text: parsed.text ?? "" };
+      }
+      if (status === 400) {
+        const parsed = JSON.parse(body) as { error?: string };
+        return { ok: false, text: parsed.error ?? this.describeStatus(status, body) };
+      }
+      await this.logFailure("POST", path, this.describeStatus(status, body));
+      return null;
+    } catch (err) {
+      await this.logFailure("POST", path, err instanceof Error ? err.message : String(err));
+      return null;
     }
   }
 

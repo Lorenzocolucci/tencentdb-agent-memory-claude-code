@@ -144,7 +144,8 @@ var GatewayClient = class {
 				tool_name: payload.toolName,
 				tool_input: payload.toolInput,
 				tool_output_text: payload.toolOutputText,
-				tool_output_is_error: payload.toolOutputIsError
+				tool_output_is_error: payload.toolOutputIsError,
+				tool_risk: payload.toolRisk
 			}, token, RECALL_TIMEOUT_MS);
 			if (status !== 200) {
 				await this.logFailure("POST", "/observe", this.describeStatus(status, body));
@@ -249,6 +250,39 @@ var GatewayClient = class {
 			if (status !== 200) await this.logFailure("POST", "/session/end", this.describeStatus(status, body));
 		} catch (err) {
 			await this.logFailure("POST", "/session/end", err instanceof Error ? err.message : String(err));
+		}
+	}
+	/**
+	* POST /memory/confirm | /memory/reject — resolve a grounded-trust gate from
+	* Claude Code. 200 and 409 both carry `{ok, text}` (409 = the store could
+	* not apply it); 400 carries `{error}` and is mapped to `{ok:false, text}`.
+	* Returns null only on transport failure or an unexpected status, so the
+	* caller can say "not applied" instead of pretending.
+	*/
+	async resolveGatedMemory(decision, ownerId, ownerKind) {
+		const path = `/memory/${decision}`;
+		try {
+			const token = await this.freshToken();
+			const { status, body } = await this.rawRequest("POST", path, {
+				owner_id: ownerId,
+				owner_kind: ownerKind
+			}, token);
+			if (status === 200 || status === 409) {
+				const parsed = JSON.parse(body);
+				return {
+					ok: parsed.ok === true,
+					text: parsed.text ?? ""
+				};
+			}
+			if (status === 400) return {
+				ok: false,
+				text: JSON.parse(body).error ?? this.describeStatus(status, body)
+			};
+			await this.logFailure("POST", path, this.describeStatus(status, body));
+			return null;
+		} catch (err) {
+			await this.logFailure("POST", path, err instanceof Error ? err.message : String(err));
+			return null;
 		}
 	}
 	rawRequest(method, path, bodyObj, token = this.token, timeoutMs = this.timeoutMs) {
@@ -940,6 +974,64 @@ function describeStaleness(v) {
 	return `BUCO nella memoria: hai lavorato per ${days > 0 ? `${days} giorni e ${hours} ore` : `${hours} ore`} dopo l'ultimo ricordo salvato (${v.lastCapture ? v.lastCapture.toISOString().slice(0, 16).replace("T", " ") : "mai"})`;
 }
 //#endregion
+//#region lib/destructive-commands.ts
+/** Commands whose success is worth remembering. Order = first match wins. */
+const DESTRUCTIVE_RULES = [
+	{
+		label: "git worktree remove",
+		pattern: /\bgit\s+worktree\s+remove\b/
+	},
+	{
+		label: "rm -r",
+		pattern: /(^|[\s;&|"'(])rm\s+(-[A-Za-z]*[rR][A-Za-z]*\b|--recursive\b)/
+	},
+	{
+		label: "git reset --hard",
+		pattern: /\bgit\s+reset\s+(?:[^|&;]*\s)?--hard\b/
+	},
+	{
+		label: "git clean -f",
+		pattern: /\bgit\s+clean\b[^|&;]*\s-[A-Za-z]*f[A-Za-z]*\b/
+	},
+	{
+		label: "git push --force",
+		pattern: /\bgit\s+push\b[^|&;]*\s(?:--force(?:-with-lease)?\b|-f\b)/
+	},
+	{
+		label: "git branch -D",
+		pattern: /\bgit\s+branch\s+(?:[^|&;]*\s)?-D\b/
+	},
+	{
+		label: "DROP TABLE",
+		pattern: /\bdrop\s+table\b/i
+	},
+	{
+		label: "TRUNCATE",
+		pattern: /\btruncate\b/i
+	},
+	{
+		label: "del /s",
+		pattern: /(^|[\s;&|"'(])del\s+(?:\/[a-z]\s+)*\/s\b/i
+	},
+	{
+		label: "Remove-Item -Recurse",
+		pattern: /\bremove-item\b[^|&;]*\s-recurse\b/i
+	},
+	{
+		label: "format <drive>",
+		pattern: /(^|[\s;&|"'(])format\s+[a-z]:/i
+	}
+];
+/**
+* Returns the label of the first destructive rule matching `command`, or null
+* when the command is not on the list.
+*/
+function matchDestructiveCommand(command) {
+	if (typeof command !== "string" || !command.trim()) return null;
+	for (const rule of DESTRUCTIVE_RULES) if (rule.pattern.test(command)) return rule.label;
+	return null;
+}
+//#endregion
 //#region lib/hook.ts
 /**
 * Unified hook entry point. Dispatched by the first CLI arg.
@@ -948,8 +1040,8 @@ function describeStaleness(v) {
 *   node ${CLAUDE_PLUGIN_ROOT}/dist/lib/hook.mjs <event-name>
 *
 * Where <event-name> is one of:
-*   session-start | user-prompt-submit | post-tool-use | stop |
-*   search | status | clear-session
+*   session-start | user-prompt-submit | post-tool-use | post-tool-use-failure |
+*   stop | search | search-stdin | status | clear-session | confirm | reject
 */
 const MAX_INJECT_CHARS = 1e4;
 const MAX_CAPTURE_TURNS = 50;
@@ -960,11 +1052,14 @@ async function handleHook(event, input) {
 		case "session-start": return handleSessionStart(data, input.client, dataDir);
 		case "user-prompt-submit": return handleUserPromptSubmit(data, input.client, dataDir);
 		case "post-tool-use": return handlePostToolUse(data, input.client);
+		case "post-tool-use-failure": return handlePostToolUseFailure(data, input.client);
 		case "stop": return handleStop(data, input.client, dataDir);
 		case "search": return handleSearch(input.args ?? [], input.client);
 		case "search-stdin": return handleSearchStdin(input.stdin, input.client);
 		case "status": return handleStatus(input.client);
 		case "clear-session": return handleClearSession(data, input.client);
+		case "confirm": return handleResolveGatedMemory("confirm", input.stdin, input.client);
+		case "reject": return handleResolveGatedMemory("reject", input.stdin, input.client);
 		default: return "";
 	}
 }
@@ -1028,10 +1123,11 @@ const MAX_TOOL_OUTPUT_CHARS = 2e3;
 * undefined when there is nothing usable — the caller then sends nothing and
 * behaviour is exactly as before.
 */
-function stringifyToolOutput(resp) {
+function stringifyToolOutput(resp, maxChars = MAX_TOOL_OUTPUT_CHARS) {
 	if (resp == null) return void 0;
 	let text;
 	if (typeof resp === "string") text = resp;
+	else if (resp instanceof Error) text = resp.message;
 	else try {
 		text = JSON.stringify(resp) ?? "";
 	} catch {
@@ -1039,24 +1135,56 @@ function stringifyToolOutput(resp) {
 	}
 	text = text.trim();
 	if (!text) return void 0;
-	return text.length > MAX_TOOL_OUTPUT_CHARS ? text.slice(0, MAX_TOOL_OUTPUT_CHARS) : text;
+	return text.length > maxChars ? text.slice(0, maxChars) : text;
 }
+/** Max characters of a SUCCESSFUL destructive command's output forwarded. */
+const MAX_DESTRUCTIVE_OUTPUT_CHARS = 400;
 async function handlePostToolUse(data, client) {
 	const toolName = data.tool_name ?? "";
 	if (!toolName) return "";
 	const sessionKey = getSessionKey(data.cwd ?? process.cwd());
-	const toolOutputText = data.tool_output_is_error === true ? stringifyToolOutput(data.tool_response) : void 0;
+	let toolOutputText = data.tool_output_is_error === true ? stringifyToolOutput(data.tool_response) : void 0;
+	const toolRisk = (toolName === "Bash" && data.tool_output_is_error !== true ? matchDestructiveCommand(data.tool_input?.command) : null) ? "destructive" : void 0;
+	if (toolRisk && toolOutputText === void 0) toolOutputText = stringifyToolOutput(data.tool_response, MAX_DESTRUCTIVE_OUTPUT_CHARS);
 	let context = await client.observe({
 		toolName,
 		sessionKey,
 		toolInput: data.tool_input,
 		toolOutputIsError: data.tool_output_is_error,
-		toolOutputText
+		toolOutputText,
+		toolRisk
 	});
 	if (!context) return "";
 	if (context.length > MAX_INJECT_CHARS) context = context.slice(0, MAX_INJECT_CHARS - 100) + "\n\n[…truncated…]";
 	return JSON.stringify({ hookSpecificOutput: {
 		hookEventName: "PostToolUse",
+		additionalContext: context
+	} });
+}
+/**
+* PostToolUseFailure (Claude Code >= 2.1): the host reports a failed tool call
+* on its own event with an `error` field instead of `tool_output_is_error` on
+* PostToolUse. Forward it as a failed observation so friction capture finally
+* fires live (it produced ZERO events in its first 29 days because nothing
+* ever subscribed to this event). A user interrupt is not friction: skip it.
+*/
+async function handlePostToolUseFailure(data, client) {
+	const toolName = data.tool_name ?? "";
+	if (!toolName) return "";
+	if (data.is_interrupt === true) return "";
+	const sessionKey = getSessionKey(data.cwd ?? process.cwd());
+	const toolOutputText = stringifyToolOutput(data.error) ?? (data.error_type ? String(data.error_type) : void 0);
+	let context = await client.observe({
+		toolName,
+		sessionKey,
+		toolInput: data.tool_input,
+		toolOutputIsError: true,
+		toolOutputText
+	});
+	if (!context) return "";
+	if (context.length > MAX_INJECT_CHARS) context = context.slice(0, MAX_INJECT_CHARS - 100) + "\n\n[…truncated…]";
+	return JSON.stringify({ hookSpecificOutput: {
+		hookEventName: "PostToolUseFailure",
 		additionalContext: context
 	} });
 }
@@ -1187,6 +1315,29 @@ async function handleSearchStdin(rawStdin, client) {
 	const query = rawStdin.trim();
 	if (!query) return "Usage: pipe the query to stdin";
 	return (await client.searchMemories(query, { limit: 10 })).results || "No memories found.";
+}
+/**
+* Confirm / reject a gated (grounded-trust) memory from Claude Code. The owner
+* id rides on stdin for the same reason as search-stdin: `$ARGUMENTS` is a
+* literal replaceAll in cc, so an id on argv would be a command-injection
+* surface. `owner_kind` is inferred from the id prefix the store uses
+* (`fact_…` / `event_…`); anything else is refused with a clear message —
+* exit code stays 0 so the skill output is rendered, not swallowed.
+*/
+async function handleResolveGatedMemory(decision, rawStdin, client) {
+	const ownerId = rawStdin.trim();
+	if (!ownerId) return `Usage: pipe the memory id (fact_… or event_…) to stdin for /memory-${decision}`;
+	const ownerKind = inferOwnerKind(ownerId);
+	if (!ownerKind) return `Cannot ${decision} "${ownerId}": the id must start with "fact_" or "event_" (copy it from the memory prompt).`;
+	const res = await client.resolveGatedMemory(decision, ownerId, ownerKind);
+	if (!res) return `Memory gateway unreachable — ${decision} of ${ownerId} NOT applied. Try /memory-status.`;
+	return res.text || (res.ok ? `${decision} applied to ${ownerId}` : `${decision} NOT applied to ${ownerId}`);
+}
+/** Owner kind from the id prefix the store uses; null when unrecognised. */
+function inferOwnerKind(ownerId) {
+	if (/^fact_[A-Za-z0-9]+$/.test(ownerId)) return "fact";
+	if (/^event_[A-Za-z0-9]+$/.test(ownerId)) return "event";
+	return null;
 }
 async function handleStatus(client) {
 	const ok = await client.health();
@@ -1395,4 +1546,4 @@ async function safeLog(path, msg) {
 }
 if (!!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main().catch(() => process.exit(0));
 //#endregion
-export { handleHook, reportHookCrash };
+export { handleHook, inferOwnerKind, reportHookCrash };
