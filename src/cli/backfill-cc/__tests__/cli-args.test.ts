@@ -38,7 +38,7 @@ describe("parseCliArgs", () => {
 
   it("parses --run overrides", () => {
     const opts = parseCliArgs(
-      ["--run", "--hook", "C:\\custom\\hook.mjs", "--pace-ms", "100", "--include-argus-children"],
+      ["--run", "--hook", "C:\\custom\\hook.mjs", "--pace-ms", "100", "--include-argus-children", "--capture-timeout-ms", "45000"],
       env,
     );
     expect(opts.command).toBe("run");
@@ -46,7 +46,14 @@ describe("parseCliArgs", () => {
       expect(opts.hookPath).toBe("C:\\custom\\hook.mjs");
       expect(opts.paceMs).toBe(100);
       expect(opts.includeArgusChildren).toBe(true);
+      expect(opts.captureTimeoutMs).toBe(45_000);
     }
+  });
+
+  it("--run defaults the capture timeout to 5 minutes (offline replay waits, never floods)", () => {
+    const opts = parseCliArgs(["--run"], env);
+    if (opts.command === "run") expect(opts.captureTimeoutMs).toBe(300_000);
+    expect(opts.command).toBe("run");
   });
 
   it("parses --digest with default keys=null (derive from state) and default stall/gateway", () => {

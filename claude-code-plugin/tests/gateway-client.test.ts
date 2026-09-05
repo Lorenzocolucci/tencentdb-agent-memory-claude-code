@@ -1,6 +1,23 @@
 import { describe, it, expect, afterEach } from "vitest";
 import http from "node:http";
-import { GatewayClient } from "../lib/gateway-client.js";
+import { CAPTURE_TIMEOUT_MS, GatewayClient, resolveCaptureTimeoutMs } from "../lib/gateway-client.js";
+
+describe("resolveCaptureTimeoutMs", () => {
+  it("keeps the live 12s default when TDAI_CAPTURE_TIMEOUT_MS is absent or empty", () => {
+    expect(resolveCaptureTimeoutMs({})).toBe(CAPTURE_TIMEOUT_MS);
+    expect(resolveCaptureTimeoutMs({ TDAI_CAPTURE_TIMEOUT_MS: "" })).toBe(CAPTURE_TIMEOUT_MS);
+  });
+
+  it("honours a positive integer override (offline replay of a big transcript)", () => {
+    expect(resolveCaptureTimeoutMs({ TDAI_CAPTURE_TIMEOUT_MS: "300000" })).toBe(300_000);
+  });
+
+  it("ignores garbage, zero, negatives and fractions", () => {
+    for (const v of ["abc", "0", "-5", "12.5", "NaN"]) {
+      expect(resolveCaptureTimeoutMs({ TDAI_CAPTURE_TIMEOUT_MS: v })).toBe(CAPTURE_TIMEOUT_MS);
+    }
+  });
+});
 
 interface CapturedRequest {
   method: string;

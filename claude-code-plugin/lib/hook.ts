@@ -9,7 +9,7 @@
  *   stop | search | search-stdin | status | clear-session | confirm | reject
  */
 
-import { GatewayClient, RECALL_TIMEOUT_MS, CAPTURE_TIMEOUT_MS } from "./gateway-client.js";
+import { GatewayClient, RECALL_TIMEOUT_MS, resolveCaptureTimeoutMs } from "./gateway-client.js";
 import { getSessionKey, getProjectName } from "./session-key.js";
 import { readAllTurns } from "./transcript.js";
 import { DaemonManager, readDaemonState, clearDaemonState } from "./daemon.js";
@@ -850,7 +850,7 @@ async function main(): Promise<void> {
       // Phase 3: HOOK CLIENT TIMEOUT — use named constants, not magic numbers.
       // recall: short (non-blocking prompt); capture: generous (don't drop saves);
       // other events: DEFAULT_TIMEOUT_MS (see gateway-client.ts constants).
-      timeoutMs: event === "user-prompt-submit" ? RECALL_TIMEOUT_MS : CAPTURE_TIMEOUT_MS,
+      timeoutMs: event === "user-prompt-submit" ? RECALL_TIMEOUT_MS : resolveCaptureTimeoutMs(),
       logPath,
       // Phase 3: TOKEN/AUTH — pass tokenPath so the client always reads the
       // CURRENT token from file on each request; handles stale-token-after-restart.

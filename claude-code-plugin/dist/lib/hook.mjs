@@ -36,6 +36,23 @@ const RECALL_TIMEOUT_MS = 6e3;
 /** Capture timeout: session save is more important; allow extra time for a
 *  slow gateway write-through before declaring the save lost. */
 const CAPTURE_TIMEOUT_MS = 12e3;
+/**
+* The capture timeout the client actually uses. Live hooks keep the 12s
+* default (the Stop hook has a 30s budget in hooks.json and retries once).
+* An OFFLINE replay (tools/backfill-cc-sessions.mts) is a different animal:
+* a never-captured 18 MB transcript sends its last 50 turns in one call and
+* the gateway needs well over 12s to write them. Measured 2026-09-05: every
+* call timed out client-side, the gateway kept processing each abandoned
+* request anyway, the cursor never advanced, and the loop re-sent the same
+* 50 turns 20 times. `TDAI_CAPTURE_TIMEOUT_MS` (positive integer) lets the
+* replay wait instead of flooding.
+*/
+function resolveCaptureTimeoutMs(env = process.env) {
+	const raw = env.TDAI_CAPTURE_TIMEOUT_MS;
+	if (raw === void 0 || raw === "") return CAPTURE_TIMEOUT_MS;
+	const n = Number(raw);
+	return Number.isInteger(n) && n > 0 ? n : CAPTURE_TIMEOUT_MS;
+}
 var GatewayClient = class {
 	baseUrl;
 	token;
@@ -175,11 +192,12 @@ var GatewayClient = class {
 	async captureTurnOnce(payload) {
 		try {
 			const token = await this.freshToken();
-			const { status, body } = await this.rawRequest("POST", "/capture", payload, token, CAPTURE_TIMEOUT_MS);
+			const captureTimeoutMs = resolveCaptureTimeoutMs();
+			const { status, body } = await this.rawRequest("POST", "/capture", payload, token, captureTimeoutMs);
 			if (status === 401 && this.tokenPath) {
 				this.token = "";
 				const freshTok = await this.freshToken();
-				const retry = await this.rawRequest("POST", "/capture", payload, freshTok, CAPTURE_TIMEOUT_MS);
+				const retry = await this.rawRequest("POST", "/capture", payload, freshTok, captureTimeoutMs);
 				if (retry.status === 200) return JSON.parse(retry.body);
 				await this.logFailure("POST", "/capture", `401 after token refresh: ${this.describeStatus(retry.status, retry.body)}`);
 				return null;
@@ -1501,7 +1519,7 @@ async function main() {
 			client: new GatewayClient({
 				baseUrl: `http://127.0.0.1:${state.port}`,
 				token,
-				timeoutMs: event === "user-prompt-submit" ? RECALL_TIMEOUT_MS : CAPTURE_TIMEOUT_MS,
+				timeoutMs: event === "user-prompt-submit" ? RECALL_TIMEOUT_MS : resolveCaptureTimeoutMs(),
 				logPath,
 				tokenPath: state.tokenPath
 			}),

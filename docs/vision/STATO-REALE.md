@@ -34,11 +34,65 @@ un altro e i ricordi **arrivano all'agente** senza che li cerchi. Non un motore 
 | **Config attiva** | ⚠️ `C:\Users\lo\.memory-tencentdb\memory-tdai\tdai-gateway.yaml` — **NON** in `tdai-gateway\`, errore facile da fare |
 | **Avvio / stop** | `C:\Users\lo\tdai-gateway\start-gateway.ps1` / `stop-gateway.ps1` |
 | **Embedder** | DeepInfra **Qwen3-Embedding-4B @ 1024 dim** (verificato in `embedding_meta`) |
-| **Estrazione** | Moonshot/Kimi (`TDAI_LLM_*`), fallback `gpt-5.4-mini` |
+| **Estrazione** | Moonshot **`kimi-k2.6`** (`TDAI_LLM_MODEL`; ragionamento spento in automatico sugli host Moonshot, `TDAI_LLM_THINKING` per forzarlo), ripiego **su ogni chiamata LLM** `gpt-5.4-mini` (`TDAI_FALLBACK_LLM_*`, chiave `OPENAI_API_KEY`) — dal 05/09/2026, vedi §2-bis |
 
 **Salute al 2026-08-23:** gateway `status: ok`, `embedding: ok`, recall live via `strategy=kb`
 (**0,5 s a caldo**, 13,6 s la prima query a freddo), `/health` riporta ora anche `last_capture_at`.
 **1.052 test verdi, 0 rossi** (2 saltati: solo-POSIX su Windows).
+
+---
+
+## 2-bis. AGGIORNAMENTO 05/09/2026 — quattro guasti riparati, tutti misurati
+
+**Che cosa era rotto** (letto nei log del gateway vivo, `gateway.err.log`, 05/09):
+
+1. **L'estrazione era morta da giorni**: Moonshot ha ritirato `moonshot-v1-auto` → ogni finestra dava
+   `Not found the model moonshot-v1-auto or Permission denied` (2 tentativi, poi ripiego). Ma il ripiego
+   `gpt-5.4-mini` copriva **solo** `extractKbDelta` (`tdai-core.ts`): le due **distillazioni** (lezioni e
+   principi) non avevano ripiego e fallivano in silenzio contando i cluster come «elaborati».
+2. **La cattura degli attriti non aveva mai prodotto un evento in 29 giorni**: il plugin ascoltava
+   `PostToolUse` con `tool_output_is_error`, ma Claude Code ≥ 2.1 manda i fallimenti su un evento
+   separato, `PostToolUseFailure`, con un campo `error`. Nessuno lo ascoltava.
+3. **Un ricordo «da confermare» non era confermabile da Claude Code**: confirm/reject esistevano solo come
+   tool in-process (OpenClaw). Il ricordo dell'IBAN BG20 è rimasto in attesa dal 04/09.
+4. **26 sessioni vere mai (o solo in parte) digerite** perché il gateway era giù mentre giravano.
+
+**Che cosa c'è ora** (branch `fix/sinapsys-20260905`, `npm run build` exit 0, `npx vitest run` →
+1.276 verdi / 2 saltati, 05/09/2026):
+
+| Pezzo | Dove | Prova |
+|---|---|---|
+| Ripiego su **ogni** chiamata LLM (estrazione + 2 distillazioni), `LLMFallbackExhaustedError` quando cadono entrambi | `src/adapters/standalone/llm-runner.ts`, `llm-provider.ts`, `gateway/config.ts` (`llm.fallback`) | test `distillation-llm-failure`, `llm-provider` |
+| Host Moonshot/Kimi: `thinking: {type: "disabled"}` iniettato, `temperature` **omessa** (Kimi accetta un solo valore per modalità) | `llm-provider.ts` `resolveThinking`/`resolveTemperature` | live 05/09: `kimi-k2.6` risponde in 1,8 s con thinking spento |
+| Distillazione onesta: contatore `skippedLlmFailed` + riga `[lessons] distillation LLM failed n/m clusters` | `src/core/kb/lessons-runner.ts`, `principle-runner.ts`, `usage-runner.ts` | test `distillation-llm-failure` |
+| `PostToolUseFailure` → evento `bug` (dedup per firma, tetto per sessione) | `claude-code-plugin/hooks/hooks.json`, `lib/hook.ts` `handlePostToolUseFailure` | live 05/09: fallimento sintetico via stdin → riga `[friction] recorded` nel gateway + riga in `events` (`type='bug'`, chiave sessione `C:\Sofia-AI`); il ripetuto identico NON crea una seconda riga |
+| Comandi distruttivi riusciti taggati `tool_risk: "destructive"` (osservazione, non attrito) | `lib/destructive-commands.ts`, `src/core/kb/destructive-capture.ts` | test `destructive-capture`, `destructive-correction-wiring` |
+| `POST /memory/confirm` · `/memory/reject` + skill `/memory-confirm <id>` · `/memory-reject <id>` | `gateway/server.ts` `handleGatedMemory`, `claude-code-plugin/skills/memory-confirm|reject` | live 05/09: `fact_01KWT3SMSB0000M87KKS` (IBAN BG20 = nostro) → `{"ok":true}` |
+| Installer che raggiunge anche la **sorgente** del marketplace (`~/.claude/plugins/tdai-mkt/plugin`) e copia le skill; `--dry-run` | `scripts/install-cc-plugin.mjs` | live 05/09: 2 destinazioni × 8 file, `cmp` cache == build |
+| Riempimento delle sessioni mai catturate: `tools/backfill-cc-sessions.mts --list/--run/--digest` (classi: catturate-complete 49 · parziali 9 · mai 8 · figlie-Argus 3.124, escluse salvo `--include-argus-children`) | `src/cli/backfill-cc/*` (14 moduli, 74 test) | `--list` 05/09: 3.190 registrazioni, 570 MB |
+
+**Verificato dal vivo dopo il riavvio** (gateway sulla build nuova dalle 15:48 ora locale del 05/09,
+`gateway.out.log`): `run() completed: 85804ms, model=kimi-k2.6, output=15456 chars` per `kb-extraction`,
+poi `lesson-distill`, `principle-distill` (356 char) e `usage-distill` completati sullo stesso modello;
+**zero** righe `moonshot-v1-auto` dopo il riavvio. Riempimento: `--run` → 17/17 registrazioni rigiocate
+(`replayed=11 partial=0 failed=0` nel secondo giro + 6 nel primo), 5 chiavi di sessione toccate; poi
+`--digest 5/5`. `events` +15 e `entities` +17 tra le 14:00Z e le 14:16Z.
+
+**Guasto trovato riempiendo, ancora aperto in produzione (→ §6, riga 1):** la registrazione da 18 MB
+(`3f0aa5cb…`) ha avuto bisogno di **29 s** per i suoi 50 turni; il client del plugin aspetta **12 s**
+(`CAPTURE_TIMEOUT_MS`), riprova una volta, poi scrive «captureTurn failed — session not saved» **e il
+gateway continua lo stesso a elaborare la richiesta abbandonata**. Il primo giro di riempimento ha così
+accodato ~20 catture identiche e il cursore non si è mosso; `/health` non ha risposto per oltre 60 s. Le 9
+sessioni «catturate a metà» sono con ogni probabilità questo stesso guasto dal vivo (⚠️ NON VERIFICATO una
+per una). Riparato **solo per il riempimento**: `TDAI_CAPTURE_TIMEOUT_MS` (il tool lo mette a 300 s,
+`--capture-timeout-ms`) e un freno nel ciclo (2 chiamate senza avanzamento → `failed`, non 20). Per le
+sessioni vive resta aperto: il gateway deve rispondere subito a `/capture` e scrivere dopo.
+
+**Variabili nuove** (lette all'avvio del gateway, quindi **riavviare** dopo averle cambiate):
+`TDAI_LLM_THINKING` (`disabled`|`enabled`), `TDAI_FALLBACK_LLM_BASE_URL`, `TDAI_FALLBACK_LLM_API_KEY`
+(altrimenti `OPENAI_API_KEY`), `TDAI_FALLBACK_LLM_MODEL` (default `gpt-5.4-mini`), `TDAI_FALLBACK_LLM_MAX_TOKENS`,
+`TDAI_FALLBACK_LLM_TIMEOUT_MS`, `TDAI_FALLBACK_LLM_THINKING`. Su questa macchina `TDAI_LLM_MODEL=kimi-k2.6`
+sta in `C:\Users\lo\tdai-gateway\gateway.secrets.env` (non versionato), che `start-gateway.ps1` inietta.
 
 ---
 
@@ -288,6 +342,7 @@ La salute deve arrivare a Lorenzo, non al disco.
 
 | # | Cosa manca | Perché conta | Stato |
 |---|---|---|---|
+| **0** | **`/capture` deve rispondere subito e scrivere dopo** | Una sessione lunga manda 50 turni in una chiamata; sopra i ~12 s il plugin la abbandona («session not saved») ma il gateway la elabora lo stesso, e ogni Stop successivo rimanda gli stessi 50 turni: lavoro doppio, niente salvato, `/health` muto per un minuto (misurato 05/09/2026, §2-bis) | **aperto** — riparato solo per il riempimento offline (`TDAI_CAPTURE_TIMEOUT_MS`); per le sessioni vive serve ack immediato + scrittura in coda |
 | **1** | **Sinapsys dentro Argus su Render** | Argus gira 24/7 nel cloud **senza la memoria associativa**: è il pezzo che chiude la stella polare | **progettato**, non costruito → [01-vision-and-plan/PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md](01-vision-and-plan/PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md) |
 | **2** | **Decidere il rapporto con la memoria che Argus HA GIÀ** | Argus ha `argus-memory.mjs` su Supabase, viva e cablata in 10+ moduli. Sostituirla è rischioso; ignorarla crea due verità divergenti | **decisione aperta** — raccomandazione: due velocità (CLS), §3 del doc Punto 5 |
 | 3 | **Decisione: un DB o due?** (portatile ↔ cloud) | Unificare crea dipendenza dalla rete su ogni tuo prompt (recall ha 6s) | **decisione aperta per Lorenzo** (§9 del doc Punto 5) |

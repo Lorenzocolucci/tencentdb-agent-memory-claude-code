@@ -23,6 +23,8 @@ export interface RunOptions extends CommonOptions {
   includeArgusChildren: boolean;
   hookPath: string;
   paceMs: number;
+  /** Forwarded to each hook child as TDAI_CAPTURE_TIMEOUT_MS (see hook-runner.ts). */
+  captureTimeoutMs: number;
 }
 
 export interface DigestOptions extends CommonOptions {
@@ -73,6 +75,10 @@ export function parseCliArgs(argv: string[], env: ParseCliArgsEnv): CliOptions {
       includeArgusChildren,
       hookPath: findValue(argv, "--hook") ?? defaultHookPath,
       paceMs: Number(findValue(argv, "--pace-ms") ?? "500"),
+      // 5 minutes: a never-captured 18 MB transcript needs well over the live
+      // 12s for its 50-turn batch (measured 2026-09-05). Offline, waiting is
+      // cheaper than re-sending.
+      captureTimeoutMs: Number(findValue(argv, "--capture-timeout-ms") ?? "300000"),
     };
   }
 

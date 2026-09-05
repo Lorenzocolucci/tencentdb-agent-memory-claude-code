@@ -36,6 +36,16 @@ export interface ReplayLoopParams {
   getCursorTurns: () => Promise<number | null>;
   /** Cap on hook invocations for this transcript (default 20, per spec). */
   maxIterations?: number;
+  /**
+   * Consecutive hook calls that exit 0 WITHOUT moving the cursor before the
+   * loop gives up (default 2). The hook exits 0 even when `/capture` timed
+   * out ("captureTurn failed after retry — session not saved" goes to
+   * hook.log, not the exit code), so without this guard a transcript whose
+   * batch the gateway cannot absorb in time is re-sent `maxIterations` times
+   * — measured 2026-09-05: one 18 MB transcript → 20 identical 50-turn
+   * captures queued on the gateway, cursor still at 0.
+   */
+  maxStalls?: number;
   /** Called between iterations (real impl: `setTimeout`, tests: no-op/instant). */
   pace: () => Promise<void>;
 }
@@ -51,9 +61,11 @@ export interface ReplayLoopResult {
 }
 
 const DEFAULT_MAX_ITERATIONS = 20;
+const DEFAULT_MAX_STALLS = 2;
 
 export async function replayTranscript(params: ReplayLoopParams): Promise<ReplayLoopResult> {
   const maxIterations = params.maxIterations ?? DEFAULT_MAX_ITERATIONS;
+  const maxStalls = params.maxStalls ?? DEFAULT_MAX_STALLS;
   const turnsSentBefore = params.cursorBefore ?? 0;
 
   // A transcript with 0 readable turns has nothing to send; do not spawn the
@@ -68,6 +80,7 @@ export async function replayTranscript(params: ReplayLoopParams): Promise<Replay
 
   let lastCursor = turnsSentBefore;
   let lastError: string | null = null;
+  let stalls = 0;
 
   for (let i = 1; i <= maxIterations; i++) {
     const result = await params.invokeHook();
@@ -77,10 +90,24 @@ export async function replayTranscript(params: ReplayLoopParams): Promise<Replay
     }
 
     const cursor = await params.getCursorTurns();
+    const advanced = cursor !== null && cursor > lastCursor;
     lastCursor = cursor ?? lastCursor;
 
     if (lastCursor >= params.turns) {
       return { status: "replayed", iterations: i, turnsSentBefore, turnsSentAfter: lastCursor, lastError: null };
+    }
+
+    stalls = advanced ? 0 : stalls + 1;
+    if (stalls >= maxStalls) {
+      return {
+        status: "failed",
+        iterations: i,
+        turnsSentBefore,
+        turnsSentAfter: lastCursor,
+        lastError:
+          `cursor did not advance from ${lastCursor}/${params.turns} in ${stalls} consecutive hook calls ` +
+          `(the hook exits 0 even when /capture times out — see hook.log; raise --capture-timeout-ms)`,
+      };
     }
 
     if (i < maxIterations) await params.pace();

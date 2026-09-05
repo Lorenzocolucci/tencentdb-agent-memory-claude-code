@@ -23,7 +23,7 @@
  * USAGE
  *   npx tsx tools/backfill-cc-sessions.mts                        # --list, dry, default
  *   npx tsx tools/backfill-cc-sessions.mts --list --json plan.json
- *   npx tsx tools/backfill-cc-sessions.mts --run [--include-argus-children] [--pace-ms 500] [--hook <path>]
+ *   npx tsx tools/backfill-cc-sessions.mts --run [--include-argus-children] [--pace-ms 500] [--hook <path>] [--capture-timeout-ms 300000]
  *   npx tsx tools/backfill-cc-sessions.mts --digest [--keys a,b,c] [--stall-minutes 30] [--force]
  *
  * All commands accept `--projects-root <dir>` and `--data-dir <dir>` to
@@ -85,13 +85,14 @@ async function runReplay(opts: {
   includeArgusChildren: boolean;
   hookPath: string;
   paceMs: number;
+  captureTimeoutMs: number;
 }): Promise<void> {
   const plan = await buildPlan({ projectsRoot: opts.projectsRoot, dataDir: opts.dataDir });
   const candidates = replayCandidates(plan, opts.includeArgusChildren);
   const statePath = join(opts.dataDir, "backfill-cc-state.json");
   let state = await loadState(statePath);
 
-  await appendLog(opts.dataDir, `run: ${candidates.length} transcript(s) to replay (hook=${opts.hookPath})`);
+  await appendLog(opts.dataDir, `run: ${candidates.length} transcript(s) to replay (hook=${opts.hookPath}, capture timeout ${opts.captureTimeoutMs}ms)`);
 
   const counts = { replayed: 0, partial: 0, failed: 0 };
   for (const candidate of candidates) {
@@ -106,6 +107,7 @@ async function runReplay(opts: {
           sessionId,
           transcriptPath: candidate.transcriptPath,
           cwd,
+          captureTimeoutMs: opts.captureTimeoutMs,
         }),
       getCursorTurns: () => readCursorTurns(opts.dataDir, sessionId),
       pace: () => sleep(opts.paceMs),

@@ -21,20 +21,43 @@ export interface RunHookStopParams {
   sessionId: string;
   transcriptPath: string;
   cwd: string;
-  /** Matches the 30s timeout declared for the Stop hook in hooks.json. */
+  /**
+   * Kill budget for the child. Default: 30s (the Stop hook's budget in
+   * hooks.json) or, when `captureTimeoutMs` is set, two capture attempts plus
+   * 10s of slack — the hook retries `/capture` once before giving up.
+   */
   timeoutMs?: number;
+  /**
+   * Passed to the child as `TDAI_CAPTURE_TIMEOUT_MS` so its gateway client
+   * waits that long for `/capture` instead of the live 12s default. A replay
+   * is offline work: waiting beats abandoning a request the gateway keeps
+   * processing anyway (2026-09-05: 20 abandoned 50-turn captures queued).
+   */
+  captureTimeoutMs?: number;
   /** Injectable for tests; defaults to the running node binary. */
   nodeBin?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+const CAPTURE_ATTEMPTS = 2;
+const KILL_SLACK_MS = 10_000;
+
+export function childTimeoutMs(params: Pick<RunHookStopParams, "timeoutMs" | "captureTimeoutMs">): number {
+  if (params.timeoutMs !== undefined) return params.timeoutMs;
+  if (params.captureTimeoutMs !== undefined) return params.captureTimeoutMs * CAPTURE_ATTEMPTS + KILL_SLACK_MS;
+  return DEFAULT_TIMEOUT_MS;
+}
 
 export function runHookStop(params: RunHookStopParams): Promise<HookInvocationResult> {
-  const timeoutMs = params.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timeoutMs = childTimeoutMs(params);
   const nodeBin = params.nodeBin ?? process.execPath;
+  const env =
+    params.captureTimeoutMs !== undefined
+      ? { ...process.env, TDAI_CAPTURE_TIMEOUT_MS: String(params.captureTimeoutMs) }
+      : process.env;
 
   return new Promise((resolve) => {
-    const child = spawn(nodeBin, [params.hookPath, "stop"], { stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(nodeBin, [params.hookPath, "stop"], { stdio: ["pipe", "pipe", "pipe"], env });
     let stderr = "";
     let stdout = "";
     let settled = false;
