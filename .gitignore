@@ -60,8 +60,10 @@ test-offload-sessions.sh
 docs/superpowers/*
 !docs/superpowers/specs/
 
-# Per-developer Claude Code project instructions (contributor-only)
-CLAUDE.md
+# Root CLAUDE.md is the project's own entry sheet on this fork (PR #9 merged the pointer to it
+# but the file itself was silently dropped by the old ignore rule). Nested per-developer copies stay ignored.
+**/CLAUDE.md
+!/CLAUDE.md
 
 # Plugin build output: COMMITTED on purpose so the plugin runs the moment it is
 # cloned/installed, with no build step (mirrors the precompiled ARM64 vec0.dll we
