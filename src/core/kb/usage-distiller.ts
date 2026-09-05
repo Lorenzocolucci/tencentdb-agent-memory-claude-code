@@ -16,6 +16,7 @@
  */
 import type { LLMRunner } from "../types.js";
 import { runWithoutCjk, hasCjk } from "../../utils/language-guard.js";
+import { reportLlmError, type DistillLlmError } from "./lessons-distiller.js";
 
 // ── Public types ───────────────────────────────────────────────────────────────
 
@@ -121,6 +122,8 @@ export function parseDistilledUsage(raw: string): DistilledUsage | null {
 
 export interface DistillUsageOptions {
   timeoutMs?: number;
+  /** Called when the LLM call THREW (not when the judge said "noise"). */
+  onLlmError?: (error: DistillLlmError) => void;
 }
 
 /**
@@ -146,7 +149,8 @@ export async function distillUsageCluster(
     // Reject residual-CJK rather than store garbage (skip the cluster).
     if (hasCjk(parsed.tendencyText)) return null;
     return parsed;
-  } catch {
+  } catch (err) {
+    reportLlmError(opts.onLlmError, "usage-distill", err);
     return null;
   }
 }

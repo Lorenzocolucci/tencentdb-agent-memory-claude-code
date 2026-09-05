@@ -40,12 +40,23 @@ import { buildFileInjection, resolveFileOwnerId } from "./hooks/situation-inject
 import {
   EMPTY_SITUATION,
   updateSituation,
+  clearRiskySignature,
   type SessionSituation,
 } from "./hooks/session-situation.js";
 import { inferTaskType } from "./hooks/task-type.js";
 import { buildSituationInjection } from "./hooks/fingerprint-injection.js";
 import { canonicalKey } from "./kb/kb-queries.js";
 import { buildFrictionEvent, createFrictionState, type FrictionState } from "./kb/friction-capture.js";
+import {
+  buildDestructiveEvent,
+  createDestructiveState,
+  SIGNATURE_TAG_PREFIX,
+  type DestructiveState,
+  type RiskySignature,
+} from "./kb/destructive-capture.js";
+import { detectDirective } from "./kb/behavioral-law-detector.js";
+import { looksLikeSystemText } from "./kb/behavioral-law-capture.js";
+import { redactSecrets } from "../utils/redact-secrets.js";
 import { applyKbDelta, type KbWriterStore, type ApplyKbDeltaResult } from "./kb/kb-writer.js";
 import type { KbDelta } from "./kb/extraction-schema.js";
 import { performAutoRecall } from "./hooks/auto-recall.js";
@@ -101,6 +112,26 @@ const TAG = "[memory-tdai] [core]";
 
 /** Namespace for proactive-injection reads/writes (single-tenant today). */
 const NAMESPACE = "default";
+/**
+ * Say out loud when a distillation step's LLM calls THREW. Before 2026-09-05 a
+ * dead primary model produced "no new lessons (candidates=1)" at debug level —
+ * an outage disguised as "nothing to learn". One `error` line per step, with
+ * the count, the taskId and the first error message.
+ */
+export function logDistillationLlmFailures(
+  logger: Logger,
+  step: string,
+  taskId: string,
+  stats: { candidates: number; skippedLlmFailed: number; llmErrors: readonly string[] },
+): void {
+  if (stats.skippedLlmFailed <= 0) return;
+  const attempted = Math.max(stats.candidates, stats.skippedLlmFailed);
+  logger.error(
+    `${TAG} [${step}] distillation LLM failed ${stats.skippedLlmFailed}/${attempted} clusters (${taskId}): ` +
+      `${stats.llmErrors[0] ?? "unknown error"}`,
+  );
+}
+
 /** Bounded recent-fingerprint window scanned per situation match. */
 const FP_QUERY_LIMIT = 200;
 
@@ -223,6 +254,8 @@ export class TdaiCore {
   private readonly injectedOwnersBySession = new Map<string, Set<string>>();
   /** Per-session friction de-dup + flood budget (see friction-capture.ts). */
   private readonly frictionStateBySession = new Map<string, FrictionState>();
+  /** Per-session dedupe window for destructive successes (CONTRACT point 1). */
+  private readonly destructiveStateBySession = new Map<string, DestructiveState>();
 
   /**
    * Tracks which sessionKeys have already fired the session-open banner.
@@ -404,6 +437,16 @@ export class TdaiCore {
     // session-open injection on the first turn.
     if (result?.cornerstoneMiss) {
       this.buildCornerstoneInBackground(result.cornerstoneMiss.key);
+    }
+
+    // Correction linking: the user's NEXT prompt after a risky moment. Scheduled
+    // off the stack (macrotask) so recall is never delayed; errors swallowed.
+    try {
+      this.scheduleCorrectionLink(userText, sessionKey);
+    } catch (err) {
+      this.logger.debug?.(
+        `${TAG} [correction] scheduling failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
 
     // Grounded Trust Phase 3: surface the INTERRUPT for any uncertain, high-stakes
@@ -780,13 +823,18 @@ export class TdaiCore {
             now: new Date().toISOString(),
             maxClusters: 3,
           });
+          logDistillationLlmFailures(logger, "lessons", "lesson-distill", stats);
           if (stats.inserted > 0 || stats.superseded > 0) {
             logger.info(
               `${TAG} [lessons] distilled: inserted=${stats.inserted}, superseded=${stats.superseded} ` +
-                `(candidates=${stats.candidates}, skippedDuplicate=${stats.skippedDuplicate})`,
+                `(candidates=${stats.candidates}, skippedDuplicate=${stats.skippedDuplicate}, ` +
+                `skippedUndistillable=${stats.skippedUndistillable}, skippedLlmFailed=${stats.skippedLlmFailed})`,
             );
           } else {
-            logger.debug?.(`${TAG} [lessons] no new lessons (candidates=${stats.candidates})`);
+            logger.debug?.(
+              `${TAG} [lessons] no new lessons (candidates=${stats.candidates}, ` +
+                `skippedUndistillable=${stats.skippedUndistillable}, skippedLlmFailed=${stats.skippedLlmFailed})`,
+            );
           }
         } catch (err) {
           logger.warn(
@@ -808,13 +856,18 @@ export class TdaiCore {
             now: new Date().toISOString(),
             maxClusters: 3,
           });
+          logDistillationLlmFailures(logger, "principles", "principle-distill", stats);
           if (stats.inserted > 0) {
             logger.info(
               `${TAG} [principles] distilled: inserted=${stats.inserted} ` +
-                `(candidates=${stats.candidates}, skippedDuplicate=${stats.skippedDuplicate})`,
+                `(candidates=${stats.candidates}, skippedDuplicate=${stats.skippedDuplicate}, ` +
+                `skippedUndistillable=${stats.skippedUndistillable}, skippedLlmFailed=${stats.skippedLlmFailed})`,
             );
           } else {
-            logger.debug?.(`${TAG} [principles] no new principles (candidates=${stats.candidates})`);
+            logger.debug?.(
+              `${TAG} [principles] no new principles (candidates=${stats.candidates}, ` +
+                `skippedUndistillable=${stats.skippedUndistillable}, skippedLlmFailed=${stats.skippedLlmFailed})`,
+            );
           }
         } catch (err) {
           logger.warn(
@@ -837,16 +890,18 @@ export class TdaiCore {
             now: new Date().toISOString(),
             maxClusters: 3,
           });
+          logDistillationLlmFailures(logger, "usage", "usage-distill", stats);
           if (stats.inserted > 0) {
             logger.info(
               `${TAG} [usage] distilled: inserted=${stats.inserted} ` +
                 `(candidates=${stats.candidates}, confirmed=${stats.confirmed}, ` +
-                `skippedRejected=${stats.skippedRejected}, skippedDuplicate=${stats.skippedDuplicate})`,
+                `skippedRejected=${stats.skippedRejected}, skippedLlmFailed=${stats.skippedLlmFailed}, ` +
+                `skippedDuplicate=${stats.skippedDuplicate})`,
             );
           } else {
             logger.debug?.(
               `${TAG} [usage] no new usage tendencies (candidates=${stats.candidates}, ` +
-                `rejected=${stats.skippedRejected})`,
+                `rejected=${stats.skippedRejected}, skippedLlmFailed=${stats.skippedLlmFailed})`,
             );
           }
         } catch (err) {
@@ -1005,8 +1060,8 @@ export class TdaiCore {
   private recordFriction(
     store: IMemoryStore,
     obs: { sessionKey: string; toolName: string; toolInput: unknown; toolOutputText?: string },
-  ): string | undefined {
-    if (typeof store.insertEvent !== "function") return undefined;
+  ): { warning?: string; risky?: RiskySignature } {
+    if (typeof store.insertEvent !== "function") return {};
 
     let state = this.frictionStateBySession.get(obs.sessionKey);
     if (!state) {
@@ -1024,7 +1079,7 @@ export class TdaiCore {
       },
       state,
     );
-    if (!ev) return undefined;
+    if (!ev) return {};
 
     // Link the failing file (when there is one) so the lesson can later be
     // surfaced by the file-touch injection path.
@@ -1046,14 +1101,14 @@ export class TdaiCore {
     }
 
     const now = new Date().toISOString();
-    store.insertEvent({
+    const inserted = store.insertEvent({
       ts: now,
       recordedAt: now,
       sessionKey: obs.sessionKey,
       namespace: NAMESPACE,
       type: "bug",
       text: ev.text,
-      entities,
+      entities: [...entities, `${SIGNATURE_TAG_PREFIX}${ev.signature}`],
     });
     this.logger.debug?.(`${TAG} [friction] recorded: ${ev.text.slice(0, 80)}`);
     if (ev.isLoop) {
@@ -1062,7 +1117,138 @@ export class TdaiCore {
       );
     }
     // Only a LOOP talks back: a first-time failure is normal work, a thrash is not.
-    return ev.warning;
+    return {
+      warning: ev.warning,
+      risky: {
+        signature: ev.signature,
+        label: ev.text.slice(0, 120),
+        toolName: obs.toolName,
+        kind: "failed",
+        atMs: Date.now(),
+        eventId: inserted?.id,
+      },
+    };
+  }
+
+  /**
+   * Destructive-success capture (CONTRACT point 1): a flagged command that
+   * SUCCEEDED becomes an `observation` event tagged destructive (never a `bug`,
+   * never a loop warning), deduped on the same 10-minute signature window as
+   * friction, and becomes the session's "last risky signature" so the user's
+   * next correction (handleBeforeRecall) can be linked to it. Synchronous,
+   * fully guarded by the caller.
+   */
+  private recordDestructive(
+    store: IMemoryStore,
+    obs: { sessionKey: string; toolName: string; toolInput: unknown; toolOutputText?: string },
+  ): RiskySignature | undefined {
+    if (typeof store.insertEvent !== "function") return undefined;
+
+    let state = this.destructiveStateBySession.get(obs.sessionKey);
+    if (!state) {
+      state = createDestructiveState();
+      this.destructiveStateBySession.set(obs.sessionKey, state);
+    }
+    const atMs = Date.now();
+    const ev = buildDestructiveEvent(
+      { sessionKey: obs.sessionKey, toolName: obs.toolName, toolInput: obs.toolInput, outputText: obs.toolOutputText, atMs },
+      state,
+    );
+    if (!ev) return undefined;
+
+    const entities: string[] = [...ev.tags];
+    if (ev.filePath && typeof store.resolveOrCreateEntity === "function") {
+      try {
+        const ent = store.resolveOrCreateEntity({
+          type: "file",
+          name: ev.filePath,
+          project: store.getSessionProject?.(obs.sessionKey),
+          now: new Date().toISOString(),
+        });
+        if (ent?.id) entities.push(ent.id);
+      } catch {
+        /* entity resolution is best-effort */
+      }
+    }
+
+    const now = new Date().toISOString();
+    const inserted = store.insertEvent({
+      ts: now,
+      recordedAt: now,
+      sessionKey: obs.sessionKey,
+      namespace: NAMESPACE,
+      project: store.getSessionProject?.(obs.sessionKey),
+      type: ev.type,
+      text: ev.text,
+      entities,
+    });
+    this.logger.debug?.(`${TAG} [destructive] recorded: ${ev.text.slice(0, 80)}`);
+    return {
+      signature: ev.signature,
+      label: ev.label,
+      toolName: obs.toolName,
+      kind: "destructive",
+      atMs,
+      eventId: inserted?.id,
+    };
+  }
+
+  /**
+   * Correction linking (CONTRACT point 1 → Mistake Notebook). The /recall path
+   * receives the user's NEXT prompt: when it reads as a correction and the
+   * session has a last risky signature (a destructive success or a failure),
+   * write a `bug` event whose text is the correction and whose entity tags link
+   * it to that signature, so the clustering sees the human correction next to
+   * the command that caused it. Scheduled on a macrotask AFTER the recall
+   * result has been handed back: it can never delay or break recall.
+   */
+  private scheduleCorrectionLink(userText: string, sessionKey: string): void {
+    const sit = this.sessionSituationByKey.get(sessionKey);
+    const risky = sit?.lastRiskySignature;
+    if (!sit || !risky) return;
+    if (typeof userText !== "string" || !userText.trim()) return;
+
+    const t = setImmediate(() => {
+      try {
+        if (looksLikeSystemText(userText)) return;
+        const directive = detectDirective(userText);
+        if (!directive || directive.kind !== "correction") return;
+        const store = this.vectorStore;
+        if (!store || typeof store.insertEvent !== "function") return;
+
+        const now = new Date().toISOString();
+        const text = redactSecrets(
+          `correction after ${risky.kind === "destructive" ? "destructive" : "failed"} ` +
+            `${risky.toolName} \`${risky.label}\`: ${userText.trim()}`,
+        ).slice(0, 400);
+        const entities = [
+          `${SIGNATURE_TAG_PREFIX}${risky.signature}`,
+          `stakes:${risky.kind}`,
+          ...(risky.eventId ? [`corrects:${risky.eventId}`] : []),
+        ];
+        store.insertEvent({
+          ts: now,
+          recordedAt: now,
+          sessionKey,
+          namespace: NAMESPACE,
+          project: store.getSessionProject?.(sessionKey),
+          type: "bug",
+          text,
+          entities,
+        });
+        // Consume the signature: one correction per risky moment.
+        const current = this.sessionSituationByKey.get(sessionKey);
+        if (current?.lastRiskySignature?.signature === risky.signature) {
+          this.sessionSituationByKey.set(sessionKey, clearRiskySignature(current));
+        }
+        this.logger.info(`${TAG} [correction] linked to ${risky.kind} ${risky.toolName}: ${text.slice(0, 80)}`);
+      } catch (err) {
+        this.logger.debug?.(
+          `${TAG} [correction] link failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    });
+    (t as { unref?: () => void }).unref?.();
   }
 
   /**
@@ -1084,8 +1270,10 @@ export class TdaiCore {
     toolName: string;
     toolInput: unknown;
     toolOutputIsError?: boolean;
-    /** Raw output of a FAILED tool call (friction capture input). */
+    /** Raw output of a FAILED tool call, or of a destructive one that succeeded. */
     toolOutputText?: string;
+    /** CONTRACT point 1: the plugin flagged this call as destructive. */
+    toolRisk?: "destructive";
   }): Promise<{ inject?: string }> {
     if (!obs.sessionKey) return {};
     await this.storeReady?.catch(() => {});
@@ -1099,12 +1287,24 @@ export class TdaiCore {
     // "patterns, never anecdotes" rule. Never on the critical path: fully
     // guarded, errors swallowed, recall/injection continues regardless.
     let frictionWarning: string | undefined;
+    let riskySignature: RiskySignature | undefined;
     if (obs.toolOutputIsError === true && obs.toolOutputText) {
       try {
-        frictionWarning = this.recordFriction(store, obs);
+        const friction = this.recordFriction(store, obs);
+        frictionWarning = friction.warning;
+        riskySignature = friction.risky;
       } catch (err) {
         this.logger.debug?.(
           `${TAG} [friction] capture failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    } else if (obs.toolRisk === "destructive") {
+      // A destructive command that SUCCEEDED: observation, not bug; no warning.
+      try {
+        riskySignature = this.recordDestructive(store, obs);
+      } catch (err) {
+        this.logger.debug?.(
+          `${TAG} [destructive] capture failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
         );
       }
     }
@@ -1123,7 +1323,7 @@ export class TdaiCore {
     const fileKey = situation.filePath ? canonicalKey("file", situation.filePath) : undefined;
     const errorSignature = situation.isError ? `${obs.toolName}:error` : undefined;
     const prevSit = this.sessionSituationByKey.get(obs.sessionKey) ?? EMPTY_SITUATION;
-    const curSit = updateSituation(prevSit, { toolName: obs.toolName, fileKey, errorSignature });
+    const curSit = updateSituation(prevSit, { toolName: obs.toolName, fileKey, errorSignature, riskySignature });
     this.sessionSituationByKey.set(obs.sessionKey, curSit);
 
     // Shared per-session owner dedup set (across both injection paths).
@@ -1337,33 +1537,17 @@ export class TdaiCore {
       ? runnerFactory.createRunner({ enableTools: true })
       : undefined;
 
-    // Immune-system extraction fallback: a NON-Chinese model (default OpenAI
-    // gpt-5.4-mini) that rescues the windows Moonshot/Kimi REFUSES with "high
-    // risk" — its content-moderation flags an incidental China-sensitive term
-    // (e.g. the idiom "rubber stamp") and rejects the whole extraction request,
-    // which would otherwise freeze/quarantine the window. Reuses the same
-    // OpenAI-compatible StandaloneLLMRunner. Enabled when a key resolves from
-    // TDAI_FALLBACK_LLM_API_KEY or the OPENAI_API_KEY already used for
-    // embeddings; absent → no fallback (unchanged fail-closed + quarantine).
-    const fallbackKey = process.env.TDAI_FALLBACK_LLM_API_KEY || process.env.OPENAI_API_KEY;
-    const fallbackModel = process.env.TDAI_FALLBACK_LLM_MODEL || "gpt-5.4-mini";
-    const fallbackLlmRunner = fallbackKey
-      ? new StandaloneLLMRunnerFactory({
-          config: {
-            baseUrl: process.env.TDAI_FALLBACK_LLM_BASE_URL || "https://api.openai.com/v1",
-            apiKey: fallbackKey,
-            model: fallbackModel,
-            // gpt-5.4-mini is a reasoning model → it rejects/ignores temperature
-            // (AI-SDK warns per call if sent). Omit it entirely; the model's
-            // default is already low-variance enough for structured extraction.
-            omitTemperature: true,
-            timeoutMs: this.cfg.llm.timeoutMs,
-          },
-          logger: this.logger,
-        }).createRunner({ enableTools: false })
-      : undefined;
+    // Second-layer extraction fallback for the kb-extractor: the transport-level
+    // fallback lives INSIDE StandaloneLLMRunner.run() (dead model, refusal,
+    // network), but a parse/schema failure of a successful response is invisible
+    // there — so the extractor keeps its own retry on a runner whose primary is
+    // the fallback provider. Config-driven (gateway `llm.fallback`, env
+    // TDAI_FALLBACK_LLM_* / OPENAI_API_KEY), no process.env read here; absent →
+    // no second layer (unchanged fail-closed + quarantine).
+    const fallbackLlmRunner = runnerFactory.createFallbackRunner?.({ enableTools: false });
     if (fallbackLlmRunner) {
-      this.logger.info(`${TAG} KB extraction fallback enabled: ${fallbackModel} (rescues Moonshot "high risk" refusals)`);
+      const fbModel = (runnerFactory as { fallbackModel?: string }).fallbackModel ?? "configured";
+      this.logger.info(`${TAG} KB extraction fallback enabled: ${fbModel} (second layer for parse/schema failures)`);
     }
 
     // L1 runner

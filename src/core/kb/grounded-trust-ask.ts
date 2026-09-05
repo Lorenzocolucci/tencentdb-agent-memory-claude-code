@@ -10,8 +10,10 @@
  * protector, not a nag.
  *
  * Pure & total: renders a string from data, no side effects, never throws.
- * The agent re-binds Lorenzo's answer by calling tdai_confirm_memory /
- * tdai_reject_memory with the owner id carried in each line.
+ * The agent re-binds Lorenzo's answer with the owner id carried in each line:
+ * on OpenClaw via the tdai_confirm_memory / tdai_reject_memory tools, on Claude
+ * Code via the plugin skills `/memory-confirm <owner_id>` /
+ * `/memory-reject <owner_id>` (which POST /memory/confirm | /memory/reject).
  */
 
 import { escapeXmlTags } from "../../utils/sanitize.js";
@@ -55,8 +57,10 @@ export function renderGroundedTrustInterrupt(asks: readonly PendingAsk[]): strin
     const text = escapeXmlTags(a.text);
     return (
       `${n}. [${domain}] «${text}» — ${originHint(a.origin)}.\n` +
-      `   → se Lorenzo CONFERMA: tdai_confirm_memory(owner_kind:"${a.owner_kind}", owner_id:"${a.owner_id}")\n` +
-      `   → se Lorenzo NEGA:     tdai_reject_memory(owner_kind:"${a.owner_kind}", owner_id:"${a.owner_id}")`
+      `   → se Lorenzo CONFERMA: in Claude Code esegui la skill /memory-confirm ${a.owner_id}` +
+      ` — su OpenClaw: tdai_confirm_memory(owner_kind:"${a.owner_kind}", owner_id:"${a.owner_id}")\n` +
+      `   → se Lorenzo NEGA:     in Claude Code esegui la skill /memory-reject ${a.owner_id}` +
+      ` — su OpenClaw: tdai_reject_memory(owner_kind:"${a.owner_kind}", owner_id:"${a.owner_id}")`
     );
   });
 
@@ -65,7 +69,7 @@ export function renderGroundedTrustInterrupt(asks: readonly PendingAsk[]): strin
     `⚠️ FERMATI prima di agire su ${asks.length === 1 ? "questo ricordo" : "questi ricordi"}: ` +
     `${asks.length === 1 ? "è" : "sono"} ad alto rischio e NON confermato da Lorenzo.\n` +
     `NON agire sul loro contenuto finché Lorenzo non risponde. Porta la domanda a Lorenzo ORA, ` +
-    `poi registra l'esito con il tool indicato (così la volta dopo non te lo richiede):\n` +
+    `poi registra l'esito con la skill o il tool indicato (così la volta dopo non te lo richiede):\n` +
     `${lines.join("\n")}\n` +
     `${BLOCK_CLOSE}`
   );

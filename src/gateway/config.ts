@@ -14,7 +14,11 @@ import YAML from "yaml";
 import { getEnv } from "../utils/env.js";
 import { parseConfig as parseMemoryConfig } from "../config.js";
 import type { MemoryTdaiConfig } from "../config.js";
-import type { StandaloneLLMConfig } from "../adapters/standalone/llm-runner.js";
+import type {
+  StandaloneLLMConfig,
+  StandaloneLLMFallbackConfig,
+} from "../adapters/standalone/llm-runner.js";
+import type { ThinkingMode } from "../adapters/standalone/llm-provider.js";
 
 // ============================
 // Gateway config types
@@ -95,6 +99,10 @@ export function loadGatewayConfig(overrides?: Partial<GatewayConfig>): GatewayCo
     // RC5: default temperature 1 (Kimi/Moonshot requires exactly 1).
     temperature: envFloat("TDAI_LLM_TEMPERATURE") ?? num(llmConfig, "temperature") ?? 1,
     timeoutMs: envInt("TDAI_LLM_TIMEOUT_MS") ?? num(llmConfig, "timeoutMs") ?? 120_000,
+    // Kimi/Moonshot reasoning control (env TDAI_LLM_THINKING / yaml llm.thinking).
+    // Unset → the runner decides by host (moonshot/kimi → "disabled").
+    thinking: thinkingMode(env("TDAI_LLM_THINKING") ?? str(llmConfig, "thinking")),
+    fallback: resolveFallbackLlm(llmConfig),
   };
 
   // Memory config (reuse the plugin's parseConfig for full compatibility)
@@ -115,6 +123,37 @@ export function loadGatewayConfig(overrides?: Partial<GatewayConfig>): GatewayCo
 // ============================
 // Helpers
 // ============================
+
+/**
+ * The fallback LLM (env TDAI_FALLBACK_LLM_* / yaml `llm.fallback`). Enabled
+ * only when a key resolves — TDAI_FALLBACK_LLM_API_KEY, or the OPENAI_API_KEY
+ * already used for embeddings; absent → no fallback (fail-closed as before).
+ * Default model gpt-5.4-mini is a reasoning model, so temperature is omitted.
+ * Before 2026-09-05 this was read straight from process.env inside tdai-core,
+ * invisible to the config layer and to every call site but the kb-extractor.
+ */
+function resolveFallbackLlm(llmConfig: Record<string, unknown>): StandaloneLLMFallbackConfig | undefined {
+  const fbFile = obj(llmConfig, "fallback");
+  const apiKey =
+    env("TDAI_FALLBACK_LLM_API_KEY") ?? str(fbFile, "apiKey") ?? env("OPENAI_API_KEY");
+  if (!apiKey) return undefined;
+  const omit = fbFile.omitTemperature;
+  return {
+    baseUrl: env("TDAI_FALLBACK_LLM_BASE_URL") ?? str(fbFile, "baseUrl") ?? "https://api.openai.com/v1",
+    apiKey,
+    model: env("TDAI_FALLBACK_LLM_MODEL") ?? str(fbFile, "model") ?? "gpt-5.4-mini",
+    omitTemperature: typeof omit === "boolean" ? omit : true,
+    maxTokens: envInt("TDAI_FALLBACK_LLM_MAX_TOKENS") ?? num(fbFile, "maxTokens"),
+    timeoutMs: envInt("TDAI_FALLBACK_LLM_TIMEOUT_MS") ?? num(fbFile, "timeoutMs"),
+    thinking: thinkingMode(env("TDAI_FALLBACK_LLM_THINKING") ?? str(fbFile, "thinking")),
+  };
+}
+
+/** Parse a thinking-mode string; anything else → undefined (runner default). */
+function thinkingMode(v: string | undefined): ThinkingMode | undefined {
+  const t = v?.trim().toLowerCase();
+  return t === "disabled" || t === "enabled" ? t : undefined;
+}
 
 function resolveConfigPath(): string | null {
   // 1. Explicit env var

@@ -45,8 +45,28 @@ export interface LessonsRunStats {
   inserted: number;
   superseded: number;
   skippedDuplicate: number;
+  /** The LLM answered but the answer was unusable (unparseable / CJK residue). */
   skippedUndistillable: number;
   skippedNotImproved: number;
+  /**
+   * The LLM call itself THREW (dead model, timeout, refusal). Counted apart from
+   * skippedUndistillable so a dead model never reads as "nothing to learn"
+   * (live 2026-09-05: 17/17 calls failed and the log said "no new lessons").
+   */
+  skippedLlmFailed: number;
+  /** First few LLM error messages (bounded), for the runner's log line. */
+  llmErrors: string[];
+}
+
+/** How many distinct LLM error messages a stats object keeps. */
+export const MAX_LLM_ERRORS_KEPT = 3;
+
+/** Record one thrown LLM call in the stats (bounded message list). */
+export function noteLlmFailure(stats: { skippedLlmFailed: number; llmErrors: string[] }, message: string): void {
+  stats.skippedLlmFailed += 1;
+  if (stats.llmErrors.length < MAX_LLM_ERRORS_KEPT && !stats.llmErrors.includes(message)) {
+    stats.llmErrors.push(message);
+  }
 }
 
 // ── Dedup ─────────────────────────────────────────────────────────────────────
@@ -105,13 +125,23 @@ async function processCluster(
   // without an extra DB query (the map is already built above).
   const fixTexts = loadFixTexts(db, cluster.bugEventIds, entityMapRaw);
 
+  let llmFailed = false;
   const distilled = await distillLesson(
     toDistillable(cluster, fixTexts),
     llmRunner,
-    params.distill,
+    {
+      ...params.distill,
+      onLlmError: (e) => {
+        llmFailed = true;
+        noteLlmFailure(stats, e.message);
+        params.distill?.onLlmError?.(e);
+      },
+    },
   );
   if (!distilled) {
-    stats.skippedUndistillable += 1;
+    // A thrown call is already counted by noteLlmFailure; only an unusable
+    // ANSWER is "undistillable".
+    if (!llmFailed) stats.skippedUndistillable += 1;
     return;
   }
   stats.distilled += 1;
@@ -175,6 +205,8 @@ export async function distillLessons(
     skippedDuplicate: 0,
     skippedUndistillable: 0,
     skippedNotImproved: 0,
+    skippedLlmFailed: 0,
+    llmErrors: [],
   };
 
   const allClusters = selectFailureClusters(db, {

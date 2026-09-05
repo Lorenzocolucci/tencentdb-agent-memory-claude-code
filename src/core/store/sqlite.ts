@@ -4096,9 +4096,20 @@ export class VectorStore implements IMemoryStore {
   async runLessonDistillation(
     llmRunner: LLMRunner,
     opts: { now: string; namespace?: string; maxClusters?: number },
-  ): Promise<{ candidates: number; inserted: number; superseded: number; skippedDuplicate: number }> {
+  ): Promise<{
+    candidates: number;
+    inserted: number;
+    superseded: number;
+    skippedDuplicate: number;
+    skippedUndistillable: number;
+    skippedLlmFailed: number;
+    llmErrors: string[];
+  }> {
     if (this.degraded || !this.kbReady || !this.kbVecReady) {
-      return { candidates: 0, inserted: 0, superseded: 0, skippedDuplicate: 0 };
+      return {
+        candidates: 0, inserted: 0, superseded: 0, skippedDuplicate: 0,
+        skippedUndistillable: 0, skippedLlmFailed: 0, llmErrors: [],
+      };
     }
     // distillLessons reads kb_vec (bug clustering) via this.db (sqlite-vec loaded)
     // and writes the `lessons` table on the SAME connection — no extra writer.
@@ -4114,6 +4125,9 @@ export class VectorStore implements IMemoryStore {
       inserted: stats.inserted,
       superseded: stats.superseded,
       skippedDuplicate: stats.skippedDuplicate,
+      skippedUndistillable: stats.skippedUndistillable,
+      skippedLlmFailed: stats.skippedLlmFailed,
+      llmErrors: stats.llmErrors,
     };
   }
 
@@ -4121,9 +4135,20 @@ export class VectorStore implements IMemoryStore {
   async runUsageDistillation(
     llmRunner: LLMRunner,
     opts: { now: string; namespace?: string; maxClusters?: number },
-  ): Promise<{ candidates: number; confirmed: number; inserted: number; skippedDuplicate: number; skippedRejected: number }> {
+  ): Promise<{
+    candidates: number;
+    confirmed: number;
+    inserted: number;
+    skippedDuplicate: number;
+    skippedRejected: number;
+    skippedLlmFailed: number;
+    llmErrors: string[];
+  }> {
     if (this.degraded || !this.kbReady || !this.kbVecReady) {
-      return { candidates: 0, confirmed: 0, inserted: 0, skippedDuplicate: 0, skippedRejected: 0 };
+      return {
+        candidates: 0, confirmed: 0, inserted: 0, skippedDuplicate: 0, skippedRejected: 0,
+        skippedLlmFailed: 0, llmErrors: [],
+      };
     }
     // Usage clustering is SEMANTIC → it needs vectors (unlike per-entity
     // principles). The reader reads this.db's kb_vec; events are read and the

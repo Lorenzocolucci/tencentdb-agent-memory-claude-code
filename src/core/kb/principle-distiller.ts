@@ -16,6 +16,7 @@
  */
 import type { LLMRunner } from "../types.js";
 import { runWithoutCjk, hasCjk } from "../../utils/language-guard.js";
+import { reportLlmError, type DistillLlmError } from "./lessons-distiller.js";
 
 // ── Public types ───────────────────────────────────────────────────────────────
 
@@ -115,6 +116,8 @@ export function parseDistilledPrinciple(raw: string): DistilledPrinciple | null 
 
 export interface DistillPrincipleOptions {
   timeoutMs?: number;
+  /** Called when the LLM call THREW (not when the answer was unparseable). */
+  onLlmError?: (error: DistillLlmError) => void;
 }
 
 /** Distill one cluster via the LLM. Returns null on any failure (never throws). */
@@ -135,7 +138,8 @@ export async function distillPrinciple(
     // Reject a residual-CJK principle rather than store garbage (skip the cluster).
     if (parsed && hasCjk(parsed.principleText)) return null;
     return parsed;
-  } catch {
+  } catch (err) {
+    reportLlmError(opts.onLlmError, "principle-distill", err);
     return null;
   }
 }

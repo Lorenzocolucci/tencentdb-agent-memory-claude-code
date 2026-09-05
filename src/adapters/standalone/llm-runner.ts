@@ -21,6 +21,12 @@ import path from "node:path";
 import { generateText, tool, stepCountIs, hasToolCall, jsonSchema } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { report } from "../../core/report/reporter.js";
+import {
+  createThinkingFetch,
+  resolveTemperature,
+  resolveThinking,
+  type ThinkingMode,
+} from "./llm-provider.js";
 import type {
   LLMRunner,
   LLMRunParams,
@@ -61,6 +67,77 @@ export interface StandaloneLLMConfig {
   omitTemperature?: boolean;
   /** Request timeout in milliseconds (default: 120_000). */
   timeoutMs?: number;
+  /**
+   * Reasoning control for Kimi/Moonshot models: injects
+   * `{"thinking":{"type":...}}` into the chat/completions body. Default:
+   * "disabled" when the base URL host contains "moonshot" or "kimi", otherwise
+   * nothing is sent. (Measured 2026-09-05: with thinking on, kimi-k2.6 spends up
+   * to 1,500 reasoning tokens / 30 s on a 70-token prompt and returns EMPTY
+   * content under a small max_tokens.)
+   */
+  thinking?: ThinkingMode;
+  /**
+   * Second provider tried INSIDE run() when the primary call throws (dead model,
+   * refusal, network). Same prompt, tools, toolChoice, stopWhen and token budget;
+   * a fresh abort signal. Without this, every distillation pass silently read a
+   * dead primary model as "nothing to learn" (measured 2026-09-05: 17/17 calls
+   * failed on `moonshot-v1-auto`, 0 lessons/principles/usage distilled).
+   */
+  fallback?: StandaloneLLMFallbackConfig;
+}
+
+/** The fallback provider: a plain config that can never carry its own fallback. */
+export interface StandaloneLLMFallbackConfig {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  /** Send NO temperature (reasoning models such as gpt-5.4-mini reject it). */
+  omitTemperature?: boolean;
+  /** Overrides the primary's max output tokens for the fallback call. */
+  maxTokens?: number;
+  /** Overrides the primary's timeout for the fallback call. */
+  timeoutMs?: number;
+  thinking?: ThinkingMode;
+}
+
+/** What one generateText attempt needs to know about its provider. */
+interface ProviderTarget {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  thinking?: ThinkingMode;
+}
+
+function buildProvider(target: ProviderTarget) {
+  // "compatible" mode calls /chat/completions (not the Responses API), which
+  // works with every OpenAI-compatible backend (Moonshot, DeepSeek, Qwen, ...).
+  const thinking = resolveThinking(target.thinking, target.baseUrl);
+  return createOpenAI({
+    baseURL: target.baseUrl,
+    apiKey: target.apiKey,
+    compatibility: "compatible",
+    ...(thinking ? { fetch: createThinkingFetch(thinking) } : {}),
+  });
+}
+
+/** Error thrown when the primary AND the fallback provider both fail. */
+export class LLMFallbackExhaustedError extends Error {
+  constructor(
+    readonly primaryModel: string,
+    readonly primaryError: unknown,
+    readonly fallbackModel: string,
+    readonly fallbackError: unknown,
+  ) {
+    super(
+      `primary ${primaryModel} failed: ${errorMessage(primaryError)}; ` +
+        `fallback ${fallbackModel} failed: ${errorMessage(fallbackError)}`,
+    );
+    this.name = "LLMFallbackExhaustedError";
+  }
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 // ============================
@@ -195,12 +272,14 @@ export class StandaloneLLMRunner implements LLMRunner {
     // RC5: default max_tokens 16000 (was 4096). 4096 silently truncated long L1
     // extraction JSON, which then failed to parse and dropped all memories.
     const maxTokens = params.maxTokens ?? this.config.maxTokens ?? 16000;
-    // RC5: Kimi/Moonshot extraction is only stable at temperature=1. Default to 1
-    // when neither the per-call param nor the config sets it. Reasoning models
-    // (omitTemperature) send NO temperature at all (undefined → param omitted).
-    const temperature = this.config.omitTemperature
-      ? undefined
-      : (params.temperature ?? this.config.temperature ?? 1);
+    // RC5: Kimi/Moonshot is only stable at temperature=1 (and rejects any other
+    // value). Reasoning models (omitTemperature) send NO temperature at all.
+    const temperature = resolveTemperature({
+      omitTemperature: this.config.omitTemperature,
+      baseUrl: this.config.baseUrl,
+      requested: params.temperature,
+      configured: this.config.temperature,
+    });
     const workspaceDir = params.workspaceDir ?? process.cwd();
 
     this.logger?.debug?.(
@@ -208,60 +287,98 @@ export class StandaloneLLMRunner implements LLMRunner {
       `tools=${this.enableTools}, timeout=${timeoutMs}ms`,
     );
 
-    // Create OpenAI-compatible provider via AI SDK
-    // Use "compatible" mode to call /chat/completions (not Responses API),
-    // which works with all OpenAI-compatible backends (DeepSeek, Qwen, etc.)
-    const provider = createOpenAI({
-      baseURL: this.config.baseUrl,
-      apiKey: this.config.apiKey,
-      compatibility: "compatible",
-    });
-
-    // Select tools based on mode
+    // Select tools based on mode — built ONCE and reused by the fallback attempt.
     const tools = this.enableTools
       ? createSandboxedTools(workspaceDir, this.logger)
       : createReadOnlyTools(workspaceDir, this.logger);
 
-    try {
-      // Optionally force the model to write via the write_to_file tool (L3
-      // persona). toolChoice pins the first step to that tool, and stopWhen
-      // halts as soon as it is called — so there is no risk of a forced-tool
-      // loop. Only applies to tool-enabled runs that expose write_to_file.
-      const forceWrite =
-        this.enableTools && params.forceWriteTool === true && "write_to_file" in tools;
-      if (forceWrite) {
-        this.logger?.debug?.(`${TAG} Forcing write_to_file tool call (toolChoice + hasToolCall stop).`);
-      }
+    // Optionally force the model to write via the write_to_file tool (L3
+    // persona). toolChoice pins the first step to that tool, and stopWhen
+    // halts as soon as it is called — so there is no risk of a forced-tool
+    // loop. Only applies to tool-enabled runs that expose write_to_file.
+    const forceWrite =
+      this.enableTools && params.forceWriteTool === true && "write_to_file" in tools;
+    if (forceWrite) {
+      this.logger?.debug?.(`${TAG} Forcing write_to_file tool call (toolChoice + hasToolCall stop).`);
+    }
 
-      const result = await generateText({
-        model: provider.chat(this.model),
-        system: params.systemPrompt,
-        prompt: params.prompt,
-        tools,
-        // "required" (force any tool) is honoured far more reliably by Moonshot
-        // for large prompts than a specific {type:"tool"} choice (measured: 3/3
-        // clean tool calls vs intermittent). The persona prompt only offers
-        // write-style tools and instructs write_to_file, so the model picks it;
-        // hasToolCall then stops the loop as soon as the write happens.
-        toolChoice: forceWrite ? "required" : undefined,
-        stopWhen: forceWrite
-          ? [stepCountIs(MAX_TOOL_ITERATIONS), hasToolCall("write_to_file")]
-          : stepCountIs(this.enableTools ? MAX_TOOL_ITERATIONS : 1),
-        maxOutputTokens: maxTokens,
-        // RC5: pin sampling temperature (Kimi/Moonshot requires exactly 1).
-        temperature,
-        // Survive transient network blips (e.g. flaky DNS: getaddrinfo ENOTFOUND)
-        // with extra retry headroom. The AI SDK retries with exponential backoff;
-        // the abortSignal below still caps total wall-clock per run.
-        maxRetries: 4,
-        abortSignal: AbortSignal.timeout(timeoutMs),
+    // Everything both attempts share. Only the provider/model, the temperature
+    // policy, the token budget and the abort signal differ per attempt.
+    const shared = {
+      system: params.systemPrompt,
+      prompt: params.prompt,
+      tools,
+      // "required" (force any tool) is honoured far more reliably by Moonshot
+      // for large prompts than a specific {type:"tool"} choice (measured: 3/3
+      // clean tool calls vs intermittent). The persona prompt only offers
+      // write-style tools and instructs write_to_file, so the model picks it;
+      // hasToolCall then stops the loop as soon as the write happens.
+      toolChoice: forceWrite ? ("required" as const) : undefined,
+      stopWhen: forceWrite
+        ? [stepCountIs(MAX_TOOL_ITERATIONS), hasToolCall("write_to_file")]
+        : stepCountIs(this.enableTools ? MAX_TOOL_ITERATIONS : 1),
+      // Survive transient network blips (e.g. flaky DNS: getaddrinfo ENOTFOUND)
+      // with extra retry headroom. The AI SDK retries with exponential backoff;
+      // the abortSignal still caps total wall-clock per attempt.
+      maxRetries: 4,
+    };
+
+    const attempt = async (target: ProviderTarget, opts: {
+      temperature: number | undefined;
+      maxOutputTokens: number;
+      timeoutMs: number;
+    }) => {
+      const provider = buildProvider(target);
+      return generateText({
+        ...shared,
+        model: provider.chat(target.model),
+        maxOutputTokens: opts.maxOutputTokens,
+        temperature: opts.temperature,
+        abortSignal: AbortSignal.timeout(opts.timeoutMs),
       });
+    };
+
+    let modelUsed = this.model;
+    try {
+      let result: Awaited<ReturnType<typeof generateText>>;
+      try {
+        result = await attempt(
+          { baseUrl: this.config.baseUrl, apiKey: this.config.apiKey, model: this.model, thinking: this.config.thinking },
+          { temperature, maxOutputTokens: maxTokens, timeoutMs },
+        );
+      } catch (primaryErr) {
+        const fb = this.config.fallback;
+        if (!fb) throw primaryErr;
+        const primaryMs = Date.now() - runStartMs;
+        this.logger?.warn(
+          `${TAG} run() primary ${this.model} failed after ${primaryMs}ms (taskId=${params.taskId}): ` +
+            `${errorMessage(primaryErr)} — retrying on fallback ${fb.model}`,
+        );
+        try {
+          modelUsed = fb.model;
+          result = await attempt(
+            { baseUrl: fb.baseUrl, apiKey: fb.apiKey, model: fb.model, thinking: fb.thinking },
+            {
+              temperature: resolveTemperature({
+                omitTemperature: fb.omitTemperature,
+                baseUrl: fb.baseUrl,
+                requested: params.temperature,
+                configured: this.config.temperature,
+              }),
+              maxOutputTokens: fb.maxTokens ?? maxTokens,
+              timeoutMs: fb.timeoutMs ?? timeoutMs,
+            },
+          );
+        } catch (fallbackErr) {
+          throw new LLMFallbackExhaustedError(this.model, primaryErr, fb.model, fallbackErr);
+        }
+      }
 
       const text = result.text.trim();
       const totalMs = Date.now() - runStartMs;
 
       this.logger?.debug?.(
-        `${TAG} run() completed: ${totalMs}ms, steps=${result.steps.length}, output=${text.length} chars`,
+        `${TAG} run() completed: ${totalMs}ms, model=${modelUsed}, steps=${result.steps.length}, output=${text.length} chars`,
       );
 
       // Log tool usage if any. Do NOT gate on steps.length > 1: a forced tool
@@ -279,7 +396,7 @@ export class StandaloneLLMRunner implements LLMRunner {
         report("llm_call", {
           taskId: params.taskId,
           provider: "standalone",
-          model: this.model,
+          model: modelUsed,
           inputLength: params.prompt.length,
           outputLength: text.length,
           totalDurationMs: totalMs,
@@ -291,14 +408,16 @@ export class StandaloneLLMRunner implements LLMRunner {
       return text;
     } catch (err) {
       const totalMs = Date.now() - runStartMs;
-      const errMsg = err instanceof Error ? err.message : String(err);
-      this.logger?.error(`${TAG} run() failed after ${totalMs}ms: ${errMsg}`);
+      const errMsg = errorMessage(err);
+      this.logger?.error(
+        `${TAG} run() failed after ${totalMs}ms (taskId=${params.taskId}, model=${modelUsed}): ${errMsg}`,
+      );
 
       if (params.instanceId) {
         report("llm_call", {
           taskId: params.taskId,
           provider: "standalone",
-          model: this.model,
+          model: modelUsed,
           inputLength: params.prompt.length,
           outputLength: 0,
           totalDurationMs: totalMs,
@@ -358,5 +477,35 @@ export class StandaloneLLMRunnerFactory implements LLMRunnerFactory {
       enableTools,
       logger: this.logger,
     });
+  }
+
+  /**
+   * A runner whose PRIMARY is the configured fallback provider (and which has
+   * no fallback of its own). Used by callers that keep a second-layer retry
+   * for failures the transport cannot see (e.g. the kb-extractor's JSON/schema
+   * parse failures). Returns undefined when no fallback is configured.
+   */
+  createFallbackRunner(opts?: LLMRunnerCreateOptions): LLMRunner | undefined {
+    const fb = this.config.fallback;
+    if (!fb) return undefined;
+    return new StandaloneLLMRunner({
+      config: {
+        baseUrl: fb.baseUrl,
+        apiKey: fb.apiKey,
+        model: fb.model,
+        omitTemperature: fb.omitTemperature,
+        maxTokens: fb.maxTokens ?? this.config.maxTokens,
+        timeoutMs: fb.timeoutMs ?? this.config.timeoutMs,
+        thinking: fb.thinking,
+      },
+      model: fb.model,
+      enableTools: opts?.enableTools ?? false,
+      logger: this.logger,
+    });
+  }
+
+  /** The configured fallback model name, for log lines; undefined when none. */
+  get fallbackModel(): string | undefined {
+    return this.config.fallback?.model;
   }
 }
