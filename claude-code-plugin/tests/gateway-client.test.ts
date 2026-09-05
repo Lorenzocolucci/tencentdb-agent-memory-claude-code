@@ -136,6 +136,87 @@ describe("GatewayClient", () => {
     });
   });
 
+  it("observe forwards tool_risk and the bounded output of a destructive success", async () => {
+    stub = await startStubServer(() => ({ status: 200, body: { context: "" } }));
+    const client = new GatewayClient({ baseUrl: `http://127.0.0.1:${stub.port}`, token: "t" });
+    await client.observe({
+      toolName: "Bash",
+      sessionKey: "k",
+      toolInput: { command: "rm -rf node_modules" },
+      toolOutputIsError: false,
+      toolOutputText: "removed 1200 files",
+      toolRisk: "destructive",
+    });
+    expect(stub.captured[0].path).toBe("/observe");
+    expect(JSON.parse(stub.captured[0].body)).toEqual({
+      session_key: "k",
+      tool_name: "Bash",
+      tool_input: { command: "rm -rf node_modules" },
+      tool_output_text: "removed 1200 files",
+      tool_output_is_error: false,
+      tool_risk: "destructive",
+    });
+  });
+
+  it("observe omits tool_risk when not set (wire shape unchanged for normal calls)", async () => {
+    stub = await startStubServer(() => ({ status: 200, body: { context: "" } }));
+    const client = new GatewayClient({ baseUrl: `http://127.0.0.1:${stub.port}`, token: "t" });
+    await client.observe({ toolName: "Read", sessionKey: "k", toolInput: { file_path: "a" } });
+    expect(JSON.parse(stub.captured[0].body)).toEqual({
+      session_key: "k",
+      tool_name: "Read",
+      tool_input: { file_path: "a" },
+    });
+  });
+
+  describe("resolveGatedMemory", () => {
+    it("POSTs /memory/confirm with owner_id + owner_kind and returns {ok,text} on 200", async () => {
+      stub = await startStubServer(() => ({ status: 200, body: { ok: true, text: "Confermato." } }));
+      const client = new GatewayClient({ baseUrl: `http://127.0.0.1:${stub.port}`, token: "tok" });
+      const res = await client.resolveGatedMemory("confirm", "fact_01ABC", "fact");
+      expect(res).toEqual({ ok: true, text: "Confermato." });
+      expect(stub.captured[0].method).toBe("POST");
+      expect(stub.captured[0].path).toBe("/memory/confirm");
+      expect(stub.captured[0].headers.authorization).toBe("Bearer tok");
+      expect(JSON.parse(stub.captured[0].body)).toEqual({ owner_id: "fact_01ABC", owner_kind: "fact" });
+    });
+
+    it("POSTs /memory/reject for the reject decision", async () => {
+      stub = await startStubServer(() => ({ status: 200, body: { ok: true, text: "Rifiutato." } }));
+      const client = new GatewayClient({ baseUrl: `http://127.0.0.1:${stub.port}`, token: "t" });
+      const res = await client.resolveGatedMemory("reject", "event_01XYZ", "event");
+      expect(res).toEqual({ ok: true, text: "Rifiutato." });
+      expect(stub.captured[0].path).toBe("/memory/reject");
+      expect(JSON.parse(stub.captured[0].body)).toEqual({ owner_id: "event_01XYZ", owner_kind: "event" });
+    });
+
+    it("returns {ok:false,text} on 409 (store could not apply)", async () => {
+      stub = await startStubServer(() => ({
+        status: 409,
+        body: { ok: false, text: "Nessuna memoria in attesa con questo id." },
+      }));
+      const client = new GatewayClient({ baseUrl: `http://127.0.0.1:${stub.port}`, token: "t" });
+      const res = await client.resolveGatedMemory("confirm", "fact_01ABC", "fact");
+      expect(res).toEqual({ ok: false, text: "Nessuna memoria in attesa con questo id." });
+    });
+
+    it("maps a 400 {error} to {ok:false,text}", async () => {
+      stub = await startStubServer(() => ({ status: 400, body: { error: "owner_kind invalid" } }));
+      const client = new GatewayClient({ baseUrl: `http://127.0.0.1:${stub.port}`, token: "t" });
+      const res = await client.resolveGatedMemory("confirm", "fact_01ABC", "fact");
+      expect(res).toEqual({ ok: false, text: "owner_kind invalid" });
+    });
+
+    it("returns null on transport error and on an unexpected status", async () => {
+      const dead = new GatewayClient({ baseUrl: "http://127.0.0.1:1", token: "t" });
+      expect(await dead.resolveGatedMemory("confirm", "fact_01ABC", "fact")).toBeNull();
+
+      stub = await startStubServer(() => ({ status: 500, body: { error: "boom" } }));
+      const client = new GatewayClient({ baseUrl: `http://127.0.0.1:${stub.port}`, token: "t" });
+      expect(await client.resolveGatedMemory("reject", "fact_01ABC", "fact")).toBeNull();
+    });
+  });
+
   it("searchMemories POSTs query, returns results text", async () => {
     stub = await startStubServer(() => ({
       status: 200,
