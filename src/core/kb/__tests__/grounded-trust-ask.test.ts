@@ -23,6 +23,15 @@ describe("renderGroundedTrustInterrupt", () => {
     expect(out).toContain('tdai_reject_memory(owner_kind:"event", owner_id:"ev-1")');
   });
 
+  it("tells a Claude Code agent to run the plugin skills with the owner id (CONTRACT point 3)", () => {
+    const out = renderGroundedTrustInterrupt([iban]);
+    expect(out).toContain("/memory-confirm ev-1");
+    expect(out).toContain("/memory-reject ev-1");
+    // Host-neutral: both the OpenClaw tool names and the Claude Code skills are named.
+    expect(out).toContain("tdai_confirm_memory");
+    expect(out).toContain("skill");
+  });
+
   it("numbers multiple asks and closes the block", () => {
     const out = renderGroundedTrustInterrupt([
       iban,

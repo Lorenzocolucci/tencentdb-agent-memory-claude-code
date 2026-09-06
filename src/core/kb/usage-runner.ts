@@ -21,6 +21,7 @@ import { selectUsageClusters, DEFAULT_USAGE_ELIGIBLE_TYPES } from "./usage-clust
 import { USAGE_CANDIDATE_TAU } from "./usage-similarity.js";
 import { distillUsageCluster, type DistillUsageOptions } from "./usage-distiller.js";
 import { writeUsage, USAGE_TYPE, USAGE_SRC_PREFIX } from "./usage-writer.js";
+import { noteLlmFailure } from "./lessons-runner.js";
 
 export interface DistillUsageParams {
   now: string;
@@ -46,11 +47,21 @@ export interface UsageRunStats {
   confirmed: number;
   inserted: number;
   skippedDuplicate: number;
-  /** Clusters the LLM rejected as noise (or that were undistillable). */
+  /** Clusters the judge rejected as noise, gave an unusable answer for, or whose write was refused. */
   skippedRejected: number;
+  /**
+   * Clusters whose LLM call THREW. Kept apart from skippedRejected: before
+   * 2026-09-05 a dead model was reported as "rejected=2", i.e. as the judge's
+   * verdict, and nobody could tell an outage from noise.
+   */
+  skippedLlmFailed: number;
+  /** First few LLM error messages (bounded), for the runner's log line. */
+  llmErrors: string[];
 }
 
-const ZERO: UsageRunStats = { candidates: 0, confirmed: 0, inserted: 0, skippedDuplicate: 0, skippedRejected: 0 };
+const ZERO: UsageRunStats = {
+  candidates: 0, confirmed: 0, inserted: 0, skippedDuplicate: 0, skippedRejected: 0, skippedLlmFailed: 0, llmErrors: [],
+};
 
 export async function distillUsage(
   store: IMemoryStore,
@@ -58,7 +69,7 @@ export async function distillUsage(
   llmRunner: LLMRunner,
   params: DistillUsageParams,
 ): Promise<UsageRunStats> {
-  const stats: UsageRunStats = { ...ZERO };
+  const stats: UsageRunStats = { ...ZERO, llmErrors: [] };
   try {
     if (typeof store.listRecentEvents !== "function" || typeof store.insertEvent !== "function") {
       return stats;
@@ -109,13 +120,22 @@ export async function distillUsage(
         continue;
       }
       // A3 precision gate: the LLM confirms/cleans, or rejects as noise.
+      let llmFailed = false;
       const distilled = await distillUsageCluster(
         { project: cluster.project, texts: cluster.texts },
         llmRunner,
-        params.distill,
+        {
+          ...params.distill,
+          onLlmError: (e) => {
+            llmFailed = true;
+            noteLlmFailure(stats, e.message);
+            params.distill?.onLlmError?.(e);
+          },
+        },
       );
       if (!distilled) {
-        stats.skippedRejected += 1;
+        // "LLM failed" is NOT "judge rejected": only count the latter here.
+        if (!llmFailed) stats.skippedRejected += 1;
         continue;
       }
       stats.confirmed += 1;

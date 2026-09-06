@@ -146,6 +146,13 @@ export interface LLMRunnerCreateOptions {
  */
 export interface LLMRunnerFactory {
   createRunner(opts?: LLMRunnerCreateOptions): LLMRunner;
+  /**
+   * Optional: a runner whose primary is the factory's configured FALLBACK
+   * provider (no fallback of its own). Callers that keep a second-layer retry
+   * for failures the transport cannot see (parse/schema) use it; hosts without
+   * a fallback omit it or return undefined.
+   */
+  createFallbackRunner?(opts?: LLMRunnerCreateOptions): LLMRunner | undefined;
 }
 
 // ============================

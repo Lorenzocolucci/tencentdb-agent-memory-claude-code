@@ -5,6 +5,12 @@ import { join } from "node:path";
 import { handleHook } from "../lib/hook.js";
 import type { GatewayClient, RecallResult } from "../lib/gateway-client.js";
 
+type ObservePayload = Parameters<GatewayClient["observe"]>[0];
+/** A typed observe fake so `mock.calls[0][0]` is the payload, not `undefined`. */
+function fakeObserve(result = "") {
+  return vi.fn(async (_p: ObservePayload) => result);
+}
+
 function makeFakeClient(overrides: Partial<GatewayClient> = {}): GatewayClient {
   return {
     health: vi.fn(async () => true),
@@ -23,6 +29,8 @@ function makeFakeClient(overrides: Partial<GatewayClient> = {}): GatewayClient {
     searchMemories: vi.fn(async () => ({ results: "m", total: 1 })),
     searchConversations: vi.fn(async () => ({ results: "c", total: 1 })),
     sessionEnd: vi.fn(async () => {}),
+    // Grounded-trust confirm/reject from Claude Code (2026-09-05).
+    resolveGatedMemory: vi.fn(async () => ({ ok: true, text: "applied" })),
     ...overrides,
   } as unknown as GatewayClient;
 }
@@ -356,6 +364,185 @@ describe("handleHook: post-tool-use", () => {
     await expect(
       handleHook("post-tool-use", { stdin, client }),
     ).resolves.not.toThrow();
+  });
+});
+
+describe("handleHook: post-tool-use — destructive command on SUCCESS", () => {
+  it("tags a successful destructive Bash command and forwards ≤400 chars of its output", async () => {
+    const observe = fakeObserve();
+    const client = makeFakeClient({ observe } as Partial<GatewayClient>);
+    const longOutput = "x".repeat(1_000);
+    const stdin = JSON.stringify({
+      session_id: "s",
+      cwd: "/tmp/proj",
+      tool_name: "Bash",
+      tool_input: { command: "git worktree remove ../wt" },
+      tool_response: longOutput,
+    });
+    await handleHook("post-tool-use", { stdin, client });
+    expect(observe).toHaveBeenCalledTimes(1);
+    const payload = observe.mock.calls[0][0];
+    expect(payload.toolName).toBe("Bash");
+    expect(payload.toolRisk).toBe("destructive");
+    expect(payload.toolOutputIsError).toBeUndefined();
+    expect(payload.toolOutputText?.length).toBe(400);
+  });
+
+  it("sends no tool_risk for an ordinary Bash success", async () => {
+    const observe = fakeObserve();
+    const client = makeFakeClient({ observe } as Partial<GatewayClient>);
+    const stdin = JSON.stringify({
+      session_id: "s",
+      tool_name: "Bash",
+      tool_input: { command: "git worktree list" },
+      tool_response: "C:/x  abc [main]",
+    });
+    await handleHook("post-tool-use", { stdin, client });
+    const payload = observe.mock.calls[0][0];
+    expect(payload.toolRisk).toBeUndefined();
+    expect(payload.toolOutputText).toBeUndefined();
+  });
+
+  it("never tags a non-Bash tool even if its input mentions a destructive command", async () => {
+    const observe = fakeObserve();
+    const client = makeFakeClient({ observe } as Partial<GatewayClient>);
+    const stdin = JSON.stringify({
+      session_id: "s",
+      tool_name: "Write",
+      tool_input: { file_path: "cleanup.sh", command: "rm -rf build" },
+      tool_response: { success: true },
+    });
+    await handleHook("post-tool-use", { stdin, client });
+    const payload = observe.mock.calls[0][0];
+    expect(payload.toolRisk).toBeUndefined();
+  });
+});
+
+describe("handleHook: post-tool-use-failure", () => {
+  it("reaches observe with toolOutputIsError true and the error text", async () => {
+    const observe = fakeObserve();
+    const client = makeFakeClient({ observe } as Partial<GatewayClient>);
+    // Shape of Claude Code 2.1.198's PostToolUseFailure stdin.
+    const stdin = JSON.stringify({
+      session_id: "s",
+      cwd: "/tmp/proj",
+      hook_event_name: "PostToolUseFailure",
+      tool_name: "Bash",
+      tool_input: { command: "npm run build" },
+      tool_use_id: "toolu_1",
+      error: "Exit code 2\nsrc/x.ts(3,1): error TS2304: Cannot find name 'foo'.",
+      error_type: "tool_error",
+      is_interrupt: false,
+      duration_ms: 1234,
+    });
+    const out = await handleHook("post-tool-use-failure", { stdin, client });
+    expect(out).toBe("");
+    expect(observe).toHaveBeenCalledTimes(1);
+    const payload = observe.mock.calls[0][0];
+    expect(payload.toolName).toBe("Bash");
+    expect(payload.toolInput).toEqual({ command: "npm run build" });
+    expect(payload.toolOutputIsError).toBe(true);
+    expect(payload.toolOutputText).toContain("error TS2304");
+    expect(payload.toolRisk).toBeUndefined();
+  });
+
+  it("bounds the error text to 2000 chars and falls back to error_type when error is empty", async () => {
+    const observe = fakeObserve();
+    const client = makeFakeClient({ observe } as Partial<GatewayClient>);
+    await handleHook("post-tool-use-failure", {
+      stdin: JSON.stringify({ tool_name: "Edit", tool_input: {}, error: "e".repeat(5_000) }),
+      client,
+    });
+    expect(observe.mock.calls[0][0].toolOutputText?.length).toBe(2_000);
+
+    await handleHook("post-tool-use-failure", {
+      stdin: JSON.stringify({ tool_name: "Edit", tool_input: {}, error: "", error_type: "timeout" }),
+      client,
+    });
+    expect(observe.mock.calls[1][0].toolOutputText).toBe("timeout");
+  });
+
+  it("renders the gateway's context as PostToolUseFailure additionalContext", async () => {
+    const client = makeFakeClient({
+      observe: vi.fn(async () => "⚠️ LOOP: 3× same failure"),
+    } as Partial<GatewayClient>);
+    const out = await handleHook("post-tool-use-failure", {
+      stdin: JSON.stringify({ tool_name: "Bash", tool_input: { command: "x" }, error: "boom" }),
+      client,
+    });
+    const parsed = JSON.parse(out);
+    expect(parsed.hookSpecificOutput.hookEventName).toBe("PostToolUseFailure");
+    expect(parsed.hookSpecificOutput.additionalContext).toContain("LOOP");
+  });
+
+  it("skips a user interrupt (not friction) and a payload without tool_name", async () => {
+    const observe = fakeObserve();
+    const client = makeFakeClient({ observe } as Partial<GatewayClient>);
+    await handleHook("post-tool-use-failure", {
+      stdin: JSON.stringify({ tool_name: "Bash", tool_input: {}, error: "x", is_interrupt: true }),
+      client,
+    });
+    await handleHook("post-tool-use-failure", { stdin: JSON.stringify({ error: "x" }), client });
+    expect(observe).not.toHaveBeenCalled();
+  });
+});
+
+describe("handleHook: confirm / reject (grounded trust)", () => {
+  it("confirm reads the id from stdin, infers fact kind, prints the gateway text", async () => {
+    const resolveGatedMemory = vi.fn(async () => ({ ok: true, text: "Memoria confermata." }));
+    const client = makeFakeClient({ resolveGatedMemory } as Partial<GatewayClient>);
+    const out = await handleHook("confirm", { stdin: "fact_01KWT3SMSB0000M87KKS\n", client });
+    expect(resolveGatedMemory).toHaveBeenCalledWith("confirm", "fact_01KWT3SMSB0000M87KKS", "fact");
+    expect(out).toBe("Memoria confermata.");
+  });
+
+  it("reject infers event kind from the event_ prefix", async () => {
+    const resolveGatedMemory = vi.fn(async () => ({ ok: true, text: "Memoria rifiutata." }));
+    const client = makeFakeClient({ resolveGatedMemory } as Partial<GatewayClient>);
+    const out = await handleHook("reject", { stdin: "  event_01ABCDEF  ", client });
+    expect(resolveGatedMemory).toHaveBeenCalledWith("reject", "event_01ABCDEF", "event");
+    expect(out).toBe("Memoria rifiutata.");
+  });
+
+  it("refuses an id with an unknown prefix without calling the gateway", async () => {
+    const resolveGatedMemory = vi.fn(async () => ({ ok: true, text: "x" }));
+    const client = makeFakeClient({ resolveGatedMemory } as Partial<GatewayClient>);
+    const out = await handleHook("confirm", { stdin: "01KWT3SMSB0000M87KKS", client });
+    expect(resolveGatedMemory).not.toHaveBeenCalled();
+    expect(out).toContain('"fact_" or "event_"');
+    expect(out).toContain("01KWT3SMSB0000M87KKS");
+  });
+
+  it("refuses an id that carries shell-looking characters (stdin is data, not a command)", async () => {
+    const resolveGatedMemory = vi.fn(async () => ({ ok: true, text: "x" }));
+    const client = makeFakeClient({ resolveGatedMemory } as Partial<GatewayClient>);
+    const out = await handleHook("reject", { stdin: "fact_01ABC; rm -rf /", client });
+    expect(resolveGatedMemory).not.toHaveBeenCalled();
+    expect(out).toContain("Cannot reject");
+  });
+
+  it("prints a usage line on empty stdin", async () => {
+    const client = makeFakeClient();
+    const out = await handleHook("confirm", { stdin: "   ", client });
+    expect(out).toContain("Usage");
+    expect(out).toContain("/memory-confirm");
+  });
+
+  it("says NOT applied when the gateway is unreachable (null)", async () => {
+    const client = makeFakeClient({
+      resolveGatedMemory: vi.fn(async () => null),
+    } as Partial<GatewayClient>);
+    const out = await handleHook("confirm", { stdin: "fact_01ABC", client });
+    expect(out).toContain("NOT applied");
+    expect(out).toContain("fact_01ABC");
+  });
+
+  it("surfaces the 409 text when the store could not apply", async () => {
+    const client = makeFakeClient({
+      resolveGatedMemory: vi.fn(async () => ({ ok: false, text: "Nessuna memoria in attesa." })),
+    } as Partial<GatewayClient>);
+    const out = await handleHook("reject", { stdin: "fact_01ABC", client });
+    expect(out).toBe("Nessuna memoria in attesa.");
   });
 });
 

@@ -31,6 +31,24 @@ export const RECALL_TIMEOUT_MS = 6_000;
 /** Capture timeout: session save is more important; allow extra time for a
  *  slow gateway write-through before declaring the save lost. */
 export const CAPTURE_TIMEOUT_MS = 12_000;
+
+/**
+ * The capture timeout the client actually uses. Live hooks keep the 12s
+ * default (the Stop hook has a 30s budget in hooks.json and retries once).
+ * An OFFLINE replay (tools/backfill-cc-sessions.mts) is a different animal:
+ * a never-captured 18 MB transcript sends its last 50 turns in one call and
+ * the gateway needs well over 12s to write them. Measured 2026-09-05: every
+ * call timed out client-side, the gateway kept processing each abandoned
+ * request anyway, the cursor never advanced, and the loop re-sent the same
+ * 50 turns 20 times. `TDAI_CAPTURE_TIMEOUT_MS` (positive integer) lets the
+ * replay wait instead of flooding.
+ */
+export function resolveCaptureTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.TDAI_CAPTURE_TIMEOUT_MS;
+  if (raw === undefined || raw === "") return CAPTURE_TIMEOUT_MS;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : CAPTURE_TIMEOUT_MS;
+}
 /** Default timeout for all other requests (health, search, sessionEnd). */
 export const DEFAULT_TIMEOUT_MS = 5_000;
 
@@ -71,6 +89,15 @@ export interface SearchResult {
   results: string;
   total: number;
   strategy?: string;
+}
+
+/** Risk tag on /observe. Only one value for now (shared contract, 2026-09-05). */
+export type ToolRisk = "destructive";
+
+/** Result of POST /memory/confirm | /memory/reject. */
+export interface GatedMemoryResult {
+  ok: boolean;
+  text: string;
 }
 
 /** What /health actually tells us. `null` from healthDetailed() = unreachable. */
@@ -205,8 +232,14 @@ export class GatewayClient {
     sessionKey: string;
     toolInput?: unknown;
     toolOutputIsError?: boolean;
-    /** Raw output of a FAILED tool call — feeds friction capture. */
+    /**
+     * Raw output of a FAILED tool call — feeds friction capture. When
+     * `toolRisk` is set it is instead the first 400 chars of a SUCCESSFUL
+     * destructive command's output.
+     */
     toolOutputText?: string;
+    /** Set when a successful Bash command matched the destructive list. */
+    toolRisk?: ToolRisk;
   }): Promise<string> {
     try {
       const token = await this.freshToken();
@@ -219,6 +252,7 @@ export class GatewayClient {
           tool_input: payload.toolInput,
           tool_output_text: payload.toolOutputText,
           tool_output_is_error: payload.toolOutputIsError,
+          tool_risk: payload.toolRisk,
         },
         token,
         RECALL_TIMEOUT_MS,
@@ -256,8 +290,9 @@ export class GatewayClient {
   private async captureTurnOnce(payload: CaptureTurnPayload): Promise<CaptureTurnResult | null> {
     try {
       const token = await this.freshToken();
+      const captureTimeoutMs = resolveCaptureTimeoutMs();
       const { status, body } = await this.rawRequest(
-        "POST", "/capture", payload, token, CAPTURE_TIMEOUT_MS,
+        "POST", "/capture", payload, token, captureTimeoutMs,
       );
 
       // Phase 3: TOKEN/AUTH — on 401 re-read the token file once and retry.
@@ -266,7 +301,7 @@ export class GatewayClient {
         this.token = "";
         const freshTok = await this.freshToken();
         const retry = await this.rawRequest(
-          "POST", "/capture", payload, freshTok, CAPTURE_TIMEOUT_MS,
+          "POST", "/capture", payload, freshTok, captureTimeoutMs,
         );
         if (retry.status === 200) {
           return JSON.parse(retry.body) as CaptureTurnResult;
@@ -340,6 +375,43 @@ export class GatewayClient {
       }
     } catch (err) {
       await this.logFailure("POST", "/session/end", err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /**
+   * POST /memory/confirm | /memory/reject — resolve a grounded-trust gate from
+   * Claude Code. 200 and 409 both carry `{ok, text}` (409 = the store could
+   * not apply it); 400 carries `{error}` and is mapped to `{ok:false, text}`.
+   * Returns null only on transport failure or an unexpected status, so the
+   * caller can say "not applied" instead of pretending.
+   */
+  async resolveGatedMemory(
+    decision: "confirm" | "reject",
+    ownerId: string,
+    ownerKind: "fact" | "event",
+  ): Promise<GatedMemoryResult | null> {
+    const path = `/memory/${decision}`;
+    try {
+      const token = await this.freshToken();
+      const { status, body } = await this.rawRequest(
+        "POST",
+        path,
+        { owner_id: ownerId, owner_kind: ownerKind },
+        token,
+      );
+      if (status === 200 || status === 409) {
+        const parsed = JSON.parse(body) as { ok?: boolean; text?: string };
+        return { ok: parsed.ok === true, text: parsed.text ?? "" };
+      }
+      if (status === 400) {
+        const parsed = JSON.parse(body) as { error?: string };
+        return { ok: false, text: parsed.error ?? this.describeStatus(status, body) };
+      }
+      await this.logFailure("POST", path, this.describeStatus(status, body));
+      return null;
+    } catch (err) {
+      await this.logFailure("POST", path, err instanceof Error ? err.message : String(err));
+      return null;
     }
   }
 

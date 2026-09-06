@@ -5,17 +5,18 @@
  *   node ${CLAUDE_PLUGIN_ROOT}/dist/lib/hook.mjs <event-name>
  *
  * Where <event-name> is one of:
- *   session-start | user-prompt-submit | post-tool-use | stop |
- *   search | status | clear-session
+ *   session-start | user-prompt-submit | post-tool-use | post-tool-use-failure |
+ *   stop | search | search-stdin | status | clear-session | confirm | reject
  */
 
-import { GatewayClient, RECALL_TIMEOUT_MS, CAPTURE_TIMEOUT_MS } from "./gateway-client.js";
+import { GatewayClient, RECALL_TIMEOUT_MS, resolveCaptureTimeoutMs } from "./gateway-client.js";
 import { getSessionKey, getProjectName } from "./session-key.js";
 import { readAllTurns } from "./transcript.js";
 import { DaemonManager, readDaemonState, clearDaemonState } from "./daemon.js";
 import { resolveDataDirDetailed, type DataDirSource } from "./data-dir.js";
 import { raiseAlarm, clearAlarm, drainAlarms } from "./alarm.js";
 import { assessStaleness, describeStaleness, newestTranscriptMs } from "./staleness.js";
+import { matchDestructiveCommand } from "./destructive-commands.js";
 import { appendFile, mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
@@ -30,11 +31,14 @@ export type HookEvent =
   | "session-start"
   | "user-prompt-submit"
   | "post-tool-use"
+  | "post-tool-use-failure"
   | "stop"
   | "search"
   | "search-stdin"
   | "status"
-  | "clear-session";
+  | "clear-session"
+  | "confirm"
+  | "reject";
 
 export interface HookInput {
   stdin: string;
@@ -54,6 +58,8 @@ export async function handleHook(event: HookEvent, input: HookInput): Promise<st
       return handleUserPromptSubmit(data, input.client, dataDir);
     case "post-tool-use":
       return handlePostToolUse(data, input.client);
+    case "post-tool-use-failure":
+      return handlePostToolUseFailure(data, input.client);
     case "stop":
       return handleStop(data, input.client, dataDir);
     case "search":
@@ -64,6 +70,10 @@ export async function handleHook(event: HookEvent, input: HookInput): Promise<st
       return handleStatus(input.client);
     case "clear-session":
       return handleClearSession(data, input.client);
+    case "confirm":
+      return handleResolveGatedMemory("confirm", input.stdin, input.client);
+    case "reject":
+      return handleResolveGatedMemory("reject", input.stdin, input.client);
     default:
       return "";
   }
@@ -81,6 +91,10 @@ interface HookStdin {
   tool_output_is_error?: boolean;
   tool_use_id?: string;
   stop_hook_active?: boolean;
+  /** PostToolUseFailure only (Claude Code >= 2.1): the failure itself. */
+  error?: unknown;
+  error_type?: string;
+  is_interrupt?: boolean;
 }
 
 function parseStdin(raw: string): HookStdin {
@@ -230,11 +244,16 @@ const MAX_TOOL_OUTPUT_CHARS = 2_000;
  * undefined when there is nothing usable — the caller then sends nothing and
  * behaviour is exactly as before.
  */
-function stringifyToolOutput(resp: unknown): string | undefined {
+function stringifyToolOutput(
+  resp: unknown,
+  maxChars: number = MAX_TOOL_OUTPUT_CHARS,
+): string | undefined {
   if (resp == null) return undefined;
   let text: string;
   if (typeof resp === "string") {
     text = resp;
+  } else if (resp instanceof Error) {
+    text = resp.message;
   } else {
     try {
       text = JSON.stringify(resp) ?? "";
@@ -244,8 +263,11 @@ function stringifyToolOutput(resp: unknown): string | undefined {
   }
   text = text.trim();
   if (!text) return undefined;
-  return text.length > MAX_TOOL_OUTPUT_CHARS ? text.slice(0, MAX_TOOL_OUTPUT_CHARS) : text;
+  return text.length > maxChars ? text.slice(0, maxChars) : text;
 }
+
+/** Max characters of a SUCCESSFUL destructive command's output forwarded. */
+const MAX_DESTRUCTIVE_OUTPUT_CHARS = 400;
 
 async function handlePostToolUse(data: HookStdin, client: GatewayClient): Promise<string> {
   // Proactive injection by SITUATION (Track A 3+4): when the agent touches a
@@ -262,8 +284,25 @@ async function handlePostToolUse(data: HookStdin, client: GatewayClient): Promis
   // design, so before this a repeated technical failure was invisible to the
   // Mistake Notebook. Bounded here (not just gateway-side) to keep the hook
   // payload small; secrets are redacted gateway-side before anything is stored.
-  const toolOutputText =
+  //
+  // NOTE (2026-09-05): Claude Code 2.1.x never sets `tool_output_is_error` on
+  // PostToolUse — failures arrive on the separate PostToolUseFailure event
+  // (handlePostToolUseFailure below). The branch is kept for older hosts.
+  let toolOutputText =
     data.tool_output_is_error === true ? stringifyToolOutput(data.tool_response) : undefined;
+
+  // Destructive-command capture: a SUCCESSFUL `rm -rf` / `git worktree remove`
+  // / `git reset --hard` is exactly the kind of event a later "you just wiped
+  // my node_modules" refers to. Tag it so the gateway records the success as an
+  // observation (never a bug) and can link the correction to it.
+  const destructiveLabel =
+    toolName === "Bash" && data.tool_output_is_error !== true
+      ? matchDestructiveCommand((data.tool_input as { command?: unknown } | undefined)?.command)
+      : null;
+  const toolRisk = destructiveLabel ? ("destructive" as const) : undefined;
+  if (toolRisk && toolOutputText === undefined) {
+    toolOutputText = stringifyToolOutput(data.tool_response, MAX_DESTRUCTIVE_OUTPUT_CHARS);
+  }
 
   let context = await client.observe({
     toolName,
@@ -271,6 +310,7 @@ async function handlePostToolUse(data: HookStdin, client: GatewayClient): Promis
     toolInput: data.tool_input,
     toolOutputIsError: data.tool_output_is_error,
     toolOutputText,
+    toolRisk,
   });
   if (!context) return "";
 
@@ -280,6 +320,43 @@ async function handlePostToolUse(data: HookStdin, client: GatewayClient): Promis
   return JSON.stringify({
     hookSpecificOutput: {
       hookEventName: "PostToolUse",
+      additionalContext: context,
+    },
+  });
+}
+
+/**
+ * PostToolUseFailure (Claude Code >= 2.1): the host reports a failed tool call
+ * on its own event with an `error` field instead of `tool_output_is_error` on
+ * PostToolUse. Forward it as a failed observation so friction capture finally
+ * fires live (it produced ZERO events in its first 29 days because nothing
+ * ever subscribed to this event). A user interrupt is not friction: skip it.
+ */
+async function handlePostToolUseFailure(data: HookStdin, client: GatewayClient): Promise<string> {
+  const toolName = data.tool_name ?? "";
+  if (!toolName) return "";
+  if (data.is_interrupt === true) return "";
+  const cwd = data.cwd ?? process.cwd();
+  const sessionKey = getSessionKey(cwd);
+
+  const toolOutputText =
+    stringifyToolOutput(data.error) ?? (data.error_type ? String(data.error_type) : undefined);
+
+  let context = await client.observe({
+    toolName,
+    sessionKey,
+    toolInput: data.tool_input,
+    toolOutputIsError: true,
+    toolOutputText,
+  });
+  if (!context) return "";
+
+  if (context.length > MAX_INJECT_CHARS) {
+    context = context.slice(0, MAX_INJECT_CHARS - 100) + "\n\n[…truncated…]";
+  }
+  return JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "PostToolUseFailure",
       additionalContext: context,
     },
   });
@@ -480,6 +557,41 @@ async function handleSearchStdin(rawStdin: string, client: GatewayClient): Promi
   if (!query) return "Usage: pipe the query to stdin";
   const result = await client.searchMemories(query, { limit: 10 });
   return result.results || "No memories found.";
+}
+
+/**
+ * Confirm / reject a gated (grounded-trust) memory from Claude Code. The owner
+ * id rides on stdin for the same reason as search-stdin: `$ARGUMENTS` is a
+ * literal replaceAll in cc, so an id on argv would be a command-injection
+ * surface. `owner_kind` is inferred from the id prefix the store uses
+ * (`fact_…` / `event_…`); anything else is refused with a clear message —
+ * exit code stays 0 so the skill output is rendered, not swallowed.
+ */
+async function handleResolveGatedMemory(
+  decision: "confirm" | "reject",
+  rawStdin: string,
+  client: GatewayClient,
+): Promise<string> {
+  const ownerId = rawStdin.trim();
+  if (!ownerId) {
+    return `Usage: pipe the memory id (fact_… or event_…) to stdin for /memory-${decision}`;
+  }
+  const ownerKind = inferOwnerKind(ownerId);
+  if (!ownerKind) {
+    return `Cannot ${decision} "${ownerId}": the id must start with "fact_" or "event_" (copy it from the memory prompt).`;
+  }
+  const res = await client.resolveGatedMemory(decision, ownerId, ownerKind);
+  if (!res) {
+    return `Memory gateway unreachable — ${decision} of ${ownerId} NOT applied. Try /memory-status.`;
+  }
+  return res.text || (res.ok ? `${decision} applied to ${ownerId}` : `${decision} NOT applied to ${ownerId}`);
+}
+
+/** Owner kind from the id prefix the store uses; null when unrecognised. */
+export function inferOwnerKind(ownerId: string): "fact" | "event" | null {
+  if (/^fact_[A-Za-z0-9]+$/.test(ownerId)) return "fact";
+  if (/^event_[A-Za-z0-9]+$/.test(ownerId)) return "event";
+  return null;
 }
 
 async function handleStatus(client: GatewayClient): Promise<string> {
@@ -738,7 +850,7 @@ async function main(): Promise<void> {
       // Phase 3: HOOK CLIENT TIMEOUT — use named constants, not magic numbers.
       // recall: short (non-blocking prompt); capture: generous (don't drop saves);
       // other events: DEFAULT_TIMEOUT_MS (see gateway-client.ts constants).
-      timeoutMs: event === "user-prompt-submit" ? RECALL_TIMEOUT_MS : CAPTURE_TIMEOUT_MS,
+      timeoutMs: event === "user-prompt-submit" ? RECALL_TIMEOUT_MS : resolveCaptureTimeoutMs(),
       logPath,
       // Phase 3: TOKEN/AUTH — pass tokenPath so the client always reads the
       // CURRENT token from file on each request; handles stale-token-after-restart.

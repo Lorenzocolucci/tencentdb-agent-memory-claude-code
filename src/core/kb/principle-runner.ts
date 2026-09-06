@@ -12,6 +12,7 @@ import type { LLMRunner } from "../types.js";
 import { selectPrincipleClusters } from "./principle-clusters.js";
 import { distillPrinciple, type DistillPrincipleOptions } from "./principle-distiller.js";
 import { writePrinciple, PRINCIPLE_TYPE } from "./principle-writer.js";
+import { noteLlmFailure } from "./lessons-runner.js";
 
 export interface DistillPrinciplesParams {
   now: string;
@@ -30,17 +31,24 @@ export interface PrincipleRunStats {
   candidates: number;
   inserted: number;
   skippedDuplicate: number;
+  /** The LLM answered but the answer was unusable (or the write was refused). */
   skippedUndistillable: number;
+  /** The LLM call itself THREW — never to be confused with "nothing to distil". */
+  skippedLlmFailed: number;
+  /** First few LLM error messages (bounded), for the runner's log line. */
+  llmErrors: string[];
 }
 
-const ZERO: PrincipleRunStats = { candidates: 0, inserted: 0, skippedDuplicate: 0, skippedUndistillable: 0 };
+const ZERO: PrincipleRunStats = {
+  candidates: 0, inserted: 0, skippedDuplicate: 0, skippedUndistillable: 0, skippedLlmFailed: 0, llmErrors: [],
+};
 
 export async function distillPrinciples(
   store: IMemoryStore,
   llmRunner: LLMRunner,
   params: DistillPrinciplesParams,
 ): Promise<PrincipleRunStats> {
-  const stats: PrincipleRunStats = { ...ZERO };
+  const stats: PrincipleRunStats = { ...ZERO, llmErrors: [] };
   try {
     if (typeof store.listRecentEvents !== "function" || typeof store.insertEvent !== "function") {
       return stats;
@@ -73,13 +81,21 @@ export async function distillPrinciples(
         continue;
       }
       try {
+        let llmFailed = false;
         const distilled = await distillPrinciple(
           { project: cluster.project, domainEntity: cluster.domainEntity, texts: cluster.texts },
           llmRunner,
-          params.distill,
+          {
+            ...params.distill,
+            onLlmError: (e) => {
+              llmFailed = true;
+              noteLlmFailure(stats, e.message);
+              params.distill?.onLlmError?.(e);
+            },
+          },
         );
         if (!distilled) {
-          stats.skippedUndistillable += 1;
+          if (!llmFailed) stats.skippedUndistillable += 1;
           continue;
         }
         const written = writePrinciple({ store, cluster, distilled, now: params.now, salience: params.salience });

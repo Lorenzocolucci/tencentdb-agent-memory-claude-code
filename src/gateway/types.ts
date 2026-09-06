@@ -69,11 +69,19 @@ export interface ObserveRequest {
   tool_input?: unknown;
   tool_output_is_error?: boolean;
   /**
-   * Raw tool output when the call FAILED. Feeds friction capture (the workshop
-   * view): the failure becomes a `bug` event so recurring technical failures can
-   * finally cluster into lessons. Ignored when tool_output_is_error is not true.
+   * Raw tool output when the call FAILED (friction capture: the failure becomes
+   * a `bug` event), OR — when `tool_risk` is present — the first ~400 chars of
+   * the output of a destructive command that SUCCEEDED. Otherwise ignored.
    */
   tool_output_text?: string;
+  /**
+   * CONTRACT point 1 (2026-09-05): the plugin flags a destructive command
+   * (rm -rf, git checkout --, force push, …). A SUCCESSFUL one is recorded as an
+   * `observation` event tagged destructive and becomes the session's "last
+   * risky signature" so the user's next correction can be linked to it. Only
+   * "destructive" is accepted for now; anything else is a 400.
+   */
+  tool_risk?: "destructive";
 }
 
 export interface ObserveResponse {
@@ -142,6 +150,27 @@ export interface SessionEndRequest {
 
 export interface SessionEndResponse {
   flushed: boolean;
+}
+
+// ============================
+// /memory/confirm + /memory/reject (Grounded Trust ask-loop, Phase 3)
+// ============================
+
+/**
+ * Body of `POST /memory/confirm` and `POST /memory/reject`: Lorenzo's answer to
+ * a gated (pending_confirmation) memory, re-bound by the Claude Code skills
+ * `/memory-confirm <owner_id>` / `/memory-reject <owner_id>`. Same Bearer auth
+ * as every other route.
+ */
+export interface GatedMemoryRequest {
+  owner_id: string;
+  owner_kind: "fact" | "event";
+}
+
+/** 200 `{ok:true}` when applied; 409 `{ok:false}` when the store could not apply it. */
+export interface GatedMemoryResponse {
+  ok: boolean;
+  text: string;
 }
 
 // ============================

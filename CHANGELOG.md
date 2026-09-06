@@ -6,6 +6,53 @@
 
 ## [Unreleased]
 
+### 2026-09-05 — fork `Lorenzocolucci/tencentdb-agent-memory-claude-code` (English)
+
+**Fixed**
+- **Extraction had been dead for days**: Moonshot retired `moonshot-v1-auto` (404 on every window) and the
+  `gpt-5.4-mini` fallback only covered `extractKbDelta`; the two distillations (lessons, principles) had
+  no fallback and silently counted failed clusters as processed. The standalone runner now falls back on
+  **every** LLM call (`createFallbackRunner`, `LLMFallbackExhaustedError` when both fail) and the
+  distillers report `skippedLlmFailed` + `[lessons] distillation LLM failed n/m clusters`.
+- **Moonshot/Kimi request shape**: `thinking: {type: "disabled"}` injected and `temperature` omitted for
+  Moonshot hosts (Kimi accepts exactly one temperature per mode). `TDAI_LLM_THINKING` overrides.
+- **Friction capture produced zero events in 29 days**: Claude Code ≥ 2.1 reports failed tools on
+  `PostToolUseFailure` (field `error`), not on `PostToolUse` with `tool_output_is_error`. The plugin now
+  subscribes to it (`hooks.json`, `handlePostToolUseFailure`); a user interrupt is not friction.
+- **Installer** (`scripts/install-cc-plugin.mjs`) now also reaches the marketplace source
+  (`~/.claude/plugins/tdai-mkt/plugin`, located by manifest name) and copies `skills/`; `--dry-run`.
+
+**Added**
+- `POST /memory/confirm` and `POST /memory/reject` (400 / 200 / 409) so hosts without in-process tools
+  can answer a Grounded Trust ask; skills `/memory-confirm <owner_id>` and `/memory-reject <owner_id>`
+  (`disable-model-invocation`).
+- `ObserveRequest.tool_risk: "destructive"`: a *successful* destructive Bash command
+  (`lib/destructive-commands.ts`) becomes an observation event and the session's `lastRiskySignature`, so a
+  later correction can be linked to it (`behavioral-law-detector`, off the critical path).
+- `tools/backfill-cc-sessions.mts` (`src/cli/backfill-cc/*`, 74 tests): `--list` classifies every
+  `~/.claude/projects` transcript by cursor state (captured-complete / captured-partial / never-captured /
+  argus-child / unreadable), `--run` replays the Stop hook per transcript (idempotent via cursor files,
+  `--pace-ms`, `--hook`, `--data-dir`, `--include-argus-children`), `--digest` calls `/digest` per session
+  key with a `--stall-minutes` abort.
+- Gateway config: `llm.thinking` (`TDAI_LLM_THINKING`) and `llm.fallback` (`TDAI_FALLBACK_LLM_BASE_URL`,
+  `_API_KEY` — falls back to `OPENAI_API_KEY` —, `_MODEL` default `gpt-5.4-mini`, `_MAX_TOKENS`,
+  `_TIMEOUT_MS`, `_THINKING`).
+
+- `TDAI_CAPTURE_TIMEOUT_MS` (`resolveCaptureTimeoutMs`, `claude-code-plugin/lib/gateway-client.ts`): the
+  plugin's `/capture` timeout stays 12s for live hooks but an offline replay can raise it. Measured
+  2026-09-05: an 18 MB never-captured transcript needs ~29s for its 50-turn batch; at 12s the client
+  abandoned every call while the gateway kept processing each one, the cursor never moved, and the loop
+  re-sent the same batch 20 times (`/health` unresponsive for >60s). The backfill tool now forwards
+  `--capture-timeout-ms` (default 300000) to each hook child and derives the kill budget from it
+  (`childTimeoutMs`), and `replayTranscript` fails a transcript after 2 consecutive hook calls that exit
+  0 without advancing the cursor instead of spinning to the iteration cap. The live-session defect
+  (`/capture` must ack first and write later) stays open — see `docs/vision/STATO-REALE.md` §6 row 0.
+
+**Verified live (2026-09-05, Lorenzo's machine)**: gateway restarted on this build (`/health` ok); a
+synthetic `PostToolUseFailure` fed to the installed `hook.mjs` wrote one `type='bug'` row in `events` and a
+repeat with the same signature wrote none; `POST /memory/confirm` on `fact_01KWT3SMSB0000M87KKS` → `ok`;
+`npx vitest run` → 1276 passed, 2 skipped.
+
 ### 📦 新功能
 
 - **Claude Code + Codex CLI 插件**（`claude-code-plugin/`）：通过 Claude Code `/plugin install tdai-memory` 或 Codex CLI marketplace 一键启用，不修改用户 `~/.claude/settings.json` 或 `~/.codex/config.toml`。提供 3 个 hooks（`SessionStart` 异步预热、`UserPromptSubmit` 同步召回并通过 `additionalContext` 注入、`Stop` 异步捕获），3 个 slash skills（`/memory-search`、`/memory-status`、`/memory-clear-session`），以及一个总览 skill `tdai-memory`。Daemon 通过 `gateway-entry.ts` wrapper 绑定父进程生命周期。插件携带双 manifest（`.claude-plugin/plugin.json` 与 `.codex-plugin/plugin.json`），共享同一份 `hooks/hooks.json` 与 `skills/`。Claude Code（v2026.4+）是当前的一等宿主，端到端完整可用；Codex CLI（v0.130+）在 schema 层（hook 事件名、handler config 字段、`${CLAUDE_PLUGIN_ROOT}` 环境变量）已对齐，但当前部分阻塞——三层 blocker 详见 `claude-code-plugin/README.md`（discovery 层 [openai/codex#22078](https://github.com/openai/codex/issues/22078)、`async` 行为层 Codex 未实现、transcript 解析层只支持 cc 格式）。

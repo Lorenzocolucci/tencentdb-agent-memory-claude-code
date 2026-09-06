@@ -152,6 +152,18 @@ export function parseDistilledLesson(raw: string): DistilledLesson | null {
 
 export interface DistillOptions {
   timeoutMs?: number;
+  /**
+   * Called when the LLM call itself THREW (dead model, timeout, refusal) — as
+   * opposed to a response that could not be parsed. The runner counts these
+   * separately so a dead model is never reported as "nothing to learn".
+   */
+  onLlmError?: (error: DistillLlmError) => void;
+}
+
+/** What the distiller tells its runner about a thrown LLM call. */
+export interface DistillLlmError {
+  taskId: string;
+  message: string;
 }
 
 /** Distill one cluster via the LLM. Returns null on any failure (never throws). */
@@ -172,7 +184,22 @@ export async function distillLesson(
     // Reject a residual-CJK lesson rather than store garbage (skip the cluster).
     if (parsed && (hasCjk(parsed.lessonText) || hasCjk(parsed.domain))) return null;
     return parsed;
-  } catch {
+  } catch (err) {
+    reportLlmError(opts.onLlmError, "lesson-distill", err);
     return null;
+  }
+}
+
+/** Hand the failure to the runner's sink; the sink itself must never break us. */
+export function reportLlmError(
+  sink: ((error: DistillLlmError) => void) | undefined,
+  taskId: string,
+  err: unknown,
+): void {
+  if (!sink) return;
+  try {
+    sink({ taskId, message: err instanceof Error ? err.message : String(err) });
+  } catch {
+    /* a reporting sink must never turn a swallowed failure into a thrown one */
   }
 }

@@ -740,7 +740,17 @@ export interface IMemoryStore {
   runLessonDistillation?(
     llmRunner: import("../types.js").LLMRunner,
     opts: { now: string; namespace?: string; maxClusters?: number },
-  ): Promise<{ candidates: number; inserted: number; superseded: number; skippedDuplicate: number }>;
+  ): Promise<{
+    candidates: number;
+    inserted: number;
+    superseded: number;
+    skippedDuplicate: number;
+    /** Unusable LLM answers (parse/CJK). */
+    skippedUndistillable: number;
+    /** Thrown LLM calls — an outage, never "nothing to learn". */
+    skippedLlmFailed: number;
+    llmErrors: string[];
+  }>;
 
   /**
    * Percorso B (behavioral notebook) write side: distill recurring cross-session
@@ -752,7 +762,16 @@ export interface IMemoryStore {
   runUsageDistillation?(
     llmRunner: import("../types.js").LLMRunner,
     opts: { now: string; namespace?: string; maxClusters?: number },
-  ): Promise<{ candidates: number; confirmed: number; inserted: number; skippedDuplicate: number; skippedRejected: number }>;
+  ): Promise<{
+    candidates: number;
+    confirmed: number;
+    inserted: number;
+    skippedDuplicate: number;
+    skippedRejected: number;
+    /** Thrown LLM calls — an outage, never the judge's verdict. */
+    skippedLlmFailed: number;
+    llmErrors: string[];
+  }>;
 
   /** kb_vec / kb_fts recall primitives (mirror searchL1Vector / searchL1Fts). */
   searchKbVector?(queryEmbedding: Float32Array, topK?: number, ownerKindFilter?: string): KbVectorSearchResult[];

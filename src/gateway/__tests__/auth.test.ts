@@ -118,6 +118,8 @@ describe("Gateway optional Bearer token", () => {
     ["POST", "/search/memories"],
     ["POST", "/search/conversations"],
     ["POST", "/session/end"],
+    ["POST", "/memory/confirm"],
+    ["POST", "/memory/reject"],
     ["POST", "/seed"],
   ])("enforces auth on %s %s (no token → 401)", async (method, path) => {
     const res = await request(PORT, path, {}, method);

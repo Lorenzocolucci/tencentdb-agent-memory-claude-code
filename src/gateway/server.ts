@@ -8,6 +8,8 @@
  *   POST /search/memories     — L1 memory search
  *   POST /search/conversations — L0 conversation search
  *   POST /session/end         — Session end + flush
+ *   POST /memory/confirm      — Grounded Trust: Lorenzo confirmed a gated memory
+ *   POST /memory/reject       — Grounded Trust: Lorenzo rejected a gated memory
  *   POST /seed               — Batch seed historical conversations (L0 → L1)
  *   POST /kb/write            - Deterministic external fact write (KbDelta)
  *
@@ -39,6 +41,8 @@ import type {
   ConversationSearchResponse,
   SessionEndRequest,
   SessionEndResponse,
+  GatedMemoryRequest,
+  GatedMemoryResponse,
   SeedRequest,
   SeedResponse,
   KbWriteRequest,
@@ -313,6 +317,10 @@ export class TdaiGateway {
           return await this.handleObserve(req, res);
         case "POST /session/end":
           return await this.handleSessionEnd(req, res);
+        case "POST /memory/confirm":
+          return await this.handleGatedMemory(req, res, "confirm");
+        case "POST /memory/reject":
+          return await this.handleGatedMemory(req, res, "reject");
         case "POST /digest":
           return await this.handleDigest(req, res);
         case "POST /seed":
@@ -653,6 +661,10 @@ export class TdaiGateway {
       sendError(res, 400, "Missing required fields: session_key, tool_name");
       return;
     }
+    if (body.tool_risk !== undefined && body.tool_risk !== "destructive") {
+      sendError(res, 400, 'Invalid field: tool_risk (expected "destructive")');
+      return;
+    }
 
     const result = await this.core.handleToolObservation({
       sessionKey: body.session_key,
@@ -660,6 +672,7 @@ export class TdaiGateway {
       toolInput: body.tool_input,
       toolOutputIsError: body.tool_output_is_error,
       toolOutputText: body.tool_output_text,
+      toolRisk: body.tool_risk,
     });
 
     const response: ObserveResponse = { context: result.inject ?? "" };
@@ -678,6 +691,34 @@ export class TdaiGateway {
 
     const response: SessionEndResponse = { flushed: true };
     sendJson(res, 200, response);
+  }
+
+  /**
+   * POST /memory/confirm | /memory/reject — the Grounded Trust ask-loop's answer
+   * path for hosts without in-process tools (Claude Code skills). Validates the
+   * body, calls TdaiCore.resolveGatedMemory, and maps its `ok` to 200/409 so the
+   * skill can tell "recorded" from "the store could not apply it".
+   */
+  private async handleGatedMemory(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    decision: "confirm" | "reject",
+  ): Promise<void> {
+    const body = await parseJsonBody<Partial<GatedMemoryRequest>>(req);
+
+    const ownerId = typeof body.owner_id === "string" ? body.owner_id.trim() : "";
+    if (!ownerId) {
+      sendError(res, 400, "Missing required field: owner_id");
+      return;
+    }
+    if (body.owner_kind !== "fact" && body.owner_kind !== "event") {
+      sendError(res, 400, 'Invalid or missing field: owner_kind (expected "fact" | "event")');
+      return;
+    }
+
+    const result = await this.core.resolveGatedMemory({ ownerId, ownerKind: body.owner_kind, decision });
+    const response: GatedMemoryResponse = { ok: result.ok, text: result.text };
+    sendJson(res, result.ok ? 200 : 409, response);
   }
 
   /**

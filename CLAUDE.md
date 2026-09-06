@@ -56,6 +56,25 @@ stesso repo dichiaravano numeri diversi (1.052 contro 1.063) per lo stesso giorn
   plugin gira dalla build compilata e installata (`claude-code-plugin/`), non dal sorgente aperto qui.
   Dopo un fix, verifica `npm run install:cc-plugin` + riavvio, non dare per scontato che sia già live.
 
+## Variabili d'ambiente che contano (lette SOLO all'avvio del gateway → riavviare dopo un cambio)
+
+- `TDAI_LLM_BASE_URL` / `TDAI_LLM_API_KEY` / `TDAI_LLM_MODEL`: il modello di estrazione. Dal 05/09/2026
+  è `kimi-k2.6` (`moonshot-v1-auto` è stato ritirato da Moonshot: 404 su ogni finestra per giorni).
+  Sugli host Moonshot/Kimi il ragionamento è spento in automatico e la `temperature` non viene mandata
+  (Kimi accetta un solo valore per modalità); `TDAI_LLM_THINKING=enabled|disabled` per forzarlo.
+- `TDAI_FALLBACK_LLM_BASE_URL|API_KEY|MODEL|MAX_TOKENS|TIMEOUT_MS|THINKING`: il ripiego, usato su **ogni**
+  chiamata LLM (estrazione e le due distillazioni). Senza chiave propria usa `OPENAI_API_KEY`; modello
+  predefinito `gpt-5.4-mini`. Se cadono entrambi il gateway lo dice (`LLMFallbackExhaustedError`,
+  contatore `skippedLlmFailed`), non conta il cluster come «fatto».
+- Su questa macchina le variabili stanno in `C:\Users\lo\tdai-gateway\gateway.secrets.env` (mai
+  versionato), iniettate da `start-gateway.ps1`. **Non fidarti della env utente di Windows**: un valore
+  messo con `setx` non raggiunge un processo già avviato.
+- Riempimento di sessioni che il gateway ha perso (era giù): `npx tsx tools/backfill-cc-sessions.mts
+  --list` (mostra le classi), `--run` (rigioca lo Stop hook, idempotente sui cursori), `--digest`.
+  Le figlie di Argus (`claude -p`, migliaia) restano fuori salvo `--include-argus-children`.
+- Un ricordo «da confermare» (Grounded Trust) si chiude da Claude Code con `/memory-confirm <id>` o
+  `/memory-reject <id>` (route `POST /memory/confirm|reject`).
+
 ## Non-negoziabili
 
 Mai push diretto su `main`. Mai committare segreti. Mai cancellare un file senza l'OK di Lorenzo.

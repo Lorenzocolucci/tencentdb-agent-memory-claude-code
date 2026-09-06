@@ -95,7 +95,7 @@ export function createFrictionState(): FrictionState {
 }
 
 /** Collapse volatile bits so the SAME failure gets the SAME signature. */
-function normalizeForSignature(s: string): string {
+export function normalizeForSignature(s: string): string {
   return s
     .toLowerCase()
     .replace(/\d+/g, "#")                        // line numbers, ports, pids, timings
@@ -114,7 +114,7 @@ function firstErrorLine(text: string): string {
 }
 
 /** Extract a command/file hint from the tool input for a readable event text. */
-function describeInput(toolInput: unknown): { label: string; filePath?: string } {
+export function describeInput(toolInput: unknown): { label: string; filePath?: string } {
   if (toolInput == null) return { label: "" };
   if (typeof toolInput === "string") return { label: toolInput.slice(0, 120) };
   if (typeof toolInput === "object") {
@@ -126,6 +126,11 @@ function describeInput(toolInput: unknown): { label: string; filePath?: string }
     try { return { label: JSON.stringify(o).slice(0, 120) }; } catch { return { label: "" }; }
   }
   return { label: "" };
+}
+
+/** The signature of a failure: tool + normalized input + normalized error line. */
+export function frictionSignature(toolName: string, label: string, errLine: string): string {
+  return `${toolName}|${normalizeForSignature(label)}|${normalizeForSignature(errLine)}`;
 }
 
 /**
@@ -152,7 +157,7 @@ export function buildFrictionEvent(
   const errLine = firstErrorLine(raw);
   if (!errLine) return null;
 
-  const signature = `${failure.toolName}|${normalizeForSignature(label)}|${normalizeForSignature(errLine)}`;
+  const signature = frictionSignature(failure.toolName, label, errLine);
 
   const prev = state.seen.get(signature);
   const withinWindow = prev !== undefined && failure.atMs - prev.lastMs < DEDUPE_WINDOW_MS;

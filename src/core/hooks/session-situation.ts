@@ -11,6 +11,8 @@
  * in-memory per-session state can never grow unbounded.
  */
 
+import type { RiskySignature } from "../kb/destructive-capture.js";
+
 /** A bounded snapshot of the current working situation. */
 export interface SessionSituation {
   /** Recent canonical file keys, oldest→newest, deduped, capped. */
@@ -19,6 +21,11 @@ export interface SessionSituation {
   readonly errorSignatures: readonly string[];
   /** Recent tool names, oldest→newest, capped (used for task-type inference). */
   readonly toolNames: readonly string[];
+  /**
+   * The most recent risky moment (a destructive success or a tool failure) —
+   * what the user's NEXT correction gets linked to. Consumed by the link.
+   */
+  readonly lastRiskySignature?: RiskySignature;
 }
 
 /** One observed tool event projected into situation terms. */
@@ -28,6 +35,8 @@ export interface SituationEvent {
   readonly fileKey?: string;
   /** Coarse error signature when the tool errored. */
   readonly errorSignature?: string;
+  /** A risky moment this event constitutes (replaces the previous one). */
+  readonly riskySignature?: RiskySignature;
 }
 
 const FILE_WINDOW = 5;
@@ -60,6 +69,7 @@ function pushBounded(window: readonly string[], value: string, max: number): str
  * names keep their recent sequence (the mix drives task-type inference).
  */
 export function updateSituation(prev: SessionSituation, event: SituationEvent): SessionSituation {
+  const lastRiskySignature = event.riskySignature ?? prev.lastRiskySignature;
   return {
     fileKeys: event.fileKey
       ? pushDedupBounded(prev.fileKeys, event.fileKey, FILE_WINDOW)
@@ -68,5 +78,12 @@ export function updateSituation(prev: SessionSituation, event: SituationEvent): 
       ? pushDedupBounded(prev.errorSignatures, event.errorSignature, ERROR_WINDOW)
       : [...prev.errorSignatures],
     toolNames: pushBounded(prev.toolNames, event.toolName, TOOL_WINDOW),
+    ...(lastRiskySignature ? { lastRiskySignature } : {}),
   };
+}
+
+/** The same situation with the risky signature consumed (immutable). */
+export function clearRiskySignature(prev: SessionSituation): SessionSituation {
+  const { lastRiskySignature: _consumed, ...rest } = prev;
+  return { ...rest };
 }
