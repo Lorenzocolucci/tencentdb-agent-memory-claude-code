@@ -76,7 +76,11 @@ un altro e i ricordi **arrivano all'agente** senza che li cerchi. Non un motore 
 poi `lesson-distill`, `principle-distill` (356 char) e `usage-distill` completati sullo stesso modello;
 **zero** righe `moonshot-v1-auto` dopo il riavvio. Riempimento: `--run` → 17/17 registrazioni rigiocate
 (`replayed=11 partial=0 failed=0` nel secondo giro + 6 nel primo), 5 chiavi di sessione toccate; poi
-`--digest 5/5`. `events` +15 e `entities` +17 tra le 14:00Z e le 14:16Z.
+`--digest 5/5`. Misurato il 06/09 alle 10:40Z: 11 estrazioni `kimi-k2.6` completate, `events` +32,
+`facts` +25, `entities` +32 dalle 14:00Z del 05/09. ⚠️ Il drenaggio di `/digest` avviene **lato gateway**
+a passi di ~50 messaggi (una chiamata LLM da 40-90 s l'uno) e per una chiave grossa dura ore: il
+watchdog del tool (`--stall-minutes 30`) abortisce la richiesta HTTP e segna la chiave «failed», ma il
+gateway **continua** il giro. Per ora la verità sul digest è nel log del gateway, non nello stato del tool.
 
 **Guasto trovato riempiendo, ancora aperto in produzione (→ §6, riga 1):** la registrazione da 18 MB
 (`3f0aa5cb…`) ha avuto bisogno di **29 s** per i suoi 50 turni; il client del plugin aspetta **12 s**
