@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { join } from "node:path";
 import { parseCliArgs } from "../cli-args.js";
 
 const env = { home: "C:\\Users\\test" };
@@ -10,8 +11,8 @@ describe("parseCliArgs", () => {
     if (opts.command === "list") {
       expect(opts.jsonPath).toBeNull();
       expect(opts.includeArgusChildren).toBe(false);
-      expect(opts.projectsRoot).toBe("C:\\Users\\test\\.claude\\projects");
-      expect(opts.dataDir).toBe("C:\\Users\\test\\.claude\\plugins\\data\\tdai-memory-tdai-local");
+      expect(opts.projectsRoot).toBe(join(env.home, ".claude", "projects"));
+      expect(opts.dataDir).toBe(join(env.home, ".claude", "plugins", "data", "tdai-memory-tdai-local"));
     }
   });
 
@@ -31,7 +32,7 @@ describe("parseCliArgs", () => {
       expect(opts.paceMs).toBe(500);
       expect(opts.includeArgusChildren).toBe(false);
       expect(opts.hookPath).toBe(
-        "C:\\Users\\test\\.claude\\plugins\\cache\\tdai-local\\tdai-memory\\0.1.0\\dist\\lib\\hook.mjs",
+        join(env.home, ".claude", "plugins", "cache", "tdai-local", "tdai-memory", "0.1.0", "dist", "lib", "hook.mjs"),
       );
     }
   });
@@ -65,7 +66,7 @@ describe("parseCliArgs", () => {
       expect(opts.stallMinutes).toBe(30);
       expect(opts.force).toBe(false);
       expect(opts.tokenFile).toBe(
-        "C:\\Users\\test\\.claude\\plugins\\data\\tdai-memory-tdai-local\\token",
+        join(env.home, ".claude", "plugins", "data", "tdai-memory-tdai-local", "token"),
       );
     }
   });
@@ -81,7 +82,7 @@ describe("parseCliArgs", () => {
     const opts = parseCliArgs(["--digest", "--data-dir", "C:\\custom\\data"], env);
     if (opts.command === "digest") {
       expect(opts.dataDir).toBe("C:\\custom\\data");
-      expect(opts.tokenFile).toBe("C:\\custom\\data\\token");
+      expect(opts.tokenFile).toBe(join("C:\\custom\\data", "token"));
     }
   });
 
