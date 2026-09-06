@@ -48,6 +48,20 @@
   0 without advancing the cursor instead of spinning to the iteration cap. The live-session defect
   (`/capture` must ack first and write later) stays open — see `docs/vision/STATO-REALE.md` §6 row 0.
 
+**2026-09-06 — durable capture inbox (closes the live `/capture` defect)**
+- `src/core/capture-inbox.ts`: `POST /capture` now writes the request to `<dataDir>/capture-inbox/<id>.json`
+  (tmp + rename) and answers `{accepted, queued: true, inbox_id}` at once; the L0 write
+  (`handleTurnCommitted`, unchanged) runs afterwards, one item at a time in arrival order, with a
+  `setImmediate` yield between items. Pending files are replayed on start; a failing item is retried
+  (30 s) and parked in `capture-inbox/failed/` with its error after 5 attempts. `l0_recorded` mirrors
+  `accepted` so older plugins keep a truthful cursor signal.
+- `/health` adds `capture_backlog`, `capture_oldest_pending_s`, `capture_failed`. The plugin raises
+  `capture-backlog` (oldest pending > 15 min) and `capture-parked` alarms; `handleStop` advances the
+  cursor on `accepted > 0` and logs "presi in carico".
+- Backfill tool: `--stall-minutes` default 30 → 240 (a key drains gateway-side in 50-message LLM passes).
+- Tests: `capture-inbox.test.ts` (7), `capture-route.test.ts` (4), 2 new `hook.test.ts` cases; full
+  suite 1301 passed / 2 skipped.
+
 **Verified live (2026-09-05, Lorenzo's machine)**: gateway restarted on this build (`/health` ok); a
 synthetic `PostToolUseFailure` fed to the installed `hook.mjs` wrote one `type='bug'` row in `events` and a
 repeat with the same signature wrote none; `POST /memory/confirm` on `fact_01KWT3SMSB0000M87KKS` → `ok`;

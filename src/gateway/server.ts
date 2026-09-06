@@ -21,7 +21,9 @@ import http from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { URL } from "node:url";
 import { TdaiCore } from "../core/tdai-core.js";
+import { CaptureInbox } from "../core/capture-inbox.js";
 import { StandaloneHostAdapter } from "../adapters/standalone/host-adapter.js";
+import { join as joinPath } from "node:path";
 import { loadGatewayConfig } from "./config.js";
 import type { GatewayConfig } from "./config.js";
 import { initDataDirectories } from "../utils/pipeline-factory.js";
@@ -186,6 +188,8 @@ export class TdaiGateway {
   private core: TdaiCore;
   private server: http.Server | null = null;
   private startTime = Date.now();
+  /** Durable inbox behind POST /capture (sign first, unpack later — see capture-inbox.ts). */
+  private captureInbox: CaptureInbox<CaptureRequest>;
 
   // Cached embedding-liveness result (see HEALTH_EMBEDDING_TTL_MS). null = not
   // probed yet. We never let a probe failure throw out of /health.
@@ -211,6 +215,27 @@ export class TdaiGateway {
       config: this.config.memory,
       sessionFilter: new SessionFilter(this.config.memory.capture.excludeAgents),
     });
+
+    this.captureInbox = new CaptureInbox<CaptureRequest>({
+      dir: joinPath(this.config.data.baseDir, "capture-inbox"),
+      logger: this.logger,
+      process: async ({ id, body }) => {
+        const startMs = Date.now();
+        const result = await this.core.handleTurnCommitted({
+          userText: body.user_content,
+          assistantText: body.assistant_content,
+          messages: body.messages ?? [
+            { role: "user", content: body.user_content },
+            { role: "assistant", content: body.assistant_content },
+          ],
+          sessionKey: body.session_key,
+          sessionId: body.session_id,
+        });
+        this.logger.info(
+          `Capture ${id} written in ${Date.now() - startMs}ms: l0=${result.l0RecordedCount} session=${body.session_key}`,
+        );
+      },
+    });
   }
 
   /**
@@ -228,6 +253,10 @@ export class TdaiGateway {
 
     // Initialize core
     await this.core.initialize();
+
+    // Replay captures a previous process accepted but never wrote (crash,
+    // kill, deploy). Runs in the background; boot is not delayed by a backlog.
+    await this.captureInbox.start();
 
     // Create HTTP server
     this.server = http.createServer((req, res) => this.handleRequest(req, res));
@@ -275,6 +304,8 @@ export class TdaiGateway {
       });
     }
 
+    // Finish the capture in flight, leave the rest on disk for the next start.
+    await this.captureInbox.stop();
     await this.core.destroy();
     this.logger.info("Gateway stopped");
   }
@@ -388,6 +419,14 @@ export class TdaiGateway {
       },
       embedding: embeddingOk ? "ok" : "failing",
       last_capture_at: await this.readLastCaptureAt(),
+      ...(await this.captureInbox.status().then(
+        (s) => ({
+          capture_backlog: s.pending,
+          capture_oldest_pending_s: s.oldestPendingAgeS,
+          capture_failed: s.failed,
+        }),
+        () => ({}),
+      )),
     };
 
     // Return 503 when degraded so EVERY existing probe — daemon.ts, the cc
@@ -517,24 +556,20 @@ export class TdaiGateway {
       return;
     }
 
-    const startMs = Date.now();
-    const result = await this.core.handleTurnCommitted({
-      userText: body.user_content,
-      assistantText: body.assistant_content,
-      messages: body.messages ?? [
-        { role: "user", content: body.user_content },
-        { role: "assistant", content: body.assistant_content },
-      ],
-      sessionKey: body.session_key,
-      sessionId: body.session_id,
-    });
-    const elapsed = Date.now() - startMs;
-
-    this.logger.info(`Capture completed in ${elapsed}ms: l0=${result.l0RecordedCount}`);
+    // Sign for the parcel, unpack later (2026-09-06). The synchronous version
+    // took ~29 s for a 50-turn batch while the plugin gave up at 12 s and the
+    // cursor never advanced. Now the request is durable on disk before we
+    // answer; the write happens in the inbox drain, one item at a time.
+    const accepted = Array.isArray(body.messages) && body.messages.length > 0 ? body.messages.length : 2;
+    const { id } = await this.captureInbox.enqueue(body);
+    this.logger.info(`Capture ${id} accepted: ${accepted} message(s) session=${body.session_key}`);
 
     const response: CaptureResponse = {
-      l0_recorded: result.l0RecordedCount,
-      scheduler_notified: result.schedulerNotified,
+      l0_recorded: accepted,
+      scheduler_notified: false,
+      accepted,
+      queued: true,
+      inbox_id: id,
     };
     sendJson(res, 200, response);
   }

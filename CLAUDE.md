@@ -74,6 +74,11 @@ stesso repo dichiaravano numeri diversi (1.052 contro 1.063) per lo stesso giorn
   Le figlie di Argus (`claude -p`, migliaia) restano fuori salvo `--include-argus-children`.
 - Un ricordo «da confermare» (Grounded Trust) si chiude da Claude Code con `/memory-confirm <id>` o
   `/memory-reject <id>` (route `POST /memory/confirm|reject`).
+- **`/capture` firma subito e scrive dopo** (dal 06/09/2026): i pacchi in attesa stanno in
+  `<dataDir>/capture-inbox/`, quelli falliti 5 volte in `capture-inbox/failed/` con l'errore accanto.
+  `/health` dice `capture_backlog` e `capture_oldest_pending_s`; se vedi `capture-backlog` o
+  `capture-parked` fra gli allarmi del plugin, la memoria è in ritardo o ha parcheggiato qualcosa:
+  guarda quella cartella, non il log.
 
 ## Non-negoziabili
 

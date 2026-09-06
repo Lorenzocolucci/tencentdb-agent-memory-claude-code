@@ -26,6 +26,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const MAX_INJECT_CHARS = 10_000;
 const MAX_CAPTURE_TURNS = 50;
+/** Oldest pending capture older than this → visible "memory is behind" alarm. */
+const CAPTURE_BACKLOG_ALARM_S = 15 * 60;
 
 export type HookEvent =
   | "session-start"
@@ -137,6 +139,29 @@ async function handleSessionStart(
     );
   } else {
     await clearAlarm(dataDir, "memory-degraded");
+  }
+
+  // Accepted is not written: the capture inbox can fall behind (a huge batch,
+  // a wedged store). Say it when the oldest pending capture is older than
+  // CAPTURE_BACKLOG_ALARM_S, clear it as soon as the inbox catches up.
+  const oldest = health.capture_oldest_pending_s;
+  if (typeof oldest === "number" && oldest > CAPTURE_BACKLOG_ALARM_S) {
+    await raiseAlarm(
+      dataDir,
+      "capture-backlog",
+      `la memoria è in ritardo: ${health.capture_backlog ?? "?"} catture in attesa, la più vecchia da ${Math.round(oldest / 60)} minuti`,
+    );
+  } else {
+    await clearAlarm(dataDir, "capture-backlog");
+  }
+  if ((health.capture_failed ?? 0) > 0) {
+    await raiseAlarm(
+      dataDir,
+      "capture-parked",
+      `${health.capture_failed} catture NON scritte dopo ripetuti tentativi (cartella capture-inbox/failed del gateway)`,
+    );
+  } else {
+    await clearAlarm(dataDir, "capture-parked");
   }
 
   // The hole detector: memory silent while work kept happening.
@@ -442,24 +467,27 @@ async function handleStop(
     // Do NOT advance the cursor: next Stop will retry the unsent turns.
     return "";
   }
-  // A 200 response is not proof of a write: the gateway reports how many L0
-  // rows it actually persisted. Zero means the turns evaporated, which is the
-  // failure mode most likely to go unnoticed — so it gets its own alarm and
-  // the cursor does NOT advance.
-  if (captureResult.l0_recorded === 0) {
+  // A 200 response is not proof of a write. Gateways since 2026-09-06 answer
+  // as soon as the turns are durably in their capture inbox (`accepted`, the
+  // write follows and survives restarts); older gateways report the L0 rows
+  // they wrote (`l0_recorded`). Zero on either contract means the turns
+  // evaporated — its own alarm, and the cursor does NOT advance.
+  const taken = captureResult.accepted ?? captureResult.l0_recorded;
+  if (!taken) {
     await raiseAlarm(
       dataDir,
       "capture-empty",
-      `il gateway ha risposto OK ma non ha scritto nulla (${newTurns.length} turni)`,
+      `il gateway ha risposto OK ma non ha preso in carico nulla (${newTurns.length} turni)`,
     );
     return "";
   }
   await clearAlarm(dataDir, "capture-failed");
   await clearAlarm(dataDir, "capture-empty");
   await writeCursor(dataDir, cursorId, allTurns.length);
+  const verb = captureResult.queued ? "presi in carico" : "salvati";
   await safeLog(
     join(dataDir, "hook.log"),
-    `stop: salvati ${captureResult.l0_recorded} messaggi (${newTurns.length} turni) — cursore ${lastSent}→${allTurns.length}`,
+    `stop: ${verb} ${taken} messaggi (${newTurns.length} turni) — cursore ${lastSent}→${allTurns.length}`,
   );
   return "";
 }

@@ -24,7 +24,7 @@
  *   npx tsx tools/backfill-cc-sessions.mts                        # --list, dry, default
  *   npx tsx tools/backfill-cc-sessions.mts --list --json plan.json
  *   npx tsx tools/backfill-cc-sessions.mts --run [--include-argus-children] [--pace-ms 500] [--hook <path>] [--capture-timeout-ms 300000]
- *   npx tsx tools/backfill-cc-sessions.mts --digest [--keys a,b,c] [--stall-minutes 30] [--force]
+ *   npx tsx tools/backfill-cc-sessions.mts --digest [--keys a,b,c] [--stall-minutes 240] [--force]
  *
  * All commands accept `--projects-root <dir>` and `--data-dir <dir>` to
  * override the defaults (live `~/.claude/projects` and the live plugin data

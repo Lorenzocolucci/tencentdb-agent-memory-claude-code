@@ -1063,6 +1063,8 @@ function matchDestructiveCommand(command) {
 */
 const MAX_INJECT_CHARS = 1e4;
 const MAX_CAPTURE_TURNS = 50;
+/** Oldest pending capture older than this → visible "memory is behind" alarm. */
+const CAPTURE_BACKLOG_ALARM_S = 900;
 async function handleHook(event, input) {
 	const data = parseStdin(input.stdin);
 	const dataDir = input.dataDir ?? resolveDataDir();
@@ -1098,6 +1100,11 @@ async function handleSessionStart(_data, client, dataDir) {
 	await clearAlarm(dataDir, "gateway-unreachable");
 	if (health.status === "degraded" || health.embedding === "failing") await raiseAlarm(dataDir, "memory-degraded", "l'embedder non risponde bene — la memoria funziona ma richiama peggio");
 	else await clearAlarm(dataDir, "memory-degraded");
+	const oldest = health.capture_oldest_pending_s;
+	if (typeof oldest === "number" && oldest > CAPTURE_BACKLOG_ALARM_S) await raiseAlarm(dataDir, "capture-backlog", `la memoria è in ritardo: ${health.capture_backlog ?? "?"} catture in attesa, la più vecchia da ${Math.round(oldest / 60)} minuti`);
+	else await clearAlarm(dataDir, "capture-backlog");
+	if ((health.capture_failed ?? 0) > 0) await raiseAlarm(dataDir, "capture-parked", `${health.capture_failed} catture NON scritte dopo ripetuti tentativi (cartella capture-inbox/failed del gateway)`);
+	else await clearAlarm(dataDir, "capture-parked");
 	const verdict = assessStaleness(health.last_capture_at, newestTranscriptMs(join(homedir(), ".claude", "projects")), Date.now());
 	if (verdict.stale) await raiseAlarm(dataDir, "memory-stale", describeStaleness(verdict));
 	else await clearAlarm(dataDir, "memory-stale");
@@ -1245,14 +1252,16 @@ async function handleStop(data, client, dataDirIn) {
 		await safeLog(join(dataDir, "hook.log"), "stop: captureTurn failed after retry — session not saved");
 		return "";
 	}
-	if (captureResult.l0_recorded === 0) {
-		await raiseAlarm(dataDir, "capture-empty", `il gateway ha risposto OK ma non ha scritto nulla (${newTurns.length} turni)`);
+	const taken = captureResult.accepted ?? captureResult.l0_recorded;
+	if (!taken) {
+		await raiseAlarm(dataDir, "capture-empty", `il gateway ha risposto OK ma non ha preso in carico nulla (${newTurns.length} turni)`);
 		return "";
 	}
 	await clearAlarm(dataDir, "capture-failed");
 	await clearAlarm(dataDir, "capture-empty");
 	await writeCursor(dataDir, cursorId, allTurns.length);
-	await safeLog(join(dataDir, "hook.log"), `stop: salvati ${captureResult.l0_recorded} messaggi (${newTurns.length} turni) — cursore ${lastSent}→${allTurns.length}`);
+	const verb = captureResult.queued ? "presi in carico" : "salvati";
+	await safeLog(join(dataDir, "hook.log"), `stop: ${verb} ${taken} messaggi (${newTurns.length} turni) — cursore ${lastSent}→${allTurns.length}`);
 	return "";
 }
 async function waitForTranscriptStable(path, maxMs) {
