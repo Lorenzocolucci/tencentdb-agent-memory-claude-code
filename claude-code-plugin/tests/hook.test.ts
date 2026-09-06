@@ -233,6 +233,59 @@ describe("handleHook: stop", () => {
     }
   });
 
+  it("advances the cursor on the inbox contract (accepted>0, queued) and logs 'presi in carico'", async () => {
+    // Gateway ≥ 2026-09-06 answers before writing: accepted turns are durable.
+    const captureTurn = vi.fn(async () => ({ l0_recorded: 2, scheduler_notified: false, accepted: 2, queued: true, inbox_id: "x" }));
+    const client = makeFakeClient({ captureTurn } as Partial<GatewayClient>);
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    const os = await import("node:os");
+    const tmp = path.join(os.tmpdir(), `tx-inbox-${Date.now()}.jsonl`);
+    await fs.writeFile(
+      tmp,
+      [
+        '{"type":"user","message":{"role":"user","content":"q"},"uuid":"u"}',
+        '{"type":"assistant","message":{"role":"assistant","content":"a"},"uuid":"a"}',
+      ].join("\n"),
+    );
+    try {
+      const stdin = JSON.stringify({ session_id: "s-inbox", transcript_path: tmp, cwd: "/tmp/proj", stop_hook_active: false });
+      await handleHook("stop", { stdin, client, dataDir: cursorDir });
+      const cursor = JSON.parse(await fs.readFile(path.join(cursorDir, "cursors", "s-inbox.json"), "utf-8")) as { lastSentIndex: number };
+      expect(cursor.lastSentIndex).toBe(1);
+      const log = await fs.readFile(path.join(cursorDir, "hook.log"), "utf-8");
+      expect(log).toContain("presi in carico 2 messaggi");
+    } finally {
+      await fs.unlink(tmp);
+    }
+  });
+
+  it("does NOT advance the cursor and raises capture-empty when the gateway accepted nothing", async () => {
+    const captureTurn = vi.fn(async () => ({ l0_recorded: 0, scheduler_notified: false, accepted: 0, queued: true, inbox_id: "x" }));
+    const client = makeFakeClient({ captureTurn } as Partial<GatewayClient>);
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    const os = await import("node:os");
+    const { readAlarms } = await import("../lib/alarm.js");
+    const tmp = path.join(os.tmpdir(), `tx-empty-${Date.now()}.jsonl`);
+    await fs.writeFile(
+      tmp,
+      [
+        '{"type":"user","message":{"role":"user","content":"q"},"uuid":"u"}',
+        '{"type":"assistant","message":{"role":"assistant","content":"a"},"uuid":"a"}',
+      ].join("\n"),
+    );
+    try {
+      const stdin = JSON.stringify({ session_id: "s-empty", transcript_path: tmp, cwd: "/tmp/proj", stop_hook_active: false });
+      await handleHook("stop", { stdin, client, dataDir: cursorDir });
+      await expect(fs.access(path.join(cursorDir, "cursors", "s-empty.json"))).rejects.toThrow();
+      const alarms = await readAlarms(cursorDir);
+      expect(alarms.some((a) => a.code === "capture-empty")).toBe(true);
+    } finally {
+      await fs.unlink(tmp);
+    }
+  });
+
   it("only sends new turns on the second Stop (cursor incremental capture)", async () => {
     // Two-turn transcript, fire Stop once. Then append a third turn and fire
     // Stop again. The second call must POST only the new turn — without the

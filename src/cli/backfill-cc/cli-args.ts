@@ -94,7 +94,11 @@ export function parseCliArgs(argv: string[], env: ParseCliArgsEnv): CliOptions {
       // still points at that data dir's own token file (the live default
       // resolves to the exact live token path the task specifies).
       tokenFile: findValue(argv, "--token-file") ?? join(dataDir, "token"),
-      stallMinutes: Number(findValue(argv, "--stall-minutes") ?? "30"),
+      // 240 min: a big session key drains gateway-side in ~50-message passes,
+      // each an LLM call of 40-90 s (measured 2026-09-05/06). At 30 min the
+      // watchdog aborted the HTTP call and marked the key "failed" while the
+      // gateway kept draining — the tool lied, the work continued.
+      stallMinutes: Number(findValue(argv, "--stall-minutes") ?? "240"),
       force: argv.includes("--force"),
     };
   }

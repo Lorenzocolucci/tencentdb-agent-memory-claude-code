@@ -37,6 +37,14 @@ export interface HealthResponse {
    * and the second false, and nothing in /health could tell them apart.
    */
   last_capture_at?: string | null;
+  /**
+   * Durable capture inbox (2026-09-06): how many accepted captures still wait
+   * to be written, the age of the oldest one, and how many were parked after
+   * repeated failures. "Accepted" is not "written": this is where the gap shows.
+   */
+  capture_backlog?: number;
+  capture_oldest_pending_s?: number | null;
+  capture_failed?: number;
 }
 
 // ============================
@@ -103,8 +111,22 @@ export interface CaptureRequest {
 }
 
 export interface CaptureResponse {
+  /**
+   * Since 2026-09-06 `/capture` acknowledges as soon as the request is
+   * durably written to the capture inbox; the L0 write happens afterwards.
+   * `l0_recorded` therefore mirrors `accepted` (the number of messages taken
+   * into custody) so clients built for the old synchronous contract keep
+   * advancing their cursor on a truthful signal: accepted turns are never lost
+   * (the inbox survives restarts and is replayed).
+   */
   l0_recorded: number;
   scheduler_notified: boolean;
+  /** Messages durably accepted into the inbox. */
+  accepted: number;
+  /** Always true: the write is asynchronous. */
+  queued: boolean;
+  /** Inbox item id (file name stem) for tracing. */
+  inbox_id: string;
 }
 
 // ============================

@@ -92,6 +92,25 @@ per una). Riparato **solo per il riempimento**: `TDAI_CAPTURE_TIMEOUT_MS` (il to
 `--capture-timeout-ms`) e un freno nel ciclo (2 chiamate senza avanzamento → `failed`, non 20). Per le
 sessioni vive resta aperto: il gateway deve rispondere subito a `/capture` e scrivere dopo.
 
+## 2-ter. AGGIORNAMENTO 06/09/2026 — la cassetta durevole dietro `/capture`
+
+**Il guasto** (§2-bis, ultimo paragrafo) è chiuso alla radice, non con un timeout più lungo. Il paragone:
+prima il postino aspettava sulla porta che il magazzino scaricasse tutto il pacco, e dopo 12 s se ne
+andava scrivendo «non consegnato» mentre il magazzino scaricava lo stesso. Ora il magazzino **firma
+appena il pacco è dentro** (`capture-inbox/<id>.json`, scrittura tmp+rename) e scarica dopo, un pacco
+alla volta, nell'ordine di arrivo; se cade la corrente, al riavvio riprende dai pacchi rimasti.
+
+| Pezzo | Dove | Prova (06/09/2026) |
+|---|---|---|
+| `POST /capture` risponde `{accepted, queued:true, inbox_id}` appena il file è su disco; `l0_recorded` rispecchia `accepted` per i plugin vecchi | `src/gateway/server.ts` `handleCapture`, `src/core/capture-inbox.ts` | test di rotta `capture-route.test.ts` (4 verdi) + `capture-inbox.test.ts` (7 verdi: ordine FIFO anche con Stop concorrenti, rigioco al riavvio, veleno parcheggiato in `failed/` dopo 5 tentativi con l'errore accanto, stato) |
+| Il plugin avanza il cursore su `accepted>0` e scrive «presi in carico»; `accepted=0` → allarme `capture-empty`, cursore fermo | `claude-code-plugin/lib/hook.ts` `handleStop` | `hook.test.ts` (2 test nuovi) · dal vivo: `stop: presi in carico 2 messaggi — cursore 8→9` alle 12:01:07Z, `Capture …written in 1709ms` nel log del gateway DOPO la risposta |
+| `/health` espone `capture_backlog`, `capture_oldest_pending_s`, `capture_failed`; il plugin alza `capture-backlog` sopra 15 min di ritardo e `capture-parked` se c'è roba in `failed/` | `server.ts` `handleHealth`, `hook.ts` `handleSessionStart`, `alarm.ts` | `/health` alle 12:01Z: `capture_backlog: 0, capture_failed: 0` |
+| Riavvio pulito: `stop()` finisce il pacco in corso e lascia il resto su disco | `server.ts` `stop()` | `npx vitest run` → **1301 verdi / 2 saltati** (06/09/2026 13:46) |
+
+⚠️ **Non riprodotto dal vivo oggi**: un lotto da 50 turni (nessuna registrazione arretrata da 50 turni
+esisteva più). La garanzia è per costruzione: la risposta non aspetta la scrittura (test di rotta), e
+la scrittura è la stessa funzione di prima (`handleTurnCommitted`), solo spostata dopo la firma.
+
 **Variabili nuove** (lette all'avvio del gateway, quindi **riavviare** dopo averle cambiate):
 `TDAI_LLM_THINKING` (`disabled`|`enabled`), `TDAI_FALLBACK_LLM_BASE_URL`, `TDAI_FALLBACK_LLM_API_KEY`
 (altrimenti `OPENAI_API_KEY`), `TDAI_FALLBACK_LLM_MODEL` (default `gpt-5.4-mini`), `TDAI_FALLBACK_LLM_MAX_TOKENS`,
@@ -346,7 +365,7 @@ La salute deve arrivare a Lorenzo, non al disco.
 
 | # | Cosa manca | Perché conta | Stato |
 |---|---|---|---|
-| **0** | **`/capture` deve rispondere subito e scrivere dopo** | Una sessione lunga manda 50 turni in una chiamata; sopra i ~12 s il plugin la abbandona («session not saved») ma il gateway la elabora lo stesso, e ogni Stop successivo rimanda gli stessi 50 turni: lavoro doppio, niente salvato, `/health` muto per un minuto (misurato 05/09/2026, §2-bis) | **aperto** — riparato solo per il riempimento offline (`TDAI_CAPTURE_TIMEOUT_MS`); per le sessioni vive serve ack immediato + scrittura in coda |
+| ~~0~~ | ~~`/capture` deve rispondere subito e scrivere dopo~~ | **CHIUSO 06/09/2026** con la cassetta durevole (`src/core/capture-inbox.ts`, §2-ter): il gateway firma appena il pacco è su disco, scrive dopo, rigioca al riavvio, e `/health` dice quanto è indietro | ✅ vivo dalle 11:48Z del 06/09 |
 | **1** | **Sinapsys dentro Argus su Render** | Argus gira 24/7 nel cloud **senza la memoria associativa**: è il pezzo che chiude la stella polare | **progettato**, non costruito → [01-vision-and-plan/PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md](01-vision-and-plan/PUNTO5-SINAPSYS-IN-ARGUS-RENDER.md) |
 | **2** | **Decidere il rapporto con la memoria che Argus HA GIÀ** | Argus ha `argus-memory.mjs` su Supabase, viva e cablata in 10+ moduli. Sostituirla è rischioso; ignorarla crea due verità divergenti | **decisione aperta** — raccomandazione: due velocità (CLS), §3 del doc Punto 5 |
 | 3 | **Decisione: un DB o due?** (portatile ↔ cloud) | Unificare crea dipendenza dalla rete su ogni tuo prompt (recall ha 6s) | **decisione aperta per Lorenzo** (§9 del doc Punto 5) |

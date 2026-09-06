@@ -39,7 +39,15 @@ export type AlarmCode =
    * hook.log — memory fully off, no signal. The other tripwires cannot catch
    * it because they all live inside the try block that never finishes.
    */
-  | "hook-crashed";
+  | "hook-crashed"
+  /**
+   * 2026-09-06: the gateway now acknowledges a capture as soon as it is on
+   * disk and writes it afterwards. "Accepted" can therefore run ahead of
+   * "written": a backlog older than 15 min, or items parked after repeated
+   * failures, must reach the user instead of hiding in the gateway's log.
+   */
+  | "capture-backlog"
+  | "capture-parked";
 
 export interface AlarmRecord {
   code: AlarmCode;

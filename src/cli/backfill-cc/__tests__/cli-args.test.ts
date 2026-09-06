@@ -63,7 +63,7 @@ describe("parseCliArgs", () => {
     if (opts.command === "digest") {
       expect(opts.keys).toBeNull();
       expect(opts.gatewayUrl).toBe("http://127.0.0.1:8421");
-      expect(opts.stallMinutes).toBe(30);
+      expect(opts.stallMinutes).toBe(240); // hours, not minutes: a key drains in 50-msg LLM passes
       expect(opts.force).toBe(false);
       expect(opts.tokenFile).toBe(
         join(env.home, ".claude", "plugins", "data", "tdai-memory-tdai-local", "token"),

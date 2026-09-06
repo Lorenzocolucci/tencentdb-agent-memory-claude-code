@@ -81,8 +81,13 @@ export interface CaptureTurnPayload {
 }
 
 export interface CaptureTurnResult {
+  /** Legacy field; since 2026-09-06 the gateway mirrors `accepted` here. */
   l0_recorded: number;
   scheduler_notified: boolean;
+  /** Messages durably accepted by the gateway's capture inbox (gateway ≥ 2026-09-06). */
+  accepted?: number;
+  queued?: boolean;
+  inbox_id?: string;
 }
 
 export interface SearchResult {
@@ -105,6 +110,10 @@ export interface HealthDetail {
   status?: "ok" | "degraded";
   embedding?: "ok" | "failing";
   last_capture_at?: string | null;
+  /** Capture inbox backlog (gateway ≥ 2026-09-06): accepted but not yet written. */
+  capture_backlog?: number;
+  capture_oldest_pending_s?: number | null;
+  capture_failed?: number;
   /** Always true when returned — the gateway answered, whatever the status. */
   reachable?: boolean;
 }
