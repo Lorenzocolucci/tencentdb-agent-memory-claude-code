@@ -1,5 +1,10 @@
 # Sinapsys — Next Blueprint (Judgment + Chat) — 2026-07-01
 
+> ## 🔧 07/09/2026 — Parte 0 (bootstrap) corretta nell'audit di verità
+> Branch, conteggio test, elenco route e link a `ENTITY_CORE_BLUEPRINT.md` sotto erano
+> superati. Corretti nella Parte 0 con i numeri e i path reali del 07/09/2026 — vedi le
+> note inline.
+
 > ## ⚠️ 2026-08-07 — leggere insieme allo STATO REALE
 > Questo documento resta valido come **direzione** ("Sinapsys è un socio, non un
 > bibliotecario"), e la sua tesi è stata **confermata dai numeri**: su LongMemEval il
@@ -29,25 +34,29 @@ schede memoria `sinapsys-*`.)
 Esegui in ordine. Nessuno di questi passi modifica dati.
 
 1. **Repo + branch.** `git -C C:/Users/lo/tencentdb-agent-memory branch --show-current`
-   → deve essere `feat/memory-excellence`. Remote di lavoro = `fork`
-   (Lorenzocolucci/tencentdb-agent-memory-claude-code). **MAI push su `origin`/main.**
+   → **corretto 07/09/2026: il branch di lavoro è `main`** (`feat/memory-excellence` è
+   superato). Remote consentito per il push = **`fork`** (Lorenzocolucci/tencentdb-agent-memory-claude-code).
+   **MAI push su `origin` (YOMXXX) né su `tencent`** (upstream open-source).
 2. **Gateway vivo?** `curl -s -m 4 http://127.0.0.1:8421/health`
    → risposta JSON (con token: `{"error":"Unauthorized"}` = server su ma serve
    `Authorization: Bearer $TDAI_GATEWAY_TOKEN`). Porta **8421** (non 8420).
    Rilancio gateway: `C:\Users\lo\tdai-gateway\start-gateway.ps1`.
-3. **Build verde?** `npm run build` (tsdown). **Test verdi?** `npm test`
-   (vitest). Baseline nota: ~586 test, **7 falliti pre-esistenti** (claude-code-plugin
-   daemon.test.ts + hook.test.ts — permessi-file/capture Windows, NON Sinapsys).
-   Un fallimento nuovo fuori da quei 7 = regressione da risolvere.
-4. **Env necessari** (presenza, non valore): `OPENAI_API_KEY` (embeddings +
-   estrazione benchmark gpt-4o), `TDAI_LLM_*` (LLM live = Moonshot/Kimi).
-   Segreti reali in `C:\Credentials\` — MAI committare.
-5. **Interfaccia gateway** (verificata in `src/gateway/server.ts`):
-   `GET /health`, `POST /recall {query,session_key}`, `POST /capture`,
-   `POST /search/memories`, `POST /search/conversations`, `POST /session/end`,
-   `POST /seed` (batch, **bloccante**). Auth Bearer opzionale via `TDAI_GATEWAY_TOKEN`.
+3. **Build verde?** `npm run build` (tsdown). **Test verdi?** `npx vitest run`
+   (vitest). **Corretto 07/09/2026:** 178 file di test, 1.303 test totali, 1.301 verdi,
+   2 saltati — nessun fallimento pre-esistente accettato: qualunque rosso è una
+   regressione da risolvere (il vecchio "~586 test, 7 falliti pre-esistenti" non
+   corrisponde più al codice).
+4. **Env necessari** (presenza, non valore): `DEEPINFRA_API_KEY` (embeddings live),
+   `OPENAI_API_KEY` (fallback LLM + estrazione benchmark gpt-4o), `TDAI_LLM_*`
+   (LLM live = Moonshot/Kimi). Segreti reali in `C:\Credentials\` — MAI committare.
+5. **Interfaccia gateway** (corretta 07/09/2026, verificata in `src/gateway/server.ts:336-360`):
+   `GET /health`, `POST /recall`, `POST /capture`, `POST /search/memories`,
+   `POST /search/conversations`, `POST /observe`, `POST /session/end`,
+   `POST /memory/confirm`, `POST /memory/reject`, `POST /digest`, `POST /seed`
+   (batch, **bloccante**), `POST /kb/write`. Auth Bearer opzionale via `TDAI_GATEWAY_TOKEN`.
 6. **Mappa architettura completa:** `docs/SINAPSYS-ARCHITECTURE.md` (layer L0–L5,
-   albero, portabilità). `docs/SINAPSYS_FOUNDATIONS.md`, `docs/ENTITY_CORE_BLUEPRINT.md`.
+   albero, portabilità). `docs/SINAPSYS_FOUNDATIONS.md`; **`docs/ENTITY_CORE_BLUEPRINT.md`
+   è ARCHIVIATO** (vedi `docs/archive/SINAPSYS-STORICO-DOCS-20260718.md`).
 
 ---
 
@@ -112,7 +121,7 @@ estendono codice che esiste già** — verificato in `src/core/kb/`.
   una volta ma poi giusta deve poter risalire). Decadimento simmetrico.
 
 ### Pilastro C — DIMENTICARE CON GUSTO (distillazione, non accumulo)
-> ✅ **Fase 1 (decay consapevole) DEPLOYATA** (`e8056ee`). ✅ **Fase 2 (distillazione) COSTRUITA + DEPLOYATA 2026-07-01** (gateway PID 51356, 21 test verdi, 7 cluster reali sui dati vivi). Scelta di Lorenzo: **conservativo — distilla, non cancella** (le sorgenti decadono via Fase 1, mai rimosse). Principio = atomo `events` type=`principle` alta-salience; clustering per entità con guard cross-sessione su session_id. Design+esito: `docs/superpowers/specs/2026-07-01-pilastro-c-fase2-distillazione-design.md`.
+> ✅ **Fase 1 (decay consapevole) DEPLOYATA** (`e8056ee`). ✅ **Fase 2 (distillazione) COSTRUITA + DEPLOYATA 2026-07-01** (gateway PID 51356, 21 test verdi, 7 cluster reali sui dati vivi). Scelta di Lorenzo: **conservativo — distilla, non cancella** (le sorgenti decadono via Fase 1, mai rimosse). Principio = atomo `events` type=`principle` alta-salience; clustering per entità con guard cross-sessione su session_id. Design+esito: archiviato: `docs/archive/SINAPSYS-STORICO-DOCS-20260718.md` §"docs/superpowers/specs/2026-07-01-pilastro-c-fase2-distillazione-design.md (archiviato 2026-07-18)" (riga 2753).
 - **Estende** (verificato): `consolidation-runner.ts` (reinforce + decay,
   deterministico, no-LLM), `lifecycle-writer.ts`, `lifecycle-decay.ts` (staleness
   14gg), il sistema a tier.
@@ -190,7 +199,7 @@ Vincolo reale: claude.ai è il prodotto Anthropic, **non controlliamo il suo mot
 > **STATO al 2026-07-01 (fine sessione feat/memory-excellence, tutto pushato su fork):**
 > - ✅ **Pilastro A (Giudizio)** — LIVE (`b9781ad`).
 > - ✅ **Pilastro C Fase 1 (decay) + Fase 2 (distillazione)** — LIVE (`e8056ee`, `e6eb213`).
-> - ✅ **Pilastro B (Crescere dall'errore) — SLICE 1 (cervello willingness)** fatta (`9a881e7`), NON cablata. **SLICE 2 (wiring live) = PROSSIMO** → `docs/superpowers/specs/2026-07-01-pilastro-b-track-record-design.md`.
+> - ✅ **Pilastro B (Crescere dall'errore) — SLICE 1 (cervello willingness)** fatta (`9a881e7`), NON cablata. **SLICE 2 (wiring live) = PROSSIMO** → archiviato: `docs/archive/SINAPSYS-STORICO-DOCS-20260718.md` §"docs/superpowers/specs/2026-07-01-pilastro-b-track-record-design.md (archiviato 2026-07-18)" (riga 2747).
 > - ✅ **Cross-cutting fixati**: continuità "dove eravamo" (rollover `0cd8233`), trigger distillazione al session-start (`8fd19d6`), **barriera CJK** — nessun cinese salvato (`d365699`+`c0c1035`).
 > - ⏳ **RIMANE**: Pilastro B Slice 2 · #1 ingest chat claude.ai (Gate G3) · #2 PULL(MCP,G4)+PUSH(estensione) · benchmark LongMemEval · residui (fatti-git nel recap, review prompt distiller lo-llm-architect, clustering principi semantico, purga 1 principio cinese pre-barriera).
 

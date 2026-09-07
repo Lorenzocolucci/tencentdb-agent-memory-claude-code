@@ -8,6 +8,14 @@
 > `src/core/kb/retrieval.ts`. Puramente additivo: un ricordo con 0 rinforzi si posiziona
 > esattamente come prima.
 >
+> **Correzione 07/09/2026 su §3b sotto:** il boost applicato in `retrieval.ts` è quello
+> **downstream**, a valle del ranking (`withConsolidation`, `retrieval.ts:608`), non una
+> modifica di `eventImportance`. `eventImportance()` in `retrieval.ts:439-441` restituisce
+> ancora la costante `0.5` — la formula `0.35 + 0.3 * consolidation` descritta più sotto
+> **non è nel codice**. Il consolidamento entra comunque nel ranking finale (verificato:
+> `withConsolidation` moltiplica `r.importance` per il termine di consolidamento), ma non
+> passando da `eventImportance`.
+>
 > ⚠️ **Da leggere insieme al seguito:** il consolidamento rinforza ciò che *ricorre*, non ciò
 > che *serve*. La misura di utilità è arrivata dopo — vedi [../STATO-REALE.md](../STATO-REALE.md)
 > §4-ter (verdetto di utilità, 2026-08-23).
@@ -89,9 +97,9 @@ Sono **esattamente** le verità durature del mondo di Lorenzo. Il segnale è **r
 
 **LongMemEval NON può misurare questo — e ora so perché.**
 Ogni domanda del benchmark semina una memoria vergine: lì i rinforzi valgono ~1 per tutti,
-quindi il consolidamento non ha nulla da differenziare. **Ecco perché l'arm `kb_consol`
-diede esattamente 0 di differenza.** Non era un fallimento del consolidamento: era il
-banco di prova sbagliato.
+quindi il consolidamento non ha nulla da differenziare. **Delta zero: l'arm `kb_consol` diede
+18/30, identico a `kb`** sull'oracle ufficiale — nessuna differenza misurabile, non "0" in
+assoluto. Non era un fallimento del consolidamento: era il banco di prova sbagliato.
 
 Il valore del consolidamento esiste **solo su una memoria vissuta a lungo** — cioè i 2,5 GB veri di Lorenzo.
 

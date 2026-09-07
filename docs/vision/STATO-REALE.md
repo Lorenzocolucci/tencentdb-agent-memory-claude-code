@@ -6,11 +6,21 @@
 > [SINAPSYS_FOUNDATIONS](../SINAPSYS_FOUNDATIONS.md). Il quadro di tutti e 5 i sistemi:
 > `C:\RISTRUTTURAZIONE\04-I-CINQUE-SISTEMI.md`. Dove siamo adesso: `C:\RISTRUTTURAZIONE\00-STATO.md`.
 
-> **Aggiornato: 2026-08-23.** Ogni numero qui è stato **misurato**, non ricordato.
+> **Aggiornato: 2026-08-23; audit di verità 2026-09-07.** Ogni numero qui è stato **misurato**,
+> non ricordato — dove non è stato ri-misurato il 07/09 resta la data della sua ultima misura,
+> scritta accanto al numero (è un log cronologico, non lo stato di oggi).
 > **Questo è il documento da leggere PER PRIMO.** Tutti gli altri partono da qui.
 >
 > Regola di questo file: se una cosa non è stata verificata con una prova reale
 > (comando, test, riga di codice, risposta live), è scritto esplicitamente.
+>
+> **Numero di test più recente e più affidabile del file (07/09/2026):** `npx vitest run` →
+> **178 file di test, 1.303 test totali, 1.301 verdi, 2 saltati** (`src/cli/__tests__/reindex-standalone.test.ts`
+> ha 2 skip fissi). In una run precedente lo stesso giorno un singolo test di integrazione
+> (`src/core/distinctiveness/__tests__/distinctiveness-real-vectors.integration.test.ts:88`) è
+> andato in timeout a 120s con il gateway già caldo — rieseguito isolato, verde. È un test
+> intermittente legato al carico, non un guasto stabile: se lo vedi rosso, riesegui quel file
+> da solo prima di allarmarti.
 
 ---
 
@@ -30,7 +40,7 @@ un altro e i ricordi **arrivano all'agente** senza che li cerchi. Non un motore 
 |---|---|
 | **Codice** | `C:\Users\lo\tencentdb-agent-memory` — branch **`main`** (locale; `fork` come remoto consentito, **mai `tencent`**) |
 | **Gateway** | processo Node dal `dist/` del repo, in ascolto su **`127.0.0.1:8421`** (token in `<dataDir>/token`) |
-| **Dati (DB live)** | `C:\Users\lo\.claude\plugins\data\tdai-memory-tdai-local\vectors.db` — **2,80 GB** |
+| **Dati (DB live)** | `C:\Users\lo\.claude\plugins\data\tdai-memory-tdai-local\vectors.db` — **3,11 GB (07/09/2026)** |
 | **Config attiva** | ⚠️ `C:\Users\lo\.memory-tencentdb\memory-tdai\tdai-gateway.yaml` — **NON** in `tdai-gateway\`, errore facile da fare |
 | **Avvio / stop** | `C:\Users\lo\tdai-gateway\start-gateway.ps1` / `stop-gateway.ps1` |
 | **Embedder** | DeepInfra **Qwen3-Embedding-4B @ 1024 dim** (verificato in `embedding_meta`) |
@@ -130,7 +140,7 @@ sta in `C:\Users\lo\tdai-gateway\gateway.secrets.env` (non versionato), che `sta
 | Relazioni | **7.958** |
 | **Lezioni** (Quaderno Errori) | **68** — erano **6** la mattina del 2026-08-07 |
 | Righe di consolidamento | **34.309** — **850** promosse a `long`, **1.517** rinforzate |
-| DB | **2,80 GB** |
+| DB | **3,11 GB (07/09/2026)** |
 | **Registro del richiamo** (verdetto) | **67** iniezioni, **50** giudicate, **5** usate → **utilità 10%** |
 
 ---
@@ -170,7 +180,8 @@ tutti silenziosi:
 
 Ogni guasto scriveva in un file di log che nessuno legge. **Un log non è un segnale.**
 
-### Le cinque trappole ora in funzione (ognuna con test che nomina il guasto che coglie)
+### Le dieci trappole ora in funzione (corretto 07/09/2026: erano elencate sette; il codice
+`claude-code-plugin/lib/alarm.ts:28-50` ne definisce dieci)
 
 | trappola | scatta quando | dove |
 |---|---|---|
@@ -181,6 +192,9 @@ Ogni guasto scriveva in un file di log che nessuno legge. **Un log non è un seg
 | `memory-stale` | hai lavorato **>24 h** dopo l'ultimo ricordo salvato | `lib/staleness.ts` + `/health.last_capture_at` |
 | `memory-degraded` | il gateway risponde ma l'embedder no (503) — richiamo peggiore, non morte | `lib/hook.ts` (session-start) |
 | `writing-to-backup` | la cartella scelta è un **archivio** — i nuovi ricordi finirebbero in un DB vecchio | `lib/data-dir.ts` |
+| `hook-crashed` | un'eccezione ovunque dentro `main()` (token illeggibile, `state.json` corrotto, bug in un handler) — trovato 23/08 auditando le altre sette | `claude-code-plugin/lib/alarm.ts` |
+| `capture-backlog` | il backlog di `/capture` (scritto su disco dopo l'accettazione, dal 06/09) supera 15 minuti di ritardo | `server.ts` `handleHealth`, `alarm.ts` |
+| `capture-parked` | ci sono pacchi parcheggiati in `capture-inbox/failed/` dopo ritentativi falliti | `alarm.ts` |
 
 Come arrivano a Lorenzo: un allarme viene scritto come briciola (`alarms.json`) e il primo
 `UserPromptSubmit` successivo lo mostra come **`systemMessage`**, l'unico canale che Claude Code
@@ -333,22 +347,25 @@ esiste un numero da migliorare invece di un'impressione. Si legge con
 
 ## 5. Le tre verità scomode (misurate, non opinioni)
 
-### 5.1 Su LongMemEval il nostro differenziatore NON batte il RAG piatto
-Prova su 40 domande reali, giudice **ufficiale** GPT-4o:
+### 5.1 Su LongMemEval il nostro differenziatore NON batte il RAG piatto (corretto 07/09/2026)
+**oracle (senza distrattori), giudice UFFICIALE GPT-4o, 30 domande:** flat **18/30 (60%)** vs
+kb **18/30 (60%)** — questo confronto È ufficiale, i file di risultato esistono.
 
-| | flat (RAG normale) | kb (associativo) |
-|---|---|---|
-| oracle (senza distrattori) | **60%** | **60%** |
-| s_cleaned (con distrattori) | **30%** | **20%** |
+**s_cleaned (con distrattori):** i file di risultato del giudice ufficiale GPT-4o per s_cleaned
+(`hyp-flat`/`hyp-kb`/`hyp-kb_consol`, 15 domande) sono **vuoti (0 byte)** — il giudice ufficiale
+su s_cleaned non ha mai prodotto un risultato. I numeri **30% flat / 20% kb** che giravano in
+questo documento venivano dal giudice **INTERNO** `qa.ts`, su **10 domande**: 3/10 corrette per
+flat, 2/10 per kb. Non sono lo stesso benchmark dell'oracle e non vanno confrontati con esso.
 
-**EDGE = 0, e −10 sotto distrattori.** Non è "rotto": LongMemEval misura chiacchiere di vita
+**EDGE = 0 sull'oracle ufficiale.** Non è "rotto": LongMemEval misura chiacchiere di vita
 quotidiana, Sinapsys è memoria per **coding agent** e scarta il chit-chat di proposito.
 **È il metro sbagliato.** Non usarlo come benchmark di vendita.
 → [../../benchmark/longmemeval/DESIGN-2026-07-21.md](../../benchmark/longmemeval/DESIGN-2026-07-21.md)
 
 ### 5.2 LongMemEval non può misurare la consolidazione (lezione metodologica)
 Ogni domanda del benchmark semina una memoria **vergine**: nessun ricordo è mai stato ripetuto,
-quindi non c'è nulla da consolidare. **Ecco perché l'arm `kb_consol` diede esattamente 0.**
+quindi non c'è nulla da consolidare. **Delta zero: `kb_consol` diede 18/30, identico a `kb`** —
+non "esattamente 0" in assoluto, ma nessuna differenza misurabile rispetto a `kb` sull'oracle.
 Falliva il banco di prova, non il motore. La consolidazione va misurata su una memoria **vissuta**
 (A/B su memoria vera: 9 query su 20 cambiano la top-8).
 → [01-vision-and-plan/PIANO-FILO-CONSOLIDAMENTO-RECALL.md](01-vision-and-plan/PIANO-FILO-CONSOLIDAMENTO-RECALL.md)
@@ -383,7 +400,7 @@ La salute deve arrivare a Lorenzo, non al disco.
 **Obiettivo:** Argus (24/7 su Render) usa Sinapsys perfettamente.
 
 ⚠️ **Premessa da non sbagliare (verificata 2026-08-07):** Argus **non è senza memoria**.
-Ha `C:/Argus/engine/lib/argus-memory.mjs` (308 righe) su **Supabase** - storico chat
+Ha `C:/Argus/engine/lib/argus-memory.mjs` (252 righe, ricontato 07/09/2026) su **Supabase** - storico chat
 append-only + fatti curati con `evidence_count` — usata da **10+ moduli**, inclusa una sua
 consolidazione. Hanno scelto Supabase proprio perché un disco Render non è condivisibile
 fra i tre servizi. Quindi Sinapsys non va "aggiunta": va **collocata**.

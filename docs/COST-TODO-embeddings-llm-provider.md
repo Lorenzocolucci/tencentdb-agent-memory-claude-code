@@ -1,5 +1,10 @@
 # COST TODO — cambiare il provider LLM/embeddings (2026-07-20)
 
+> **✅ FATTO (20-21/07/2026), verificato 07/09/2026.** Gli embeddings sono passati da OpenAI
+> `text-embedding-3-small` a DeepInfra `Qwen/Qwen3-Embedding-4B` (1024 dim) — vedi
+> `docs/vision/STATO-REALE.md:36` e la config live `tdai-gateway.yaml` (`provider: deepinfra`).
+> Il resto di questo file è la nota storica che ha originato il cambio, lasciata per contesto.
+
 > Nota lasciata dalla sessione "Socio" mentre bonificava i costi di Sofia AI. NON dimenticare.
 
 ## Cosa

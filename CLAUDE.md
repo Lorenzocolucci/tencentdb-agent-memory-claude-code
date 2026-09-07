@@ -49,8 +49,9 @@ stesso repo dichiaravano numeri diversi (1.052 contro 1.063) per lo stesso giorn
   repo, `C:\Users\lo\tencentdb-agent-memory`. Se trovi un riferimento al vecchio percorso in un
   documento (fuori da `docs/archive/`), è una bugia rimasta indietro, correggila.
 - **Un errore dentro `main()` del hook può spegnere richiamo E cattura in silenzio**: c'era un
-  `try/catch` la cui unica azione era scrivere una riga di log — nessun allarme delle "sette (oggi
-  otto) trappole" poteva vederlo, perché vivevano dentro quello stesso `try`. Riparato (`alarm.ts`,
+  `try/catch` la cui unica azione era scrivere una riga di log — nessun allarme delle trappole
+  (sette allora, dieci oggi — `alarm.ts:28-50`, corretto 07/09/2026) poteva vederlo, perché
+  vivevano dentro quello stesso `try`. Riparato (`alarm.ts`,
   `hook.ts`), ma è la forma di guasto a cui fare più attenzione qui: **un log non è un allarme**.
 - **Il bundle installato può restare indietro rispetto al codice del repo** anche dopo un merge: il
   plugin gira dalla build compilata e installata (`claude-code-plugin/`), non dal sorgente aperto qui.

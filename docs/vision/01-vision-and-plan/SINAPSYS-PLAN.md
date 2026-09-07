@@ -47,7 +47,7 @@ Stato dettagliato per-modulo: `docs/SINAPSYS-ARCHITECTURE.md` + `docs/SINAPSYS_F
 
 | Livello Sinapsys | Stato | Dove |
 |---|---|---|
-| **L0** Working memory (file .md) | ✅ fatto | status.md / done-log / scene_blocks |
+| **L0** Working memory (file .md, status.md/done-log/next-up) | ⚠️ MAI COSTRUITO (verificato 07/09/2026: zero occorrenze in src/) | L0 reale = `l0_conversations` (conversazioni grezze), `src/core/store/sqlite.ts:827` |
 | **L1** Episodica (eventi) | 🟡 parziale | tabella `events` (manca formato narrativo Situazione→Azioni→Risultati→Lezioni + Context Fingerprint) |
 | **L2** Semantica (knowledge graph) | ✅ in gran parte | `entities` + `facts` (bi-temporali, supersession) + **`relations`** tipizzate |
 | Ricerca ibrida FTS5+vettori (RRF) | ✅ fatto | `kbRecall` (FTS + vec + entity-match → RRF → score calibrato) |
