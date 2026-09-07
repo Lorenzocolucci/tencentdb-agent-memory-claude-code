@@ -16,9 +16,12 @@
 > does what, the data model, the request flows, and the six original ideas mapped to
 > code. Generated from the real tree (not memory).
 >
-> **Scale (all re-measured 2026-08-23):** **345** TypeScript files · **~72,800** LOC ·
-> **151** test files · **1,052** tests green, 2 skipped (POSIX-only, on Windows) ·
-> **0 failing**.
+> **Scale (re-measured 2026-09-07):** **379** TypeScript files in `src/` (`find src -name '*.ts' | wc -l`,
+> 402 including `claude-code-plugin/`) · **81,350** LOC across `src/` + `claude-code-plugin/`
+> (`find src claude-code-plugin -name '*.ts' -exec cat {} + | wc -l`) ·
+> **178** test files · **1,303** tests total, 1,301 green, 2 skipped as measured 07/09
+> (`npx vitest run`; one distinctiveness integration test has an intermittent 120s timeout
+> on a warm gateway — re-run isolated if it recurs, see STATO-REALE.md).
 > **Status:** all six pillars built, wired and live. Three gaps closed since 2026-08-07 —
 > the **consolidation → recall wire** (reinforcement/tier now affect ranking), **friction
 > capture** (memory sees failed tool calls and interrupts intra-session loops), and the
@@ -26,7 +29,7 @@
 > on what it retrieved).
 >
 > ⚠️ **Read this before trusting anything here:** between 2026-08-13 and 2026-08-22 capture
-> was dead and nobody noticed. Root cause, the seven tripwires that now make silence
+> was dead and nobody noticed. Root cause, the ten tripwires (see `claude-code-plugin/lib/alarm.ts:28-50`) that now make silence
 > impossible, and the performance fixes are in
 > [`docs/vision/STATO-REALE.md`](vision/STATO-REALE.md) §4-bis/§4-ter.
 >
@@ -80,17 +83,17 @@ src/
 │   └── standalone/ ……………………… Gateway/Hermes sidecar ↔ TDAI Core (Vercel AI SDK runner)
 ├── core/
 │   ├── tdai-core.ts ………………… ⚙️ THE ORCHESTRATOR — owns the lifecycle hooks
-│   ├── kb/ (49 files) ……………… 🧠 the entity-centric brain (graph + ideas)
+│   ├── kb/ (58 files, re-counted 07/09: `find src/core/kb -maxdepth 1 -name '*.ts' | wc -l`) … 🧠 the entity-centric brain (graph + ideas)
 │   ├── store/ (10 files) ……… ⚙️ storage abstraction (SQLite+sqlite-vec / Tencent VDB)
 │   ├── hooks/ (11 files) ……… 📤 capture + recall + proactive injection
 │   ├── distinctiveness/ (7) … 🧠 Idea 5 (cornerstone / von Restorff)
-│   ├── continuity/ (6) ………… "Dove eravamo" session continuity
+│   ├── continuity/ (7 files, re-counted 07/09) ………… "Dove eravamo" session continuity
 │   ├── record/ · conversation/  📥 L0/L1 capture + extraction
 │   ├── scene/ · persona/ · profile/  L2/L3 projections of who the user is
 │   ├── prompts/ · seed/ · tools/ · report/
 ├── offload/ (17 files) ……… ⚙️ context-window offload (token tracking, state)
 ├── cli/ ……………………………………… reindex, chat-export backfill, maintenance
-└── utils/ (15 files) ………… redaction, sanitization, secrets, shared helpers
+└── utils/ (18 files, re-counted 07/09: `find src/utils -maxdepth 1 -name '*.ts' | wc -l`) ………… redaction, sanitization, secrets, shared helpers
 ```
 
 ---
@@ -144,7 +147,7 @@ hanging off them, linked by **relations**. The six ideas live here.
 | `types.ts` | `IMemoryStore` — the interface every backend implements |
 | `sqlite.ts` 🗄️ | Default backend: SQLite + `sqlite-vec` (100% local, no cloud) |
 | `tcvdb.ts` · `tcvdb-client.ts` | Optional Tencent Cloud VectorDB backend |
-| `embedding.ts` | Text → vector (OpenAI `text-embedding-3-small`, 1536-d) |
+| `embedding.ts` | Text → vector (DeepInfra `Qwen/Qwen3-Embedding-4B`, 1024-d, live since 20/07 (`embedding_meta` table)) |
 | `bm25-local.ts` · `bm25-client.ts` | Sparse keyword vectors (hybrid recall) |
 | `chunking.ts` · `search-utils.ts` · `factory.ts` | Long-text chunking, shared search, backend selection |
 
@@ -194,7 +197,7 @@ stale data. Keeps long agent sessions within the model's context budget.
 
 ---
 
-## Data model (11 tables)
+## Data model (13 tables, re-counted 07/09: `grep -n "CREATE TABLE" src/core/store/sqlite.ts src/core/kb/foundations-schema.ts`)
 
 | Table | Holds | Written by |
 | :-- | :-- | :-- |
@@ -208,7 +211,11 @@ stale data. Keeps long agent sessions within the model's context budget.
 | `memory_audit` | Append-only trail of every automatic mutation | `memory-audit` |
 | `recall_ledger` | **The usefulness verdict**: one row per memory actually injected into a turn, judged at capture time, keeping the tokens that decided it | `recall-ledger` |
 | `embedding_meta` | Embedding provider/model/dim bookkeeping | `sqlite` |
-| `l0_vec / kb_vec / kb_fts / l1_vec` | Vector + FTS shadow tables (sqlite-vec / FTS5) | `sqlite` |
+| `l0_conversations` | L0 raw conversation turns | `sqlite` |
+| `l1_records` | L1 extracted records | `sqlite` |
+| `session_projects` | Session key → project mapping | `sqlite` |
+
+Plus vector/FTS shadow tables (`l0_vec` / `kb_vec` / `kb_fts` / `l1_vec`, sqlite-vec / FTS5), not counted above as they are virtual tables, not `CREATE TABLE`.
 
 ---
 
@@ -221,7 +228,14 @@ stale data. Keeps long agent sessions within the model's context budget.
 | `POST /observe` 🧠 | PostToolUse: fold the touched file into the session situation; surface file memory + cross-session fingerprint matches; record lesson exposure |
 | `POST /session/end` | Flush + 6 deferred bg tasks: consolidation, recap, lesson distillation, B3 avoidance crediting, **principle distillation** (Pilastro C Fase 2), **usage distillation** (Behavioral Notebook, Percorso B) |
 | `GET /health` | Liveness |
-| `/recall-context`, `/session-filter` | Internal compose/scope helpers |
+| `POST /memory/confirm`, `/memory/reject` | Gated memory confirm/reject |
+| `POST /digest` | On-demand digest |
+| `POST /seed` | Seed data |
+| `POST /kb/write` | Direct KB write |
+
+Real route table as of 07/09 (`src/gateway/server.ts:336-360`); the previous version of this doc
+listed `/recall-context` and `/session-filter` as endpoints — they are internal helper modules,
+not HTTP routes.
 
 ---
 
@@ -250,7 +264,7 @@ they are unverified off Windows-ARM.**
 | :-- | :-- | :-- |
 | **OS** | Verified on Windows 11 ARM64 | Must verify Linux / macOS / Windows x64; CI matrix |
 | **Native dep** | `sqlite-vec` via Node `node:sqlite` (experimental) | Pin/bundle per-platform prebuilds; fallback path |
-| **Embeddings** | OpenAI `text-embedding-3-small` (network + key) | Local ONNX option (Phase E, 100% TODO) for privacy/offline |
+| **Embeddings** | DeepInfra `Qwen/Qwen3-Embedding-4B`, 1024-d (network + key) | Local ONNX option (Phase E, 100% TODO) for privacy/offline |
 | **Gateway** | Local supervised process, port 8421, token auth | Installer/daemon per OS; managed/cloud option |
 | **Host** | OpenClaw + standalone adapters | Document the adapter contract; SDKs for other runtimes |
 | **Config** | Single-user, local paths | Multi-user/workspace; secret management |
@@ -329,7 +343,7 @@ where nothing was ever repeated, which is exactly why its `kb_consol` arm measur
 
 ## Test coverage
 
-**1,052 tests across 151 test files, green — 0 failing** (re-measured 2026-08-23).
+**1,303 tests across 178 test files, 1,301 green, 2 skipped** (re-measured 2026-09-07, `npx vitest run`).
 Pure modules (🔬) are unit-tested in isolation; store methods are tested against a real
 SQLite. Two tests are skipped on Windows because they assert POSIX file modes, which the
 implementation itself skips there (`claude-code-plugin/lib/daemon.ts`).

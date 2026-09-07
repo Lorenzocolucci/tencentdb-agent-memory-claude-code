@@ -32,7 +32,7 @@ Il codice di Sinapsys si costruisce **sopra TencentDB Agent Memory** (decisione 
 | **Officina** (fallimenti tecnici → ricordi, loop) | `src/core/kb/friction-capture.ts` |
 | **Verdetto di utilità** (usato vs solo recuperato) | `src/core/kb/{recall-usage,recall-ledger}.ts` |
 | Limite al confronto a coppie degli errori | `src/core/kb/bug-working-set.ts` |
-| **Allarmi "mai in silenzio"** (7 trappole) | `claude-code-plugin/lib/{alarm,staleness}.ts` |
+| **Allarmi "mai in silenzio"** (10 trappole, `alarm.ts:28-50`) | `claude-code-plugin/lib/{alarm,staleness}.ts` |
 | Trovare la cartella dati (indipendente dal layout) | `claude-code-plugin/lib/data-dir.ts` |
 | Facciata host-neutrale (recall/capture/observe) | `src/core/tdai-core.ts` |
 | Gateway HTTP | `src/gateway/server.ts` |
@@ -40,7 +40,7 @@ Il codice di Sinapsys si costruisce **sopra TencentDB Agent Memory** (decisione 
 
 ## Gateway (memoria live)
 - **Ascolto:** `127.0.0.1:8421`; token in `<dataDir>/token`.
-- **Dati:** `C:\Users\lo\.claude\plugins\data\tdai-memory-tdai-local\` (`vectors.db`, 2,80 GB).
+- **Dati:** `C:\Users\lo\.claude\plugins\data\tdai-memory-tdai-local\` (`vectors.db`, 3,11 GB (07/09/2026)).
 - **⚠️ CONFIG ATTIVA:** `C:\Users\lo\.memory-tencentdb\memory-tdai\tdai-gateway.yaml`
   — **NON** in `C:\Users\lo\tdai-gateway\`. Ordine di risoluzione (`src/gateway/config.ts`):
   `TDAI_GATEWAY_CONFIG` → CWD del processo → data-dir di default. *Errore facile da fare.*

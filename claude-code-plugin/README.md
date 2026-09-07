@@ -4,6 +4,13 @@
 
 **Maintained fork by [Lorenzo Colucci](https://github.com/Lorenzocolucci).** Built on Tencent's [TencentDB Agent Memory](https://github.com/Tencent/TencentDB-Agent-Memory) and its Claude Code plugin adapter by 李冠辰 (liguanchen) — see [Credits](#credits--attribution).
 
+> **Nota (corretta 07/09/2026):** questo README descrive il layout generico `claude-code-plugin/windows/`.
+> Sull'installazione live di Lorenzo lo start script e i secrets NON stanno lì: sono in
+> `C:\Users\lo\tdai-gateway\` (`start-gateway.ps1`, `gateway.secrets.env`). Il layout `windows/`
+> resta valido per chi clona il repo da zero; per l'ambiente reale vedi `docs/vision/CODE-POINTER.md:47-48`.
+> L'embedder in uso live è DeepInfra `Qwen/Qwen3-Embedding-4B` (1024 dim), non OpenAI
+> `text-embedding-3-small` — vedi sotto: OpenAI resta un'opzione qualsiasi endpoint OpenAI-compatible.
+
 ---
 
 ## What is this? (30 seconds)

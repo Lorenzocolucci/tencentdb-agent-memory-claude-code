@@ -14,7 +14,7 @@
 | «Argus è senza memoria» (mia, di stamattina) | **FALSO.** Argus ha una memoria permanente **già viva e profondamente integrata**. |
 
 ### Che memoria ha Argus, davvero
-`C:\Argus\engine\lib\argus-memory.mjs` (308 righe) — **Supabase/PostgREST**, non SQLite:
+`C:\Argus\engine\lib\argus-memory.mjs` (252 righe, ricontato 07/09/2026: `wc -l`) — **Supabase/PostgREST**, non SQLite:
 
 - `argus_chat_memory` — una riga per turno, **append-only**;
 - `argus_facts` — conoscenza curata (`fact` / `not_error` / `mistake` / `charter_rule`),
@@ -66,14 +66,14 @@ Argus su Render (verificato via API, 2026-08-07) — **tre servizi, una immagine
               ┌──────────────────────────────────┐
               │  sinapsys-memory (PRIVATE)       │  ← 1 sola istanza
               │  node dist/src/gateway/cli.mjs   │
-              │  disco persistente /var/data     │  ← vectors.db (2,80 GB)
+              │  disco persistente /var/data     │  ← vectors.db (3,11 GB (07/09/2026))
               └──────────────────────────────────┘
 ```
 
 Il gateway **è già** questo server HTTP: non si riscrive nulla, gira lo stesso codice del portatile.
 
 **Perché non riscrivere Sinapsys su Supabase/pgvector** (idea circolata a luglio): zero riscrittura
-dello store, zero re-embed (i 2,80 GB sono già Qwen3/1024), zero ricompilazione di vec0, e
+dello store, zero re-embed (i 3,11 GB (07/09/2026) sono già Qwen3/1024), zero ricompilazione di vec0, e
 soprattutto **le 5 idee associative restano intatte** (spreading activation, priming: JS puro).
 Portarle su Postgres async sarebbe settimane di lavoro col rischio di regredire proprio il
 differenziatore. **Scartata con motivo.**
@@ -114,7 +114,7 @@ comportamento byte-identico a oggi. Flag `ARGUS_SINAPSYS=1`, default OFF.
 
 ---
 
-## 5. Migrazione dei 2,80 GB
+## 5. Migrazione dei 3,11 GB (07/09/2026)
 
 I dischi Render **non sono accessibili in build/pre-deploy**: il DB non può stare nell'immagine
 (e non deve — sarebbe un'immagine con dentro dati personali).

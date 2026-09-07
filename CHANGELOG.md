@@ -4,6 +4,25 @@
 
 ---
 
+## [fork] 2026-07 → 2026-09
+
+Fork work continued past `package.json`'s `0.3.4` and this file's last dated entry
+(0.3.4, 12/05) with PRs #5–#12 (added 07/09/2026, from `git log fork/main --oneline`):
+
+- **#5** (2026-08-23) fix(plugin): the 8th silent failure — a crash inside `main()` left only a log line
+- **#6** (2026-08-23) fix(memory): a file's identity is project+path, never the base name
+- **#7** (2026-08-23) ci: make the gate real — it never ran a single test, and had been red since June
+- **#9** (2026-09-05) docs: add the missing root CLAUDE.md
+- **#8** (2026-09-05) docs: cross-link Sinapsys's live documents to each other and to the RISTRUTTURAZIONE hub
+- **#10** (2026-09-05) docs: actually ship the root CLAUDE.md (PR #9 merged only the README pointer, `.gitignore` dropped the file)
+- **#11** (2026-09-06) fix: extraction back on kimi-k2.6 with a fallback on every LLM call, PostToolUseFailure friction capture, confirm/reject from Claude Code, backfill of lost sessions
+- **#12** (2026-09-06) feat(capture): durable inbox behind POST /capture — sign first, write later; /health backlog; plugin alarms
+
+**Three version numbers, not a bug:** the npm package stays at `0.3.4` (`package.json`), the
+Claude Code plugin manifest is `0.1.0` (`claude-code-plugin/`), and upstream Tencent tags
+(e.g. `v2.0.0`) are not present on this fork's `main` branch — the fork tracks its own history,
+not upstream's tags.
+
 ## [Unreleased]
 
 ### 2026-09-05 — fork `Lorenzocolucci/tencentdb-agent-memory-claude-code` (English)

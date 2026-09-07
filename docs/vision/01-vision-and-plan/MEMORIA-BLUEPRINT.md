@@ -374,7 +374,7 @@ cieco o filtrano cieco; nessuno *chiede con umiltà e impara*. È la spina dorsa
 della fiducia su cui poggiano tutte le altre idee.
 
 > Dettaglio + design d'apertura:
-> `repo/docs/superpowers/specs/2026-06-29-grounded-trust-child-and-fire-design.md`.
+> archiviato: `docs/archive/SINAPSYS-STORICO-DOCS-20260718.md` §"docs/superpowers/specs/2026-06-29-grounded-trust-child-and-fire-design.md (archiviato 2026-07-18)" (riga ~2693).
 
 ---
 
@@ -421,7 +421,13 @@ della fiducia su cui poggiano tutte le altre idee.
 │  done-log.md — cosa è stato fatto                │
 │  SEMPRE letti per primi, SEMPRE aggiornati       │
 │  Zero dipendenze. Sopravvivono a tutto.          │
-│  ✅ GIA' COSTRUITO                                │
+│  ⚠️ MAI COSTRUITO (verificato 07/09/2026: zero    │
+│  occorrenze di "status.md"/"next-up.md"/          │
+│  "done-log.md" in src/). L0 REALE = le            │
+│  conversazioni grezze in `l0_conversations`       │
+│  (`src/core/store/sqlite.ts:827`) — vedi          │
+│  `docs/SINAPSYS-ARCHITECTURE.md` §"L0" e          │
+│  `docs/vision/02-architecture/INTERCONNECTION-MAP.md`.│
 └──────────────────────────────────────────────────┘
 ```
 

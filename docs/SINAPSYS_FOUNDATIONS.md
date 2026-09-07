@@ -10,7 +10,7 @@
 > Le tabelle-mattone sono tutte create e **popolate**. Numeri reali:
 > `memory_lifecycle` **34.309** righe (850 `long`, 1.517 rinforzate) ·
 > `lessons` **68** (erano 6 il 2026-08-07) · `entities` 12.582 · `facts` 20.416 ·
-> `events` 15.687 (1.708 `bug`, 18 `principle`) · `relations` 7.958 · DB **2,80 GB**.
+> `events` 15.687 (1.708 `bug`, 18 `principle`) · `relations` 7.958 · DB **3,11 GB (07/09/2026)**.
 >
 > **Mattone NUOVO (2026-08-23): `recall_ledger`** — una riga per ogni ricordo *davvero
 > iniettato* in un turno, scritta non giudicata dal recall e chiusa dalla cattura, con le
@@ -32,7 +32,9 @@
 > Stato completo e cosa manca: → [vision/STATO-REALE.md](vision/STATO-REALE.md)
 
 > v1 — 24 giugno 2026 — Lorenzo + Socio. Schema validato e COSTRUITO.
-> **STATO 2026-06-24 sera:** fondamenta LIVE · Fase A live · Fase B **B1 (`a3c81c4`) + B2a (`2a4cc5c`) costruite e live**. Dettaglio moduli/stato: `docs/superpowers/specs/2026-06-24-track-b-mistake-notebook-design.md` + `docs/HANDOFF-2026-06-24-trackB.md`.
+> **STATO 2026-06-24 sera:** fondamenta LIVE · Fase A live · Fase B **B1 (`a3c81c4`) + B2a (`2a4cc5c`) costruite e live**. Dettaglio moduli/stato: entrambi archiviati in `docs/archive/SINAPSYS-STORICO-DOCS-20260718.md`
+— §"docs/superpowers/specs/2026-06-24-track-b-mistake-notebook-design.md" (riga ~2681) e
+§"docs/HANDOFF-2026-06-24-trackB.md" (riga ~2615).
 > Principio: ogni fase futura (A→E) e ogni angolo vendibile si aggancia a queste fondamenta SENZA demolire. Tutto additivo (`IF NOT EXISTS` / `ALTER TABLE ADD COLUMN`), stile `initKbSchema()` esistente. Il KB live non si rompe mai.
 
 ---

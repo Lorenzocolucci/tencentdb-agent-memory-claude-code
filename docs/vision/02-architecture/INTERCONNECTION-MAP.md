@@ -93,11 +93,13 @@ STATO-REALE  ◄── punto d'ingresso, l'unico che si aggiorna ogni sessione
     si misura su traffico vero, poi si agisce.
 ```
 
-### Le 7 trappole "mai in silenzio" (2026-08-22/23)
+### Le 10 trappole "mai in silenzio" (2026-08-22/23, aggiornato 07/09/2026 —
+`claude-code-plugin/lib/alarm.ts:28-50`)
 
 ```
  data-dir-lost · gateway-unreachable · capture-failed · capture-empty
  memory-stale  · memory-degraded     · writing-to-backup
+ hook-crashed  · capture-backlog     · capture-parked
         │
         └─► briciola in alarms.json ─► il primo UserPromptSubmit la mostra
             come systemMessage (l'unico canale che CC rende all'utente)
