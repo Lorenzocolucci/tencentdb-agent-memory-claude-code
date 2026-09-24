@@ -1348,14 +1348,14 @@ async function handleSearchStdin(rawStdin, client) {
 * id rides on stdin for the same reason as search-stdin: `$ARGUMENTS` is a
 * literal replaceAll in cc, so an id on argv would be a command-injection
 * surface. `owner_kind` is inferred from the id prefix the store uses
-* (`fact_…` / `event_…`); anything else is refused with a clear message —
+* (`fact_…` / `evt_…`, legacy `event_…`); anything else is refused with a clear message —
 * exit code stays 0 so the skill output is rendered, not swallowed.
 */
 async function handleResolveGatedMemory(decision, rawStdin, client) {
 	const ownerId = rawStdin.trim();
-	if (!ownerId) return `Usage: pipe the memory id (fact_… or event_…) to stdin for /memory-${decision}`;
+	if (!ownerId) return `Usage: pipe the memory id (fact_… or evt_…) to stdin for /memory-${decision}`;
 	const ownerKind = inferOwnerKind(ownerId);
-	if (!ownerKind) return `Cannot ${decision} "${ownerId}": the id must start with "fact_" or "event_" (copy it from the memory prompt).`;
+	if (!ownerKind) return `Cannot ${decision} "${ownerId}": the id must start with "fact_" or "event_"/"evt_" (copy it from the memory prompt).`;
 	const res = await client.resolveGatedMemory(decision, ownerId, ownerKind);
 	if (!res) return `Memory gateway unreachable — ${decision} of ${ownerId} NOT applied. Try /memory-status.`;
 	return res.text || (res.ok ? `${decision} applied to ${ownerId}` : `${decision} NOT applied to ${ownerId}`);
@@ -1363,7 +1363,7 @@ async function handleResolveGatedMemory(decision, rawStdin, client) {
 /** Owner kind from the id prefix the store uses; null when unrecognised. */
 function inferOwnerKind(ownerId) {
 	if (/^fact_[A-Za-z0-9]+$/.test(ownerId)) return "fact";
-	if (/^event_[A-Za-z0-9]+$/.test(ownerId)) return "event";
+	if (/^(evt|event)_[A-Za-z0-9]+$/.test(ownerId)) return "event";
 	return null;
 }
 async function handleStatus(client) {

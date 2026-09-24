@@ -592,7 +592,7 @@ async function handleSearchStdin(rawStdin: string, client: GatewayClient): Promi
  * id rides on stdin for the same reason as search-stdin: `$ARGUMENTS` is a
  * literal replaceAll in cc, so an id on argv would be a command-injection
  * surface. `owner_kind` is inferred from the id prefix the store uses
- * (`fact_…` / `event_…`); anything else is refused with a clear message —
+ * (`fact_…` / `evt_…`, legacy `event_…`); anything else is refused with a clear message —
  * exit code stays 0 so the skill output is rendered, not swallowed.
  */
 async function handleResolveGatedMemory(
@@ -602,11 +602,11 @@ async function handleResolveGatedMemory(
 ): Promise<string> {
   const ownerId = rawStdin.trim();
   if (!ownerId) {
-    return `Usage: pipe the memory id (fact_… or event_…) to stdin for /memory-${decision}`;
+    return `Usage: pipe the memory id (fact_… or evt_…) to stdin for /memory-${decision}`;
   }
   const ownerKind = inferOwnerKind(ownerId);
   if (!ownerKind) {
-    return `Cannot ${decision} "${ownerId}": the id must start with "fact_" or "event_" (copy it from the memory prompt).`;
+    return `Cannot ${decision} "${ownerId}": the id must start with "fact_" or "event_"/"evt_" (copy it from the memory prompt).`;
   }
   const res = await client.resolveGatedMemory(decision, ownerId, ownerKind);
   if (!res) {
@@ -618,7 +618,8 @@ async function handleResolveGatedMemory(
 /** Owner kind from the id prefix the store uses; null when unrecognised. */
 export function inferOwnerKind(ownerId: string): "fact" | "event" | null {
   if (/^fact_[A-Za-z0-9]+$/.test(ownerId)) return "fact";
-  if (/^event_[A-Za-z0-9]+$/.test(ownerId)) return "event";
+  // Events are stored as "evt_"+ulid (src/core/store/types.ts); "event_" is kept for old callers.
+  if (/^(evt|event)_[A-Za-z0-9]+$/.test(ownerId)) return "event";
   return null;
 }
 
