@@ -15,7 +15,7 @@ Use a here-document with a long random sentinel:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/dist/lib/hook.mjs" confirm <<'__TDAI_OWNER_EOF__'
-<paste the id verbatim, exactly as shown above, on one line — it starts with fact_ or event_>
+<paste the id verbatim, exactly as shown above, on one line — it starts with fact_ or evt_>
 __TDAI_OWNER_EOF__
 ```
 

@@ -557,6 +557,14 @@ describe("handleHook: confirm / reject (grounded trust)", () => {
     expect(out).toBe("Memoria rifiutata.");
   });
 
+  it("reject infers event kind from the evt_ prefix the store actually uses", async () => {
+    const resolveGatedMemory = vi.fn(async () => ({ ok: true, text: "Memoria rifiutata." }));
+    const client = makeFakeClient({ resolveGatedMemory } as Partial<GatewayClient>);
+    const out = await handleHook("reject", { stdin: "evt_01M2MT1XKF0000D6W1B6\n", client });
+    expect(resolveGatedMemory).toHaveBeenCalledWith("reject", "evt_01M2MT1XKF0000D6W1B6", "event");
+    expect(out).toBe("Memoria rifiutata.");
+  });
+
   it("refuses an id with an unknown prefix without calling the gateway", async () => {
     const resolveGatedMemory = vi.fn(async () => ({ ok: true, text: "x" }));
     const client = makeFakeClient({ resolveGatedMemory } as Partial<GatewayClient>);
