@@ -75,6 +75,16 @@ import { phaseFor as lessonPhaseFor } from "../kb/lesson-reinforcement.js";
 import { distillLessons as kbDistillLessons } from "../kb/lessons-runner.js";
 import { distillUsage as kbDistillUsage } from "../kb/usage-runner.js";
 import { createKbVecEmbeddingReader } from "../kb/bug-embeddings.js";
+import {
+  KB_VEC_SPEC,
+  L0_VEC_SPEC,
+  ensureVecTable,
+  makeOwnerDelete,
+  makeVecInsert,
+  ownerTableName,
+  pruneOwnerRows,
+  type VecWriteStmt,
+} from "./vec-compact.js";
 import { ensureLifecycle, confirmProvenance, rejectProvenance, markGatePending, getLifecycle, stampSalience as kbStampSalience, reinforce as kbReinforce } from "../kb/lifecycle-writer.js";
 import { serializeProvenance, parseProvenance, gateStateOf, type ProvenanceStamp } from "../kb/provenance.js";
 import { classifyStakes, shouldGate } from "../kb/stakes.js";
@@ -468,8 +478,10 @@ export class VectorStore implements IMemoryStore {
 
   // Prepared statements — L0 (initialized in init())
   private stmtL0UpsertMeta!: StatementSync;
-  private stmtL0DeleteVec?: StatementSync;   // optional — only set when vecTablesReady
-  private stmtL0InsertVec?: StatementSync;   // optional — only set when vecTablesReady
+  private stmtL0DeleteVec?: VecWriteStmt;    // optional — only set when vecTablesReady (layout-aware, see vec-compact.ts)
+  private stmtL0InsertVec?: VecWriteStmt;    // optional — only set when vecTablesReady
+  /** true once l0_vec is the compact (no partition key + owner side table) layout. */
+  private l0VecCompact = false;
   private stmtL0DeleteMeta!: StatementSync;
   private stmtL0GetMeta!: StatementSync;
   private stmtL0SearchVec?: StatementSync;   // optional — only set when vecTablesReady
@@ -510,8 +522,10 @@ export class VectorStore implements IMemoryStore {
   private kbVecReady = false;
   /** `true` once the kb_fts FTS5 table exists. */
   private kbFtsAvailable = false;
-  private stmtKbVecDelete?: StatementSync;
-  private stmtKbVecInsert?: StatementSync;
+  private stmtKbVecDelete?: VecWriteStmt;   // layout-aware (see vec-compact.ts)
+  private stmtKbVecInsert?: VecWriteStmt;
+  /** true once kb_vec is the compact (no partition key + owner side table) layout. */
+  private kbVecCompact = false;
   private stmtKbVecSearch?: StatementSync;
   private stmtKbVecSearchKind?: StatementSync;
   private stmtKbFtsDelete?: StatementSync;
@@ -876,16 +890,12 @@ export class VectorStore implements IMemoryStore {
 
     // L0 vector virtual table (cosine distance, same dimensions as L1) — deferred when dimensions=0.
     // Chunked schema: one row per chunk (chunk_id PK), record_id partition key.
+    // Layout: a fresh DB gets the COMPACT layout (vec-compact.ts: no partition key
+    // — it cost one chunk per record — plus an owner side table). A DB that still
+    // has the legacy partition-key table keeps the legacy path until
+    // tools/vec-compact.mts migrates it.
     if (this.dimensions > 0) {
-      this.db.exec(`
-        CREATE VIRTUAL TABLE IF NOT EXISTS l0_vec USING vec0(
-          chunk_id TEXT PRIMARY KEY,
-          record_id TEXT partition key,
-          embedding float[${this.dimensions}] distance_metric=cosine,
-          recorded_at TEXT DEFAULT '',
-          chunk_size=8
-        )
-      `);
+      this.l0VecCompact = ensureVecTable(this.db, L0_VEC_SPEC, this.dimensions);
     }
 
     // L0 prepared statements
@@ -900,9 +910,12 @@ export class VectorStore implements IMemoryStore {
     `);
 
     if (this.dimensions > 0) {
-      // DELETE by partition key removes ALL chunk rows for a record.
-      this.stmtL0DeleteVec = this.db.prepare("DELETE FROM l0_vec WHERE record_id = ?");
-      this.stmtL0InsertVec = this.db.prepare(
+      // Removes ALL chunk rows for a record (legacy: by partition key; compact: via owner side table).
+      this.stmtL0DeleteVec = makeOwnerDelete(this.db, L0_VEC_SPEC, this.l0VecCompact);
+      this.stmtL0InsertVec = makeVecInsert(
+        this.db,
+        L0_VEC_SPEC,
+        this.l0VecCompact,
         "INSERT INTO l0_vec (chunk_id, record_id, embedding, recorded_at) VALUES (?, ?, ?, ?)",
       );
     }
@@ -1263,6 +1276,10 @@ export class VectorStore implements IMemoryStore {
     // reindexKb() refills it (kb_fts, the text source, is preserved). Uses
     // prepare().run() (not db.exec) to avoid the child_process.exec lint false-positive.
     this.db.prepare("DROP TABLE IF EXISTS kb_vec").run();
+    // Compact-layout owner side tables go with their vec tables (stale rows would
+    // otherwise point at chunks of the new, empty tables).
+    this.db.prepare(`DROP TABLE IF EXISTS ${ownerTableName("l0_vec")}`).run();
+    this.db.prepare(`DROP TABLE IF EXISTS ${ownerTableName("kb_vec")}`).run();
     this.logger?.info(`${TAG} Dropped vector tables (l1_vec, l0_vec, kb_vec)`);
   }
 
@@ -2031,6 +2048,14 @@ export class VectorStore implements IMemoryStore {
       this.db.exec("BEGIN");
       try {
         if (this.vecTablesReady) {
+          if (this.l0VecCompact) {
+            pruneOwnerRows(
+              this.db,
+              L0_VEC_SPEC,
+              "SELECT record_id FROM l0_conversations WHERE recorded_at != '' AND recorded_at < ?",
+              cutoffIso,
+            );
+          }
           this.db.prepare(
             "DELETE FROM l0_vec WHERE recorded_at != '' AND recorded_at < ?",
           ).run(cutoffIso);
@@ -3751,19 +3776,15 @@ export class VectorStore implements IMemoryStore {
     // Only when dimensions > 0 (deferred under provider="none", like l1_vec).
     if (this.dimensions > 0) {
       try {
-        this.db.exec(`
-          CREATE VIRTUAL TABLE IF NOT EXISTS kb_vec USING vec0(
-            chunk_id TEXT PRIMARY KEY,
-            owner_id TEXT partition key,
-            owner_kind TEXT,
-            embedding float[${this.dimensions}] distance_metric=cosine,
-            updated_time TEXT DEFAULT '',
-            chunk_size=8
-          )
-        `);
-        // DELETE by partition key removes ALL chunk rows for an owner.
-        this.stmtKbVecDelete = this.db.prepare("DELETE FROM kb_vec WHERE owner_id = ?");
-        this.stmtKbVecInsert = this.db.prepare(
+        // Fresh DB → compact layout; legacy partition-key table → legacy path
+        // until tools/vec-compact.mts migrates it (see vec-compact.ts).
+        this.kbVecCompact = ensureVecTable(this.db, KB_VEC_SPEC, this.dimensions);
+        // Removes ALL chunk rows for an owner (legacy: partition key; compact: owner side table).
+        this.stmtKbVecDelete = makeOwnerDelete(this.db, KB_VEC_SPEC, this.kbVecCompact);
+        this.stmtKbVecInsert = makeVecInsert(
+          this.db,
+          KB_VEC_SPEC,
+          this.kbVecCompact,
           "INSERT INTO kb_vec (chunk_id, owner_id, owner_kind, embedding, updated_time) VALUES (?, ?, ?, ?, ?)",
         );
         this.stmtKbVecSearch = this.db.prepare(`

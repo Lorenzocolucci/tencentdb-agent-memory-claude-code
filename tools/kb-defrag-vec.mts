@@ -19,10 +19,11 @@ import net from "node:net";
 const req = createRequire(import.meta.url);
 const DB = "C:/Users/lo/.claude/plugins/data/tdai-memory-tdai-local/vectors.db";
 
+// kb_vec and l0_vec are deliberately NOT here: this tool recreates a table from its
+// own DDL and would put back the partition-key layout (one chunk per owner, the 8x
+// bloat) that tools/vec-compact.mts removes. Use tools/vec-compact.mts for those two.
 const TABLES = [
-  { name: "kb_vec", cols: ["chunk_id", "owner_id", "owner_kind", "embedding", "updated_time"] },
   { name: "l1_vec", cols: ["chunk_id", "record_id", "embedding", "updated_time"] },
-  { name: "l0_vec", cols: ["chunk_id", "record_id", "embedding", "recorded_at"] },
 ];
 
 function portUp(port: number): Promise<boolean> {
