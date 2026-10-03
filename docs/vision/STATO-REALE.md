@@ -6,7 +6,7 @@
 > [SINAPSYS_FOUNDATIONS](../SINAPSYS_FOUNDATIONS.md). Il quadro di tutti e 5 i sistemi:
 > `C:\RISTRUTTURAZIONE\04-I-CINQUE-SISTEMI.md`. Dove siamo adesso: `C:\RISTRUTTURAZIONE\00-STATO.md`.
 
-> **Aggiornato: 2026-08-23; audit di verità 2026-09-07.** Ogni numero qui è stato **misurato**,
+> **Aggiornato: 2026-08-23; audit di verità 2026-09-07; grande riparazione 2026-10-03 (§2-quater).** Ogni numero qui è stato **misurato**,
 > non ricordato — dove non è stato ri-misurato il 07/09 resta la data della sua ultima misura,
 > scritta accanto al numero (è un log cronologico, non lo stato di oggi).
 > **Questo è il documento da leggere PER PRIMO.** Tutti gli altri partono da qui.
@@ -126,6 +126,40 @@ la scrittura è la stessa funzione di prima (`handleTurnCommitted`), solo sposta
 (altrimenti `OPENAI_API_KEY`), `TDAI_FALLBACK_LLM_MODEL` (default `gpt-5.4-mini`), `TDAI_FALLBACK_LLM_MAX_TOKENS`,
 `TDAI_FALLBACK_LLM_TIMEOUT_MS`, `TDAI_FALLBACK_LLM_THINKING`. Su questa macchina `TDAI_LLM_MODEL=kimi-k2.6`
 sta in `C:\Users\lo\tdai-gateway\gateway.secrets.env` (non versionato), che `start-gateway.ps1` inietta.
+
+---
+
+## 2-quater. AGGIORNAMENTO 03/10/2026 — la grande riparazione (PR #15–#24)
+
+**Diagnosi del mattino** (`DIAGNOSI-RECALL-TIMEOUT-2026-10-03.md`, report in
+`SINAPSYS-PERCHE-NON-FUNZIONA-2026-10-03.md`, piano in `SINAPSYS-PIANO-TECNICO-2026-10-03.md`, tutti fuori
+da git nella radice del repo): recall annullato fino al 90%/giorno dal 28/09; ricordi usati **6%** (1,5% il
+03/10); ogni turno iniettato al tetto di 10.000 caratteri; livello proattivo mai collegato.
+
+| PR | Cosa | Prova |
+|---|---|---|
+| #15 | gateway: log con orario + rotazione, `gateway.crash.log`, `gateway.lock`, 503 `starting`, capture idempotente, header `X-TDAI-Deadline-Ms`, lag a finestra mobile | CI verde; avvio pronto in 5 s dal vivo |
+| #16 | plugin: `budget.ts` unico (test anti-deriva), allarmi letti prima di cancellarli, fallback L0 vero, backup esclusi dall'elezione, niente recall su notifiche/cron | 210 test plugin |
+| #17 | recall senza scansioni: `entities_fts`, `event_entities` (backfill sul DB vivo: 24.671 / 52.227 righe, conteggi esistenti invariati) | runKbRecall p95 1.905 → 233 ms sulla copia |
+| #18 | `start-gateway.ps1` installato fuori dal repo (PS 5.1 `$PSScriptRoot` vuoto nei default) | avvio dal vivo |
+| #19 | **PreToolUse** `/pretool`: lezioni e bug ricorrenti prima di Bash/Edit, deny solo se lezione attestata + azione irreversibile | hook 0,4–0,7 s dal vivo |
+| #20 | recall **selettivo**: soglia, max 5 righe, soggetto in ogni riga, progetto rigido, regolamento solo al 1° turno, rinforzo solo sull'uso, IBAN mascherato | replay 84 prompt: 15,6 → 0,96 righe/turno, 0 righe di altri progetti |
+| #21 | vec0 **compatto** (niente `partition key`) + `tools/vec-compact.mts` | DB vivo 5,3 → **1,26 GB**; 72.914 + 77.569 vettori, 500 per tabella identici byte per byte; `integrity_check` ok |
+| #22 | coseno da solo non basta: ≥ 3 punti di prompt e coseno ≥ 0,86 | "Riprova" → silenzio dal vivo |
+| #23 | **worker separato** (`src/worker/*`): estrazione, consolidamento, cornerstone, drain capture, indice nav fuori dal filo HTTP; fix FTS L0 (313–870 ms → ~1 ms per messaggio); `BEGIN IMMEDIATE` | bench su copia: /recall p99 19.727 → 79 ms; dal vivo `/health.worker.state=ready` |
+| #24 | taratura su verità del registro (`tools/recall-eval.mts`) | held-out: precisione 8,5% → 33,3%, 61% turni silenziosi, 0 righe fuori progetto, p95 57 ms |
+
+**Pulizie dati (Fase 6, autorizzate da Lorenzo 03/10, backup in `C:\Users\lo\tdai-backups\phase6-20261003\`):**
+118 ricordi "rumore cronico" azzerati (73 scesi da `long`); lezioni 71 → 62 (9 dati di prova cancellati, 17
+riattribuite); `state.json`/`alarms.json` spostati fuori dalle cartelle BACKUP; "FOCUS Sinapsys" spostato in
+`principles/tencentdb-agent-memory.md`; 9 copie vecchie del DB (17 GB) cancellate da Lorenzo.
+
+**Verità scomode che restano (misurate):**
+- **Richiamo basso:** sul registro, solo ~2% dei ricordi storicamente "usati" torna fuori a parità di silenzio.
+  Il tetto teorico è ~50% perché metà di quei ricordi è etichettata con un altro progetto, e il 74% non
+  condivide nessuna parola distintiva col prompt. Molti eventi di Sinapsys sono etichettati `Sofia-AI` o `''`.
+- **RAM:** gateway ~0,55 GB + worker ~1 GB su una macchina da 16 GB che spesso ha 1 GB libero.
+- **Utilità vera (≥ 30% usati)** si misura solo dopo giorni d'uso: `npx tsx tools/memory-verdict.mts --since 2026-10-04`.
 
 ---
 
