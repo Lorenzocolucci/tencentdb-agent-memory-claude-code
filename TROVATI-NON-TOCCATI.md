@@ -19,3 +19,5 @@
 | `src/core/kb/auto-recall.ts:904` | Leftover Chinese regex `活动时间`. | low |
 | `package.json` files | Package ships both `src/` and `dist/`; this is why the size ratchet had to go 1200 → 1260 KB. | low |
 | distinctiveness real-vectors integration test | Opens the live DB read-write and times out when the gateway holds it. | low |
+| `claude-code-plugin/lib/session-key.ts:29` (`getProjectName`) | Project = basename of cwd: worktrees (`C:\Argus\.claude\worktrees\agent-…`) and subfolders (`C:\Tutor-Agent\backend`) get their own label, so their memories are hidden from the main repo by hard project scope. Added 04/10. | med |
+| recall project scope (`src/core/kb/selective-recall.ts`, `projectsConflict`) | Scope is by WHERE the conversation happened, not WHAT it is about: 118 events about Sinapsys are labelled Argus / Sofia-AI / RISTRUTTURAZIONE, so "capture inbox" asked here finds nothing. Needs a subject-aware scope design, not a blind relabel. Added 04/10. | med |
