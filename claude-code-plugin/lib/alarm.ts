@@ -47,7 +47,13 @@ export type AlarmCode =
    * failures, must reach the user instead of hiding in the gateway's log.
    */
   | "capture-backlog"
-  | "capture-parked";
+  | "capture-parked"
+  /**
+   * 2026-10-03: recall timed out (or hit the UserPromptSubmit deadline) three
+   * prompts in a row. Each miss is silent on its own — the prompt just goes
+   * through without memory — so only the streak is worth a user-facing line.
+   */
+  | "recall-timeout";
 
 export interface AlarmRecord {
   code: AlarmCode;
@@ -134,23 +140,57 @@ export async function clearAlarm(dataDir: string, code: AlarmCode): Promise<void
   }
 }
 
+/** Pending alarms as one line, plus `ack()` to delete exactly those once shown. */
+export interface AlarmPeek {
+  line: string;
+  ack: () => Promise<void>;
+}
+
+function renderAlarmLine(alarms: AlarmRecord[]): string {
+  const parts = alarms.map((a) => {
+    const times = a.count > 1 ? ` (×${a.count}, dal ${a.firstSeen.slice(0, 16).replace("T", " ")})` : "";
+    return `${a.message}${times}`;
+  });
+  return `${PREFIX} — la memoria NON sta funzionando: ${parts.join(" · ")}`;
+}
+
+/**
+ * Render pending alarms WITHOUT deleting them. The caller writes its output and
+ * only then calls `ack()` — draining first lost the alarm whenever the hook was
+ * killed or stdout failed between the delete and the write (2026-10-03, R9).
+ *
+ * `ack()` removes only the records that were shown (same code + lastSeen), so an
+ * alarm raised after the peek survives. Never throws.
+ */
+export async function peekAlarms(dataDir: string): Promise<AlarmPeek> {
+  const shown = await readAlarms(dataDir);
+  if (shown.length === 0) return { line: "", ack: async () => {} };
+  const ack = async (): Promise<void> => {
+    try {
+      const current = await readAlarms(dataDir);
+      const next = current.filter(
+        (a) => !shown.some((s) => s.code === a.code && s.lastSeen === a.lastSeen),
+      );
+      if (next.length === current.length) return;
+      const path = join(dataDir, ALARM_FILE);
+      if (next.length === 0) await rm(path, { force: true });
+      else await writeFile(path, JSON.stringify(next, null, 1), { mode: 0o600 });
+    } catch {
+      // ignore
+    }
+  };
+  return { line: renderAlarmLine(shown), ack };
+}
+
 /**
  * Render pending alarms as a single user-facing line, then clear them.
+ * Prefer `peekAlarms` when the line is about to be written to stdout.
  *
  * Returns "" when everything is healthy, so the caller can simply skip the
  * `systemMessage` field.
  */
 export async function drainAlarms(dataDir: string): Promise<string> {
-  const alarms = await readAlarms(dataDir);
-  if (alarms.length === 0) return "";
-  const parts = alarms.map((a) => {
-    const times = a.count > 1 ? ` (×${a.count}, dal ${a.firstSeen.slice(0, 16).replace("T", " ")})` : "";
-    return `${a.message}${times}`;
-  });
-  try {
-    await rm(join(dataDir, ALARM_FILE), { force: true });
-  } catch {
-    // ignore
-  }
-  return `${PREFIX} — la memoria NON sta funzionando: ${parts.join(" · ")}`;
+  const peek = await peekAlarms(dataDir);
+  await peek.ack();
+  return peek.line;
 }

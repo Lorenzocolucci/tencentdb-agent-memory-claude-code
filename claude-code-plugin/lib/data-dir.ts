@@ -168,8 +168,13 @@ export function resolveDataDirDetailed(opts: ResolveOptions): DataDirResolution 
   const root = findPluginsDataRoot(opts.scriptPath);
   const candidates = root ? findOwnDataDirs(root) : [];
   if (candidates.length > 0) {
-    const alive = candidates.filter((c) => isAlive(c.pid));
-    const pool = alive.length > 0 ? alive : candidates;
+    // A backup may win only when NOTHING else exists: drop backups BEFORE the
+    // PID-alive filter, or a dead live PID + a stale-but-alive backup PID lets
+    // the archive win (2026-10-03, R9).
+    const nonBackup = candidates.filter((c) => !c.isBackup);
+    const eligible = nonBackup.length > 0 ? nonBackup : candidates;
+    const alive = eligible.filter((c) => isAlive(c.pid));
+    const pool = alive.length > 0 ? alive : eligible;
     const winner = pool[0];
     return {
       dir: winner.dir,
