@@ -136,6 +136,8 @@ export interface RecalledMemory {
   content: string;
   score: number;
   type: string;
+  /** KB owner id (fact/event) when the memory came from the KB path — lets tools audit what was shown. */
+  ownerId?: string;
 }
 
 export interface RecallResult {
@@ -264,7 +266,7 @@ async function performAutoRecallInner(params: {
         return {
           lines: kbResults.map((r) => formatKbRecallLine(r)),
           strategy: "kb",
-          memories: kbResults.map((r) => ({ content: r.text, score: r.score, type: r.owner_kind })),
+          memories: kbResults.map((r) => ({ content: r.text, score: r.score, type: r.owner_kind, ownerId: r.owner_id })),
           timing: { ftsMs: 0, embeddingMs: performance.now() - tKb, ftsHits: 0, embeddingHits: kbResults.length },
         };
       }
