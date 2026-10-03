@@ -17,10 +17,10 @@ export function formatCrashEntry(kind: CrashKind, err: unknown, now: Date = new 
 }
 
 /** Append one entry. Never throws: a failing black box must not mask the crash. */
-export function writeCrashLog(dataDir: string, kind: CrashKind, err: unknown): void {
+export function writeCrashLog(dataDir: string, kind: CrashKind, err: unknown, file: string = CRASH_LOG_FILE): void {
   try {
     mkdirSync(dataDir, { recursive: true });
-    appendFileSync(join(dataDir, CRASH_LOG_FILE), formatCrashEntry(kind, err), "utf-8");
+    appendFileSync(join(dataDir, file), formatCrashEntry(kind, err), "utf-8");
   } catch (writeErr) {
     process.stderr.write(`tdai-memory-gateway: could not write ${CRASH_LOG_FILE}: ${String(writeErr)}\n`);
   }
@@ -35,9 +35,10 @@ export function installCrashHandlers(
   dataDir: string,
   exit: (code: number) => void = (code) => process.exit(code),
   target: CrashHandlerTarget = process,
+  file: string = CRASH_LOG_FILE,
 ): void {
   const handle = (kind: CrashKind) => (err: unknown): void => {
-    writeCrashLog(dataDir, kind, err);
+    writeCrashLog(dataDir, kind, err, file);
     process.stderr.write(`tdai-memory-gateway: fatal ${kind}: ${String(err)}\n`);
     exit(1);
   };

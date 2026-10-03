@@ -38,6 +38,8 @@ export interface GatewayLock {
 
 export interface GatewayLockOptions {
   pid?: number;
+  /** Lock file name inside the data dir (default `gateway.lock`; the worker uses `worker.lock`). */
+  fileName?: string;
   /** Injectable liveness probe (tests). */
   isAlive?: (pid: number) => boolean;
 }
@@ -92,7 +94,7 @@ async function isStale(path: string, isAlive: (pid: number) => boolean): Promise
 export async function acquireGatewayLock(dataDir: string, opts: GatewayLockOptions = {}): Promise<GatewayLock> {
   const pid = opts.pid ?? process.pid;
   const isAlive = opts.isAlive ?? isPidAlive;
-  const path = join(dataDir, GATEWAY_LOCK_FILE);
+  const path = join(dataDir, opts.fileName ?? GATEWAY_LOCK_FILE);
 
   for (let attempt = 0; attempt < 2; attempt++) {
     if (await tryCreate(path, pid)) {

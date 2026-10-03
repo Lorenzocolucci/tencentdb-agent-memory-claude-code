@@ -53,6 +53,24 @@ export interface HealthResponse {
     machineFree: number;
     machineTotal: number;
   };
+  /** Event-loop lag of the gateway process over a rolling 10 s window (ms). Phase 5 target: p99 < 200. */
+  event_loop?: {
+    p99Ms: number;
+    maxMs: number;
+    meanMs: number;
+  };
+  /** Worker process (absent in inline mode). A restarting worker does NOT make the gateway unhealthy. */
+  worker?: {
+    state: "starting" | "ready" | "down" | "stopped";
+    pid: number | null;
+    restarts: number;
+    heartbeat_age_s: number | null;
+    rss: number | null;
+    /** Heavy tasks running in the worker right now. */
+    active: string[];
+    lag_p99_ms: number | null;
+    lag_max_ms: number | null;
+  };
 }
 
 // ============================

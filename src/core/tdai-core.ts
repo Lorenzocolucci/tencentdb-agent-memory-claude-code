@@ -31,6 +31,7 @@ import type {
 } from "./types.js";
 import type { MemoryTdaiConfig } from "../config.js";
 import type { IMemoryStore } from "./store/types.js";
+import type { CoreRole, HeavyWorkDelegate, ApplyDeltaOptions } from "./heavy-delegate.js";
 import type { EmbeddingService } from "./store/embedding.js";
 import { scheduleConsolidation } from "./kb/consolidation-scheduler.js";
 import { captureSessionRecap } from "./continuity/recap-capture.js";
@@ -105,6 +106,16 @@ import { StandaloneLLMRunnerFactory } from "../adapters/standalone/llm-runner.js
  */
 const DISTILLATION_COOLDOWN_MS = 30 * 60 * 1000;
 
+/**
+ * The cornerstone block is corpus-wide, not per-session: the worker computes it once
+ * and serves every session from that result for this long (a recall used to trigger
+ * a fresh build for every new session key - ~140 s of KNN scans each at eventLimit 200).
+ */
+export const CORNERSTONE_COOLDOWN_MS = 10 * 60 * 1000;
+
+/** busy_timeout of the gateway's connection: a write the worker is blocking fails fast instead of freezing the HTTP loop. */
+export const GATEWAY_BUSY_TIMEOUT_MS = 250;
+
 function yieldToMacrotask(): Promise<void> {
   return new Promise<void>((resolve) => setImmediate(resolve));
 }
@@ -149,6 +160,15 @@ export interface TdaiCoreOptions {
   sessionFilter?: SessionFilter;
   /** Plugin instance ID for metric reporting. */
   instanceId?: string;
+  /**
+   * Process role (Phase 5). `full` (default) = everything in this process.
+   * `gateway` = HTTP side: no pipeline scheduler, nav index follows the worker's
+   * snapshot, heavy work goes through `heavyDelegate`. `worker` = the process that
+   * owns every heavy job (schedulers, extraction, distillation, cornerstone, nav build).
+   */
+  role?: CoreRole;
+  /** For `role: "gateway"`: forwards heavy work to the worker process. */
+  heavyDelegate?: HeavyWorkDelegate;
 }
 
 /**
@@ -272,8 +292,16 @@ export class TdaiCore {
   /** Session keys whose cornerstone block is being built off-path — dedupes the
    *  concurrent turns that arrive before the first background build commits. */
   private readonly cornerstoneInFlight = new Set<string>();
+  /** Phase 5: which process this core lives in (see {@link TdaiCoreOptions.role}). */
+  private readonly role: CoreRole;
+  private heavyDelegate?: HeavyWorkDelegate;
+  /** Worker: the corpus-wide cornerstone block, its build time and the in-flight build. */
+  private cornerstoneShared?: { block: string; at: number };
+  private cornerstoneSharedBuild?: Promise<string | undefined>;
 
   constructor(opts: TdaiCoreOptions) {
+    this.role = opts.role ?? "full";
+    this.heavyDelegate = opts.heavyDelegate;
     this.hostAdapter = opts.hostAdapter;
     this.cfg = opts.config;
     this.logger = opts.hostAdapter.getLogger();
@@ -299,7 +327,7 @@ export class TdaiCore {
     this.storeReady = this.initStores();
 
     // Create pipeline manager (sync — does not need store)
-    if (this.cfg.extraction.enabled) {
+    if (this.cfg.extraction.enabled && this.role !== "gateway") {
       this.scheduler = createPipelineManager(this.cfg, this.logger, this.sessionFilter);
       // Wire runners after store is ready (or after store init fails — runners
       // still work in degraded mode with JSONL fallback and no embedding)
@@ -520,6 +548,23 @@ export class TdaiCore {
     if (this.cornerstoneCache.get(key) !== undefined) return; // already committed
     const store = this.vectorStore;
     this.cornerstoneInFlight.add(key);
+    if (this.role === "gateway") {
+      // The worker builds (and caches corpus-wide with a cooldown); we only commit its answer.
+      const delegate = this.heavyDelegate;
+      void (async () => {
+        try {
+          const block = await delegate?.buildCornerstone(key);
+          if (block !== undefined) this.cornerstoneCache.commit(key, block);
+        } catch (err) {
+          this.logger.debug?.(
+            `[memory-tdai] cornerstone worker build skipped (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        } finally {
+          this.cornerstoneInFlight.delete(key);
+        }
+      })();
+      return;
+    }
     void (async () => {
       try {
         const block = await buildCornerstones({
@@ -678,6 +723,7 @@ export class TdaiCore {
     ownerKind: "fact" | "event";
     decision: "confirm" | "reject";
   }): Promise<{ ok: boolean; text: string }> {
+    if (this.role === "gateway" && this.heavyDelegate) return this.heavyDelegate.resolveGated(params);
     await this.storeReady?.catch(() => {});
     const store = this.vectorStore;
     if (!store) return { ok: false, text: "Memory store unavailable." };
@@ -710,8 +756,9 @@ export class TdaiCore {
    */
   async applyDelta(
     delta: KbDelta,
-    opts: { namespace?: string; project?: string; sessionKey?: string; sessionId?: string } = {},
+    opts: ApplyDeltaOptions = {},
   ): Promise<ApplyKbDeltaResult> {
+    if (this.role === "gateway" && this.heavyDelegate) return this.heavyDelegate.applyDelta(delta, opts);
     await this.storeReady?.catch(() => {});
     const store = this.vectorStore;
     if (!isKbWriterStore(store)) {
@@ -831,6 +878,16 @@ export class TdaiCore {
       return;
     }
     this.distillationNextAllowedAt = now + DISTILLATION_COOLDOWN_MS;
+
+    // Gateway: the passes are seconds of synchronous SQLite - they run in the worker.
+    if (this.role === "gateway") {
+      try {
+        this.heavyDelegate?.scheduleDistillation();
+      } catch (err) {
+        this.logger.debug?.(`${TAG} [distillation] delegate failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
 
     const runnerFactory = this.runnerFactory;
     const logger = this.logger;
@@ -976,6 +1033,13 @@ export class TdaiCore {
 
   async handleSessionEnd(sessionKey: string): Promise<void> {
     if (!sessionKey) return;
+    if (this.role === "gateway") {
+      await this.heavyDelegate?.sessionEnd(sessionKey);
+      this.injectedFilesBySession.delete(sessionKey);
+      this.sessionSituationByKey.delete(sessionKey);
+      this.injectedOwnersBySession.delete(sessionKey);
+      return;
+    }
     await this.storeReady?.catch(() => {});
 
     // Immune system: ensure the scheduler is STARTED (per-session pipeline state
@@ -1458,6 +1522,64 @@ export class TdaiCore {
   }
 
   // ============================
+  // Worker-side entry points (called by the worker process on gateway requests)
+  // ============================
+
+  /**
+   * Worker: the corpus-wide cornerstone block, built at most once per
+   * {@link CORNERSTONE_COOLDOWN_MS}; concurrent callers share the one in-flight build.
+   * (The gateway used to start a build per new session key.) Never rejects.
+   * Resolves `undefined` ("not ready, do not cache") while the nav index is still loading: the
+   * neighbour scans would fall back to a brute-force KNN of ~10 s EACH over the whole corpus.
+   */
+  async buildCornerstoneShared(): Promise<string | undefined> {
+    await this.storeReady?.catch(() => {});
+    const cached = this.cornerstoneShared;
+    if (cached && Date.now() - cached.at < CORNERSTONE_COOLDOWN_MS) return cached.block;
+    if (this.cornerstoneSharedBuild) return this.cornerstoneSharedBuild;
+    const store = this.vectorStore;
+    if (!store) return "";
+    const navActive = (store as { isKbNavIndexActive?: () => boolean }).isKbNavIndexActive;
+    if (typeof navActive === "function" && !navActive.call(store)) return undefined;
+    const build = (async () => {
+      try {
+        const block = await buildCornerstones({
+          vectorStore: store,
+          embeddingService: this.embeddingService,
+          injectionTracker: this.cornerstoneTracker,
+          logger: this.logger,
+        });
+        this.cornerstoneShared = { block, at: Date.now() };
+        return block;
+      } catch (err) {
+        this.logger.warn(
+          `[memory-tdai] cornerstone worker build failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return "";
+      } finally {
+        this.cornerstoneSharedBuild = undefined;
+      }
+    })();
+    this.cornerstoneSharedBuild = build;
+    return build;
+  }
+
+  /** Worker: run the distillation passes now (its own cooldown still applies). */
+  scheduleDistillationNow(): void {
+    this.scheduleBackgroundDistillation();
+  }
+
+  /** Install / replace the delegate of a `gateway` core (the supervisor is created after the core). */
+  setHeavyDelegate(delegate: HeavyWorkDelegate | undefined): void {
+    this.heavyDelegate = delegate;
+  }
+
+  /** Resolves once the stores are initialised (or failed to). */
+  async whenStoresReady(): Promise<void> {
+    await this.storeReady?.catch(() => {});
+  }
+
+  // ============================
   // Accessors (for migration bridge)
   // ============================
 
@@ -1500,7 +1622,12 @@ export class TdaiCore {
 
   private async initStores(): Promise<void> {
     try {
-      const stores = await initStores(this.cfg, this.dataDir, this.logger);
+      const stores = await initStores(
+        this.cfg,
+        this.dataDir,
+        this.logger,
+        this.role === "gateway" ? { busyTimeoutMs: GATEWAY_BUSY_TIMEOUT_MS, kbNavRole: "follower" } : undefined,
+      );
       this.vectorStore = stores.vectorStore;
       this.embeddingService = stores.embeddingService;
       this.logger.debug?.(`${TAG} Stores initialized: backend=${this.cfg.storeBackend}, embedding=${this.cfg.embedding.provider}`);
@@ -1639,6 +1766,7 @@ export class TdaiCore {
    * it and triggered recovery). Idempotent via {@link ensureSchedulerStarted}.
    */
   async resumeExtraction(): Promise<void> {
+    if (this.role === "gateway") return; // the worker resumes extraction at its own boot
     await this.storeReady?.catch(() => {});
     await this.ensureSchedulerStarted();
   }
@@ -1653,6 +1781,7 @@ export class TdaiCore {
    */
   async digestBacklogSession(sessionKey: string): Promise<{ processedCount: number }> {
     if (!sessionKey) return { processedCount: 0 };
+    if (this.role === "gateway" && this.heavyDelegate) return this.heavyDelegate.digest(sessionKey);
     await this.storeReady?.catch(() => {});
     if (!this.scheduler) return { processedCount: 0 };
     const res = await this.scheduler.digestBacklogSession(sessionKey);

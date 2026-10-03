@@ -15,6 +15,8 @@
  *                       TDAI_GATEWAY_ALLOW_REMOTE=1 to opt in (defence in depth).
  *   TDAI_DATA_DIR       data root
  *   TDAI_CC_PID         (optional) parent process pid; daemon self-exits when it dies
+ *   TDAI_WORKER         `inline` = run heavy jobs inside this process (rollback switch);
+ *                       default = a supervised worker process owns every heavy job
  *
  * Designed for use by host-agnostic plugins (Claude Code, Codex CLI) that spawn
  * the Gateway as a sidecar without bundling npm dependencies.
@@ -65,7 +67,11 @@ async function main(): Promise<void> {
   assertSafeHost();
   loadTokenFromFile();
   installCrashHandlers(loadGatewayConfig().data.baseDir);
-  const gateway = new TdaiGateway();
+  // Phase 5: heavy work runs in a supervised worker process. TDAI_WORKER=inline is the
+  // rollback switch back to the single-process behaviour.
+  const gateway = new TdaiGateway(undefined, {
+    workerMode: process.env.TDAI_WORKER?.trim().toLowerCase() === "inline" ? "inline" : "process",
+  });
 
   let shuttingDown = false;
   const shutdown = async (reason: string): Promise<void> => {
@@ -74,7 +80,8 @@ async function main(): Promise<void> {
     try {
       await Promise.race([
         gateway.stop(),
-        new Promise<void>((r) => setTimeout(r, 5_000)),
+        // 15 s: in process mode stop() waits for the worker to finish its current capture item.
+        new Promise<void>((r) => setTimeout(r, 15_000)),
       ]);
     } catch {
       // best effort
