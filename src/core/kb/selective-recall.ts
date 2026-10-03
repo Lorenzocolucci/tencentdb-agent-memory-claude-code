@@ -145,7 +145,7 @@ export function relevanceScore(
 ): number {
   const vector = e.cosine != null ? clamp01(e.cosine) : 0;
   const needed = e.entityMatch ? gate.anchoredMinPoints : gate.minPoints;
-  if (e.points < needed || e.maxPoints <= 0) return vector;
+  if (e.points < needed || e.maxPoints <= 0) return vectorOnlyRelevance(vector, e.maxPoints);
   const coverage = Math.min(1, e.points / Math.min(e.maxPoints, 2 * needed));
   // No BM25 score (the candidate came from the entity-name source): an anchored memory that
   // already earned its evidence points is as strong as a good FTS hit; an un-anchored one is not.
@@ -153,6 +153,20 @@ export function relevanceScore(
   let lexical = lexicalBase * (0.5 + 0.5 * coverage);
   if (e.entityMatch) lexical = Math.min(1, lexical + 0.1 * coverage);
   return Math.max(vector, clamp01(lexical));
+}
+
+/**
+ * A cosine with no lexical evidence behind it. Measured live (2026-10-03): Qwen3-4B
+ * puts one-word prompts at ~0.81-0.83 against unrelated memories ("Riprova" pulled
+ * "... — Procedi"), so the raw cosine alone is only trusted for a prompt with enough
+ * distinctive words AND a cosine above that band.
+ */
+export const VECTOR_ONLY_MIN_COSINE = 0.86;
+export const VECTOR_ONLY_MIN_PROMPT_POINTS = 3;
+
+function vectorOnlyRelevance(vector: number, maxPoints: number): number {
+  if (maxPoints < VECTOR_ONLY_MIN_PROMPT_POINTS) return 0;
+  return vector >= VECTOR_ONLY_MIN_COSINE ? vector : 0;
 }
 
 function clamp01(v: number): number {

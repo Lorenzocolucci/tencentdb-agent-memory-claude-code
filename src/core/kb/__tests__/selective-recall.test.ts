@@ -54,8 +54,11 @@ describe("evidence points and the relevance gate", () => {
     expect(relevanceScore({ ...e, points: 2 }, GATE)).toBe(0);
     expect(relevanceScore({ ...e, points: 3 }, GATE)).toBeGreaterThan(0.45);
   });
-  it("a vector hit carries its own cosine even without lexical evidence", () => {
-    expect(relevanceScore({ entityMatch: false, cosine: 0.71, points: 0, maxPoints: 3 }, GATE)).toBe(0.71);
+  // 2026-10-03 (approved by Lorenzo): reversed. Live, a bare cosine of ~0.8 matched
+  // unrelated memories for short prompts ("Riprova"); without lexical evidence a
+  // vector hit needs a richer prompt and a cosine >= VECTOR_ONLY_MIN_COSINE.
+  it("a vector hit without lexical evidence does not inject at a mid cosine", () => {
+    expect(relevanceScore({ entityMatch: false, cosine: 0.71, points: 0, maxPoints: 3 }, GATE)).toBe(0);
   });
   it("the score is a real number, not the old constant 0.50 for every rank-0 hit", () => {
     const hi = relevanceScore({ entityMatch: false, ftsScore: 0.95, points: 6, maxPoints: 6 }, GATE);
