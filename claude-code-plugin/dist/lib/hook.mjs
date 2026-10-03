@@ -152,7 +152,8 @@ var GatewayClient = class {
 				context: parsed.context ?? "",
 				error: null,
 				strategy: parsed.strategy,
-				memory_count: parsed.memory_count
+				memory_count: parsed.memory_count,
+				...parsed.silent === true ? { silent: true } : {}
 			};
 		} catch (err) {
 			await this.logFailure("POST", "/recall", err instanceof Error ? err.message : String(err));
@@ -1307,6 +1308,10 @@ async function recallWithFallbacks(client, prompt, sessionKey, project, sessionI
 	const recall = await client.recall(prompt, sessionKey, project, sessionId);
 	const error = recall.error ?? null;
 	let context = recall.context ?? "";
+	if (!context && error === null && recall.silent === true) return {
+		context: "",
+		error
+	};
 	if (!context && error === null) {
 		const remaining = deadlineAt - Date.now();
 		if (remaining >= 1500) {

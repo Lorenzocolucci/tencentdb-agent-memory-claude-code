@@ -76,6 +76,8 @@ export interface RecallResult {
   error?: RecallError;
   strategy?: string;
   memory_count?: number;
+  /** The gateway completed recall and chose to inject nothing — not a failure, no fallbacks. */
+  silent?: boolean;
 }
 
 export interface CaptureTurnPayload {
@@ -241,6 +243,7 @@ export class GatewayClient {
         error: null,
         strategy: parsed.strategy,
         memory_count: parsed.memory_count,
+        ...(parsed.silent === true ? { silent: true } : {}),
       };
     } catch (err) {
       await this.logFailure("POST", "/recall", err instanceof Error ? err.message : String(err));
