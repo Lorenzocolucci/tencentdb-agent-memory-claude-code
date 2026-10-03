@@ -19,22 +19,14 @@
 import http from "node:http";
 import { appendFile, readFile } from "node:fs/promises";
 import { URL } from "node:url";
+import { CAPTURE_TIMEOUT_MS, OBSERVE_TIMEOUT_MS, RECALL_TIMEOUT_MS } from "./budget.js";
 
-// --- Named timeout constants (Phase 3: HOOK CLIENT TIMEOUT) ---
-/** Recall timeout: must not hang the prompt; kept short and non-blocking.
- *  Defence-in-depth at 6s (was 4s): the corpus-embedding that used to push the
- *  first-turn recall to ~5s is now built off the critical path (see
- *  tdai-core.buildCornerstoneInBackground), so recall is normally <1s. 6s still
- *  bounds the prompt but no longer clips a legitimately slow (cold/contended)
- *  query embedding, which silently dropped the whole session-open injection. */
-export const RECALL_TIMEOUT_MS = 6_000;
-/** Capture timeout: session save is more important; allow extra time for a
- *  slow gateway write-through before declaring the save lost. */
-export const CAPTURE_TIMEOUT_MS = 12_000;
+// --- Timeouts live in ./budget.ts (single source of truth, drift-tested against hooks.json) ---
+export { CAPTURE_TIMEOUT_MS, RECALL_TIMEOUT_MS };
 
 /**
  * The capture timeout the client actually uses. Live hooks keep the 12s
- * default (the Stop hook has a 30s budget in hooks.json and retries once).
+ * default (the Stop hook has a 45s budget in hooks.json, 40s internal, and retries once).
  * An OFFLINE replay (tools/backfill-cc-sessions.mts) is a different animal:
  * a never-captured 18 MB transcript sends its last 50 turns in one call and
  * the gateway needs well over 12s to write them. Measured 2026-09-05: every
@@ -56,6 +48,8 @@ export interface GatewayClientConfig {
   baseUrl: string;
   token: string;
   timeoutMs?: number;
+  /** Override for POST /recall (tests only). Defaults to RECALL_TIMEOUT_MS. */
+  recallTimeoutMs?: number;
   /** If set, every fallthrough error is appended here as one line. */
   logPath?: string;
   /**
@@ -66,8 +60,13 @@ export interface GatewayClientConfig {
   tokenPath?: string;
 }
 
+/** Why a recall produced nothing: no answer in time, or nobody listening. null = the gateway answered. */
+export type RecallError = "timeout" | "refused" | null;
+
 export interface RecallResult {
   context: string;
+  /** Optional so older fakes keep compiling; the real client always sets it. */
+  error?: RecallError;
   strategy?: string;
   memory_count?: number;
 }
@@ -78,6 +77,8 @@ export interface CaptureTurnPayload {
   session_key: string;
   session_id?: string;
   messages?: Array<{ role: string; content: string }>;
+  /** sha1(session_id:lastSent:turns) — the gateway dedups retried captures by it. */
+  idempotency_key?: string;
 }
 
 export interface CaptureTurnResult {
@@ -122,6 +123,7 @@ export class GatewayClient {
   private baseUrl: URL;
   private token: string;
   private timeoutMs: number;
+  private recallTimeoutMs: number;
   private logPath?: string;
   /** Path to the token file; when set, token is always read fresh from disk. */
   private tokenPath?: string;
@@ -130,6 +132,7 @@ export class GatewayClient {
     this.baseUrl = new URL(config.baseUrl);
     this.token = config.token;
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.recallTimeoutMs = config.recallTimeoutMs ?? RECALL_TIMEOUT_MS;
     this.logPath = config.logPath;
     this.tokenPath = config.tokenPath;
   }
@@ -209,25 +212,28 @@ export class GatewayClient {
   }
 
   async recall(query: string, sessionKey: string, project?: string, sessionId?: string): Promise<RecallResult> {
-    // Recall uses RECALL_TIMEOUT_MS — short, non-blocking (Phase 3: HOOK CLIENT TIMEOUT).
+    // The deadline header tells the gateway how long this client waits, so it can
+    // give up first instead of working for a caller that already left.
     try {
       const token = await this.freshToken();
       const { status, body } = await this.rawRequest(
-        "POST", "/recall", { query, session_key: sessionKey, project, session_id: sessionId }, token, RECALL_TIMEOUT_MS,
+        "POST", "/recall", { query, session_key: sessionKey, project, session_id: sessionId }, token,
+        this.recallTimeoutMs, { "X-TDAI-Deadline-Ms": String(this.recallTimeoutMs) },
       );
       if (status !== 200) {
         await this.logFailure("POST", "/recall", this.describeStatus(status, body));
-        return { context: "" };
+        return { context: "", error: null };
       }
       const parsed = JSON.parse(body) as RecallResult;
       return {
         context: parsed.context ?? "",
+        error: null,
         strategy: parsed.strategy,
         memory_count: parsed.memory_count,
       };
     } catch (err) {
       await this.logFailure("POST", "/recall", err instanceof Error ? err.message : String(err));
-      return { context: "" };
+      return { context: "", error: classifyRecallError(err) };
     }
   }
 
@@ -264,7 +270,7 @@ export class GatewayClient {
           tool_risk: payload.toolRisk,
         },
         token,
-        RECALL_TIMEOUT_MS,
+        OBSERVE_TIMEOUT_MS,
       );
       if (status !== 200) {
         await this.logFailure("POST", "/observe", this.describeStatus(status, body));
@@ -355,7 +361,7 @@ export class GatewayClient {
 
   async searchConversations(
     query: string,
-    opts?: { limit?: number; sessionKey?: string },
+    opts?: { limit?: number; sessionKey?: string; timeoutMs?: number },
   ): Promise<SearchResult> {
     try {
       const token = await this.freshToken();
@@ -363,7 +369,7 @@ export class GatewayClient {
         query,
         limit: opts?.limit,
         session_key: opts?.sessionKey,
-      }, token);
+      }, token, opts?.timeoutMs);
       if (status !== 200) {
         await this.logFailure("POST", "/search/conversations", this.describeStatus(status, body));
         return { results: "", total: 0 };
@@ -434,6 +440,7 @@ export class GatewayClient {
     bodyObj: unknown,
     token: string,
     timeoutMs?: number,
+    extraHeaders?: Record<string, string>,
   ): Promise<{ status: number; body: string }>;
   private rawRequest(
     method: string,
@@ -441,6 +448,7 @@ export class GatewayClient {
     bodyObj?: undefined,
     token?: string,
     timeoutMs?: number,
+    extraHeaders?: Record<string, string>,
   ): Promise<{ status: number; body: string }>;
   private rawRequest(
     method: string,
@@ -448,6 +456,7 @@ export class GatewayClient {
     bodyObj?: unknown,
     token: string = this.token,
     timeoutMs: number = this.timeoutMs,
+    extraHeaders: Record<string, string> = {},
   ): Promise<{ status: number; body: string }> {
     return new Promise((resolve, reject) => {
       const bodyStr = bodyObj !== undefined ? JSON.stringify(bodyObj) : undefined;
@@ -459,6 +468,7 @@ export class GatewayClient {
         path,
         headers: {
           Authorization: `Bearer ${token}`,
+          ...extraHeaders,
           ...(bodyStr
             ? {
                 "Content-Type": "application/json",
@@ -488,4 +498,16 @@ export class GatewayClient {
       req.end();
     });
   }
+}
+
+/** Map a transport error onto the two recall failure modes; anything else is "answered badly" (null). */
+export function classifyRecallError(err: unknown): RecallError {
+  const msg = err instanceof Error ? err.message : String(err);
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  if (/^Timeout after/.test(msg) || code === "ETIMEDOUT") return "timeout";
+  if (code === "ECONNREFUSED" || code === "ECONNRESET" || code === "EHOSTUNREACH") return "refused";
+  if (err instanceof AggregateError && err.errors.some((e) => (e as NodeJS.ErrnoException)?.code === "ECONNREFUSED")) {
+    return "refused";
+  }
+  return null;
 }
