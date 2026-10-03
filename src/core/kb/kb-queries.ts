@@ -20,6 +20,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { canonicalizeAttribute } from "./attribute-canon-map.js";
+import { ftsEntityMatches, ftsEventIdsForEntity } from "./kb-index.js";
 import type {
   KbEntity,
   KbEvent,
@@ -954,9 +955,15 @@ export function queryEventById(db: DatabaseSync, id: string): KbEvent | null {
  * token. This is a deterministic lexical recall path (NO LLM, NO embedding) so
  * "Sofia" finds the Sofia project even when the vector side is weak.
  *
- * Matching is done in JS against the lightweight entity set (entities are the
- * smallest KB table — one row per real-world thing), which keeps the SQL a
- * single bounded scan and the match logic readable + alias-aware. The query is
+ * FAST PATH (Phase 2.1): once the `entities_fts` index is ready (see kb-index.ts)
+ * the match is an FTS5 whole-word lookup — no table scan, no JSON alias parse.
+ * Differences vs the legacy path, by design: a token matches a WORD of the name /
+ * alias / canonical_key (tokenized on non-alphanumerics, diacritics folded), not
+ * an arbitrary substring ("gate" no longer matches "gateway"); each token
+ * contributes at most 1000 entities; ties keep oldest-entity-first order.
+ *
+ * LEGACY PATH (index not backfilled yet): matching is done in JS against the
+ * whole entity set (a full scan), alias-aware, substring-based. The query is
  * scoped by namespace; an empty token list returns nothing.
  */
 export function queryEntitiesByTokens(
@@ -967,6 +974,9 @@ export function queryEntitiesByTokens(
 ): KbEntity[] {
   const normTokens = [...new Set(tokens.map((t) => normalizeBase(t)).filter((t) => t.length > 0))];
   if (normTokens.length === 0) return [];
+
+  const fastIds = ftsEntityMatches(db, normTokens, namespace, limit);
+  if (fastIds) return fetchEntitiesInOrder(db, fastIds);
 
   // Exclude entities merged away by Cura #2 (their facts are re-keyed onto the
   // canonical, which carries their name as an alias — so recall still finds the
@@ -996,6 +1006,23 @@ export function queryEntitiesByTokens(
     .sort((a, b) => b.matches - a.matches)
     .slice(0, limit)
     .map((s) => s.entity);
+}
+
+/** Load entities by id (merged-away satellites excluded), preserving the given order. */
+function fetchEntitiesInOrder(db: DatabaseSync, ids: string[]): KbEntity[] {
+  if (ids.length === 0) return [];
+  const rows = db
+    .prepare(
+      `SELECT * FROM entities WHERE id IN (${ids.map(() => "?").join(",")}) AND merged_into IS NULL`,
+    )
+    .all(...ids) as Array<Record<string, unknown>>;
+  const byId = new Map(rows.map((r) => [r.id as string, r]));
+  const out: KbEntity[] = [];
+  for (const id of ids) {
+    const row = byId.get(id);
+    if (row) out.push(rowToEntity(row));
+  }
+  return out;
 }
 
 // ============================================================================
@@ -1188,6 +1215,11 @@ export function queryEventsForEntity(
   const ns = namespace?.trim() || "default";
   const cap = clampLimit(limit, 50);
 
+  // FAST PATH (Phase 2.2): indexed join table, no scan. Same ordering and the
+  // same exact-membership semantics as the legacy path below.
+  const fastIds = ftsEventIdsForEntity(db, id, ns, cap);
+  if (fastIds) return fetchEventsInOrder(db, fastIds);
+
   // LIKE pre-filter on the JSON column narrows the scan to rows that mention the
   // id at all; the authoritative check is the parsed-array membership below
   // (avoids false positives from a substring match across ids).
@@ -1206,6 +1238,21 @@ export function queryEventsForEntity(
       out.push(event);
       if (out.length >= cap) break;
     }
+  }
+  return out;
+}
+
+/** Load events by id, preserving the given order. */
+function fetchEventsInOrder(db: DatabaseSync, ids: string[]): KbEvent[] {
+  if (ids.length === 0) return [];
+  const rows = db
+    .prepare(`SELECT * FROM events WHERE id IN (${ids.map(() => "?").join(",")})`)
+    .all(...ids) as Array<Record<string, unknown>>;
+  const byId = new Map(rows.map((r) => [r.id as string, r]));
+  const out: KbEvent[] = [];
+  for (const id of ids) {
+    const row = byId.get(id);
+    if (row) out.push(rowToEvent(row));
   }
   return out;
 }

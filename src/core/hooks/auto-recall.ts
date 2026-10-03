@@ -10,7 +10,6 @@
  * - L2 scene navigation (full injection, LLM decides relevance)
  */
 
-import fs from "node:fs/promises";
 import path from "node:path";
 import type { MemoryTdaiConfig } from "../../config.js";
 import { readSceneIndex } from "../scene/scene-index.js";
@@ -21,11 +20,13 @@ import { buildFtsQuery } from "../store/sqlite.js";
 import type { EmbeddingService, EmbeddingCallOptions } from "../store/embedding.js";
 import { sanitizeText, escapeXmlTags } from "../../utils/sanitize.js";
 import { redactSecrets } from "../../utils/redact-secrets.js";
-import { kbRecall, type KbRecallResult } from "../kb/retrieval.js";
+import { kbRecall, type KbRecallResult, type PhaseTimings } from "../kb/retrieval.js";
+import { isSlowRecall } from "../diagnostics/slow-recall.js";
+import { readPersonaCached, loadPrinciplesCached } from "./projection-cache.js";
 import { buildSituationSeeds } from "../kb/situation-cue.js";
 import { assessRecallConfidence } from "../kb/recall-confidence.js";
 import type { SessionSituation } from "./session-situation.js";
-import { loadPrinciples, formatPrinciplesBlock } from "./principles.js";
+import { formatPrinciplesBlock } from "./principles.js";
 import { buildSessionBanner, type SessionBannerTracker } from "./session-banner.js";
 import { latestRecapBlock } from "../continuity/recap-retrieval.js";
 import { captureRolloverRecap } from "../continuity/recap-rollover.js";
@@ -259,7 +260,7 @@ async function performAutoRecallInner(params: {
         const kbResults = await runKbRecall(userText, cfg, logger, vectorStore, embeddingService, projectName, {
           sessionKey: params.sessionKey,
           namespace: "default",
-        });
+        }, { deferWrites: true });
         return {
           lines: kbResults.map((r) => formatKbRecallLine(r)),
           strategy: "kb",
@@ -316,10 +317,9 @@ async function performAutoRecallInner(params: {
   const tPersonaStart = performance.now();
   let personaContent: string | undefined;
   try {
-    const personaPath = path.join(pluginDataDir, "persona.md");
-    const raw = await fs.readFile(personaPath, "utf-8");
-    personaContent = stripSceneNavigation(raw).trim();
-    if (!personaContent) personaContent = undefined;
+    // Cached by (mtime,size): the persona projection is large and changes rarely, so
+    // it is re-read + re-stripped only when the file actually changed (Phase 2.7).
+    personaContent = await readPersonaCached(path.join(pluginDataDir, "persona.md"), stripSceneNavigation);
     logger?.debug?.(`${TAG} Persona loaded: ${personaContent ? `${personaContent.length} chars` : "empty"}`);
   } catch {
     logger?.debug?.(`${TAG} No persona file found (expected for new users)`);
@@ -346,7 +346,7 @@ async function performAutoRecallInner(params: {
   // inject?" gate. The north-star is the one thing that must surface even when a
   // fresh project has no persona/scene/memory yet — otherwise the binding vision
   // is silently dropped exactly when it matters most (the "forgot the vision" bug).
-  const principles = await loadPrinciples(pluginDataDir, projectName);
+  const principles = await loadPrinciplesCached(pluginDataDir, projectName);
 
   // "Cambio della guardia" — capture the PREVIOUS session's recap on the FIRST
   // turn of a new session, BEFORE the "anything to inject?" gate below. The
@@ -374,6 +374,7 @@ async function performAutoRecallInner(params: {
       `persona=${(tPersonaEnd - tPersonaStart).toFixed(0)}ms, ` +
       `scene=${(tSceneEnd - tSceneStart).toFixed(0)}ms — no context to inject`,
     );
+    logSlowRecallPhases(logger, totalMs, 0, (tPersonaEnd - tPersonaStart), (tSceneEnd - tSceneStart));
     logger?.debug?.(`${TAG} No memories/persona/scenes/principles to inject`);
     return undefined;
   }
@@ -454,10 +455,13 @@ async function performAutoRecallInner(params: {
   // never break a turn.
   const bannerKey = params.sessionId ?? params.sessionKey;
   let bannerEmitted = false;
+  let bannerHealthMs = 0;
   if (bannerTracker?.pending(bannerKey)) {
     try {
       const recentEventText = resolveRecentEventText(vectorStore, params.sessionKey);
+      const tHealth = performance.now();
       const healthWarning = resolveHealthWarning(vectorStore);
+      bannerHealthMs = performance.now() - tHealth;
       const banner = buildSessionBanner({
         projectName,
         personaLoaded: personaContent !== undefined,
@@ -513,6 +517,8 @@ async function performAutoRecallInner(params: {
     `persona=${(tPersonaEnd - tPersonaStart).toFixed(0)}ms(${personaContent ? `${personaContent.length}chars` : "none"}), ` +
     `scene=${(tSceneEnd - tSceneStart).toFixed(0)}ms(${sceneNavigation ? "loaded" : "none"})`,
   );
+
+  logSlowRecallPhases(logger, totalMs, bannerHealthMs, (tPersonaEnd - tPersonaStart), (tSceneEnd - tSceneStart));
 
   if (!appendSystemContext && !prependContext) {
     return undefined;
@@ -644,11 +650,34 @@ export async function runKbRecall(
    * query text. Optional — when absent, only the query-cue path runs (old behavior).
    */
   sit?: { sessionKey: string; namespace: string; situation?: SessionSituation },
+  /**
+   * `deferWrites` (the gateway sets it): the bookkeeping writes (stakes gate, recall
+   * ledger, Hebbian reinforcement) run in ONE batched setImmediate after the result
+   * is returned, under a short busy_timeout, instead of inline on the critical path.
+   * Default false keeps the historical synchronous behaviour (tests, CLIs).
+   */
+  runOpts?: { deferWrites?: boolean },
 ): Promise<KbRecallResult[]> {
   if (!vectorStore) {
     logger?.debug?.(`${TAG} [kb] vectorStore unavailable — KB recall skipped`);
     return [];
   }
+  const tKbTotal = performance.now();
+  const phases: PhaseTimings = {};
+  const deferWrites = runOpts?.deferWrites === true;
+  const pendingWrites: PendingRecallWrite[] = [];
+  const doWrite = (name: string, run: () => void): void => {
+    if (deferWrites) {
+      pendingWrites.push({ name, run });
+      return;
+    }
+    const t0 = performance.now();
+    try {
+      run();
+    } finally {
+      phases[`write:${name}`] = (phases[`write:${name}`] ?? 0) + (performance.now() - t0);
+    }
+  };
   const recallEmbeddingTimeoutMs = cfg.embedding?.recallTimeoutMs ?? cfg.embedding?.timeoutMs;
   try {
     // Redact secrets before the KB recall query is embedded (same egress guard
@@ -667,6 +696,9 @@ export async function runKbRecall(
       skipVector: true,
       // Consolidation → recall wire (config-gated, default OFF).
       consolidationBoost: cfg.recall.consolidationBoost ?? false,
+      // Never fall back to a brute-force kb_vec scan inside recall (Phase 2.5).
+      allowBruteForceVector: false,
+      phaseMs: phases,
       logger,
     });
 
@@ -683,11 +715,9 @@ export async function runKbRecall(
     const gate = (vectorStore as { gateRecalledUnits?: (u: unknown[], now: string) => void })
       .gateRecalledUnits;
     if (typeof gate === "function") {
-      gate.call(
-        vectorStore,
-        results.map((r) => ({ owner_id: r.owner_id, owner_kind: r.owner_kind, text: r.text })),
-        new Date().toISOString(),
-      );
+      const gateUnits = results.map((r) => ({ owner_id: r.owner_id, owner_kind: r.owner_kind, text: r.text }));
+      const gateNow = new Date().toISOString();
+      doWrite("gate", () => gate.call(vectorStore, gateUnits, gateNow));
     }
 
     // Grounded Trust Phase 4: suppress tombstoned (rejected) memories from injection
@@ -711,6 +741,7 @@ export async function runKbRecall(
     // over the graph so connected-but-unmatched memories COME to the agent. Purely
     // additive, best-effort, off the critical path: any failure leaves `visible`
     // as it was. NO global vector scan, NO embedding — O(neighborhood).
+    const tExpand = performance.now();
     const expand = (vectorStore as {
       associativeExpand?: (seeds: string[], opts?: { hops?: number; maxNodes?: number }) => Array<{
         owner_id: string; owner_kind: "fact" | "event"; text: string; entity_id: string; activation: number;
@@ -778,6 +809,8 @@ export async function runKbRecall(
       }
     }
 
+    phases.expand = performance.now() - tExpand;
+
     // ── LEDGER — write down what we are about to put in front of the agent ──
     // Note the asymmetry with the block below: hebbian reinforcement rewards
     // RETRIEVAL, which is why an ignored memory used to grow stronger forever.
@@ -790,20 +823,23 @@ export async function runKbRecall(
       }) => number;
     }).recordRecallInjections;
     if (typeof recordLedger === "function" && sit?.sessionKey) {
-      try {
-        recordLedger.call(vectorStore, {
-          sessionKey: sit.sessionKey,
-          namespace: sit.namespace,
-          now: new Date().toISOString(),
-          injections: visible.map((r) => ({
-            ownerId: r.owner_id,
-            ownerKind: r.owner_kind,
-            score: r.score,
-            associative: !!r.associative,
-            memoryText: r.text,
-          })),
-        });
-      } catch { /* best-effort: bookkeeping never breaks recall */ }
+      const ledgerParams = {
+        sessionKey: sit.sessionKey,
+        namespace: sit.namespace,
+        now: new Date().toISOString(),
+        injections: visible.map((r) => ({
+          ownerId: r.owner_id,
+          ownerKind: r.owner_kind,
+          score: r.score,
+          associative: !!r.associative,
+          memoryText: r.text,
+        })),
+      };
+      doWrite("ledger", () => {
+        try {
+          recordLedger.call(vectorStore, ledgerParams);
+        } catch { /* best-effort: bookkeeping never breaks recall */ }
+      });
     }
 
     // ── B2a — HEBBIAN reinforcement: every recall strengthens what it surfaced ──
@@ -824,17 +860,105 @@ export async function runKbRecall(
           .slice(0, 3) // bounded: only the strongest few, to avoid over-reinforcement
           .map((r) => ({ owner_id: r.owner_id, owner_kind: r.owner_kind as "fact" | "event" }));
         if (topAssoc.length > 0) {
-          const n = reinforceOwners.call(vectorStore, topAssoc, new Date().toISOString());
-          logger?.debug?.(`${TAG} [kb] hebbian reinforced ${n} associative memory(ies)`);
+          const reinforceNow = new Date().toISOString();
+          doWrite("reinforce", () => {
+            try {
+              const n = reinforceOwners.call(vectorStore, topAssoc, reinforceNow);
+              logger?.debug?.(`${TAG} [kb] hebbian reinforced ${n} associative memory(ies)`);
+            } catch { /* best-effort: reinforcement never breaks recall */ }
+          });
         }
       } catch { /* best-effort: reinforcement never breaks recall */ }
     }
 
+    scheduleRecallWrites(vectorStore, logger, pendingWrites);
+    lastKbRecallPhases = { ...phases, total: performance.now() - tKbTotal };
     return visible;
   } catch (err) {
     logger?.warn?.(`${TAG} [kb] KB recall failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    lastKbRecallPhases = { ...phases, total: performance.now() - tKbTotal };
     return [];
   }
+}
+
+// ============================
+// Recall-path telemetry + deferred writes (Phase 2.4)
+// ============================
+
+interface PendingRecallWrite {
+  name: string;
+  run: () => void;
+}
+
+/** Phase timings (ms) of the most recent runKbRecall — read by the slow-recall breadcrumb. */
+let lastKbRecallPhases: Record<string, number> = {};
+
+/** Per-phase timings of the most recent runKbRecall (entity match, priming/adjacency, expand, writes, …). */
+export function getLastKbRecallPhases(): Readonly<Record<string, number>> {
+  return lastKbRecallPhases;
+}
+
+/**
+ * Flush the recall bookkeeping writes in ONE macrotask after the recall result is
+ * built, under the store's short busy_timeout when it offers one. Each write is
+ * isolated: a failure is logged and never reaches the (already returned) recall.
+ */
+function scheduleRecallWrites(
+  store: IMemoryStore,
+  logger: Logger | undefined,
+  writes: PendingRecallWrite[],
+): void {
+  if (writes.length === 0) return;
+  setImmediate(() => {
+    const t0 = performance.now();
+    const runAll = (): void => {
+      for (const w of writes) {
+        const tw = performance.now();
+        try {
+          w.run();
+        } catch (err) {
+          logger?.warn?.(`${TAG} [kb] deferred write "${w.name}" failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+        }
+        lastKbRecallPhases = { ...lastKbRecallPhases, [`write:${w.name}`]: performance.now() - tw };
+      }
+    };
+    try {
+      const withShortTimeout = (store as {
+        runWithShortBusyTimeout?: <T>(fn: () => T, timeoutMs?: number, opts?: { transaction?: boolean }) => T;
+      }).runWithShortBusyTimeout;
+      // ONE transaction for the whole batch: one WAL commit instead of ~20.
+      if (typeof withShortTimeout === "function") withShortTimeout.call(store, runAll, 200, { transaction: true });
+      else runAll();
+    } catch (err) {
+      logger?.warn?.(`${TAG} [kb] deferred recall writes failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
+    logger?.debug?.(`${TAG} [kb] deferred recall writes (${writes.length}) flushed in ${(performance.now() - t0).toFixed(0)}ms`);
+  });
+}
+
+/**
+ * Slow-recall breadcrumb, per phase: when a recall crosses the slow threshold, log
+ * WHERE the time went inside our own code (entity match / priming-adjacency /
+ * expand / writes / health / persona / scene). Complements the gateway's
+ * SLOW RECALL line (event-loop lag + heavy tasks). Never throws.
+ */
+function logSlowRecallPhases(
+  logger: Logger | undefined,
+  totalMs: number,
+  healthMs: number,
+  personaMs: number,
+  sceneMs: number,
+): void {
+  try {
+    if (!isSlowRecall(totalMs)) return;
+    const kb = Object.entries(lastKbRecallPhases)
+      .map(([k, v]) => `${k}=${v.toFixed(0)}ms`)
+      .join(",");
+    logger?.warn?.(
+      `${TAG} ⏱️ SLOW RECALL phases total=${totalMs.toFixed(0)}ms kb[${kb || "n/a"}] ` +
+        `banner.health=${healthMs.toFixed(0)}ms persona=${personaMs.toFixed(0)}ms scene=${sceneMs.toFixed(0)}ms`,
+    );
+  } catch { /* diagnostics never break a turn */ }
 }
 
 /**
