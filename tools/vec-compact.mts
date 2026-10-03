@@ -20,6 +20,8 @@
 import { createRequire } from "node:module";
 import { DatabaseSync } from "node:sqlite";
 import net from "node:net";
+import { existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import {
   VEC_SPECS,
   isLegacyVecSql,
@@ -98,7 +100,11 @@ function randomQueries(db: DatabaseSync, spec: VecTableSpec, n: number, ids: str
 
 async function guardOffline(db: string | undefined, what: string): Promise<string> {
   if (!db) { out(`STOP: ${what} needs an explicit --db <path> (no default on purpose).`); process.exit(2); }
-  if (await portUp(8421)) { out("STOP: something answers on 127.0.0.1:8421 (gateway up). Stop it first — exclusive access needed."); process.exit(1); }
+  // A gateway's data dir holds gateway.lock / state.json. A scratch copy elsewhere
+  // can be migrated while the live gateway keeps running.
+  const dir = dirname(resolve(db));
+  const isGatewayDir = existsSync(join(dir, "gateway.lock")) || existsSync(join(dir, "state.json"));
+  if (isGatewayDir && (await portUp(8421))) { out("STOP: this DB belongs to a gateway data dir and something answers on 127.0.0.1:8421 (gateway up). Stop it first — exclusive access needed."); process.exit(1); }
   return db;
 }
 
