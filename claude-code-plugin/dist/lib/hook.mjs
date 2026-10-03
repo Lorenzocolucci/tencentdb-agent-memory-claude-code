@@ -12,6 +12,8 @@ import { createInterface } from "node:readline";
 const RECALL_TIMEOUT_MS = 4500;
 /** POST /observe (PostToolUse): must fit inside the 4 s hook timeout. */
 const OBSERVE_TIMEOUT_MS = 2500;
+/** POST /pretool (PreToolUse): the gateway answers from memory in < 300 ms; 1.5 s is the ceiling, hook timeout is 3 s. Fails open. */
+const PRETOOL_TIMEOUT_MS = 1500;
 /** POST /capture, per attempt (two attempts + 2 s gap, inside STOP_DEADLINE_MS). */
 const CAPTURE_TIMEOUT_MS = 12e3;
 /** Stop: internal deadline, 5 s below the hook timeout. */
@@ -174,7 +176,10 @@ var GatewayClient = class {
 				tool_input: payload.toolInput,
 				tool_output_text: payload.toolOutputText,
 				tool_output_is_error: payload.toolOutputIsError,
-				tool_risk: payload.toolRisk
+				tool_risk: payload.toolRisk,
+				project: payload.project,
+				cwd: payload.cwd,
+				skip_file_memory: payload.skipFileMemory
 			}, token, OBSERVE_TIMEOUT_MS);
 			if (status !== 200) {
 				await this.logFailure("POST", "/observe", this.describeStatus(status, body));
@@ -184,6 +189,38 @@ var GatewayClient = class {
 		} catch (err) {
 			await this.logFailure("POST", "/observe", err instanceof Error ? err.message : String(err));
 			return "";
+		}
+	}
+	/**
+	* POST /pretool — PreToolUse: ask memory whether this tool call repeats a known
+	* mistake. FAILS OPEN: any error, timeout, 503 (gateway starting) or non-200
+	* returns null and the tool call proceeds untouched.
+	*/
+	async pretool(payload) {
+		try {
+			const token = await this.freshToken();
+			const { status, body } = await this.rawRequest("POST", "/pretool", {
+				session_key: payload.sessionKey,
+				project: payload.project,
+				cwd: payload.cwd,
+				tool_name: payload.toolName,
+				tool_input: payload.toolInput,
+				one_way: payload.oneWay ?? null
+			}, token, PRETOOL_TIMEOUT_MS);
+			if (status !== 200) {
+				await this.logFailure("POST", "/pretool", this.describeStatus(status, body));
+				return null;
+			}
+			const parsed = JSON.parse(body);
+			if (parsed.decision !== "warn" && parsed.decision !== "deny" || !parsed.message) return null;
+			return {
+				decision: parsed.decision,
+				message: parsed.message,
+				lessonId: parsed.lesson_id
+			};
+		} catch (err) {
+			await this.logFailure("POST", "/pretool", err instanceof Error ? err.message : String(err));
+			return null;
 		}
 	}
 	/**
@@ -1099,7 +1136,7 @@ function matchDestructiveCommand(command) {
 *   node ${CLAUDE_PLUGIN_ROOT}/dist/lib/hook.mjs <event-name>
 *
 * Where <event-name> is one of:
-*   session-start | user-prompt-submit | post-tool-use | post-tool-use-failure |
+*   session-start | user-prompt-submit | pre-tool-use | post-tool-use | post-tool-use-failure |
 *   stop | search | search-stdin | status | clear-session | confirm | reject
 */
 const MAX_INJECT_CHARS = 1e4;
@@ -1112,6 +1149,7 @@ async function handleHook(event, input) {
 	switch (event) {
 		case "session-start": return handleSessionStart(data, input.client, dataDir);
 		case "user-prompt-submit": return handleUserPromptSubmit(data, input.client, dataDir, input);
+		case "pre-tool-use": return handlePreToolUse(data, input.client, input.preToolDeadlineMs ?? 2500);
 		case "post-tool-use": return handlePostToolUse(data, input.client);
 		case "post-tool-use-failure": return handlePostToolUseFailure(data, input.client);
 		case "stop": return handleStop(data, input.client, dataDir, input.stopDeadlineMs ?? 4e4);
@@ -1335,10 +1373,51 @@ function stringifyToolOutput(resp, maxChars = MAX_TOOL_OUTPUT_CHARS) {
 }
 /** Max characters of a SUCCESSFUL destructive command's output forwarded. */
 const MAX_DESTRUCTIVE_OUTPUT_CHARS = 400;
+/**
+* PreToolUse (Phase 4): memory that arrives BEFORE the agent acts. Asks the
+* gateway whether this Bash command / file edit repeats a known mistake in THIS
+* project. Output is either an `additionalContext` warning, or — for an attested
+* lesson on a one-way action — `permissionDecision: "deny"` with the reason.
+*
+* FAILS OPEN: any error, timeout or unreachable/starting gateway yields "" (exit
+* 0, no output). Never raises or prints alarms: a memory problem must not become
+* noise on every tool call, and must never block work.
+*/
+async function handlePreToolUse(data, client, deadlineMs) {
+	const toolName = data.tool_name ?? "";
+	if (!toolName) return "";
+	try {
+		const cwd = data.cwd ?? process.cwd();
+		const command = data.tool_input?.command;
+		const oneWay = toolName === "Bash" ? matchDestructiveCommand(command) : null;
+		const result = await raceDeadline(client.pretool({
+			sessionKey: getSessionKey(cwd),
+			project: getProjectName(cwd),
+			cwd,
+			toolName,
+			toolInput: data.tool_input,
+			oneWay
+		}), deadlineMs);
+		const answer = result.timedOut ? null : result.value;
+		if (!answer) return "";
+		if (answer.decision === "deny") return JSON.stringify({ hookSpecificOutput: {
+			hookEventName: "PreToolUse",
+			permissionDecision: "deny",
+			permissionDecisionReason: answer.message
+		} });
+		return JSON.stringify({ hookSpecificOutput: {
+			hookEventName: "PreToolUse",
+			additionalContext: answer.message
+		} });
+	} catch {
+		return "";
+	}
+}
 async function handlePostToolUse(data, client) {
 	const toolName = data.tool_name ?? "";
 	if (!toolName) return "";
-	const sessionKey = getSessionKey(data.cwd ?? process.cwd());
+	const cwd = data.cwd ?? process.cwd();
+	const sessionKey = getSessionKey(cwd);
 	let toolOutputText = data.tool_output_is_error === true ? stringifyToolOutput(data.tool_response) : void 0;
 	const toolRisk = (toolName === "Bash" && data.tool_output_is_error !== true ? matchDestructiveCommand(data.tool_input?.command) : null) ? "destructive" : void 0;
 	if (toolRisk && toolOutputText === void 0) toolOutputText = stringifyToolOutput(data.tool_response, MAX_DESTRUCTIVE_OUTPUT_CHARS);
@@ -1348,7 +1427,10 @@ async function handlePostToolUse(data, client) {
 		toolInput: data.tool_input,
 		toolOutputIsError: data.tool_output_is_error,
 		toolOutputText,
-		toolRisk
+		toolRisk,
+		project: getProjectName(cwd),
+		cwd,
+		skipFileMemory: true
 	});
 	if (!context) return "";
 	if (context.length > MAX_INJECT_CHARS) context = context.slice(0, MAX_INJECT_CHARS - 100) + "\n\n[…truncated…]";
@@ -1368,14 +1450,18 @@ async function handlePostToolUseFailure(data, client) {
 	const toolName = data.tool_name ?? "";
 	if (!toolName) return "";
 	if (data.is_interrupt === true) return "";
-	const sessionKey = getSessionKey(data.cwd ?? process.cwd());
+	const cwd = data.cwd ?? process.cwd();
+	const sessionKey = getSessionKey(cwd);
 	const toolOutputText = stringifyToolOutput(data.error) ?? (data.error_type ? String(data.error_type) : void 0);
 	let context = await client.observe({
 		toolName,
 		sessionKey,
 		toolInput: data.tool_input,
 		toolOutputIsError: true,
-		toolOutputText
+		toolOutputText,
+		project: getProjectName(cwd),
+		cwd,
+		skipFileMemory: true
 	});
 	if (!context) return "";
 	if (context.length > MAX_INJECT_CHARS) context = context.slice(0, MAX_INJECT_CHARS - 100) + "\n\n[…truncated…]";
@@ -1680,10 +1766,13 @@ async function main() {
 	const args = process.argv.slice(3);
 	const { dir: dataDir, source: dataDirSource, isBackup: dataDirIsBackup } = resolveDataDirWithSource();
 	const logPath = join(dataDir, "hook.log");
-	if (dataDirSource === "fallback") await raiseAlarm(dataDir, "data-dir-lost", "il plugin non trova la cartella del gateway — cattura e recall SPENTI");
-	else await clearAlarm(dataDir, "data-dir-lost");
-	if (dataDirIsBackup) await raiseAlarm(dataDir, "writing-to-backup", "la memoria sta puntando a una cartella di BACKUP — i nuovi ricordi finirebbero in un archivio vecchio");
-	else await clearAlarm(dataDir, "writing-to-backup");
+	const quiet = event === "pre-tool-use";
+	if (dataDirSource === "fallback") {
+		if (!quiet) await raiseAlarm(dataDir, "data-dir-lost", "il plugin non trova la cartella del gateway — cattura e recall SPENTI");
+	} else await clearAlarm(dataDir, "data-dir-lost");
+	if (dataDirIsBackup) {
+		if (!quiet) await raiseAlarm(dataDir, "writing-to-backup", "la memoria sta puntando a una cartella di BACKUP — i nuovi ricordi finirebbero in un archivio vecchio");
+	} else await clearAlarm(dataDir, "writing-to-backup");
 	try {
 		const stdin = await readStdin();
 		const mgr = new DaemonManager({ dataDir });
@@ -1702,6 +1791,7 @@ async function main() {
 		}
 		if (!state) {
 			await safeLog(logPath, `${event}: no daemon, skipped`);
+			if (quiet) return;
 			if (event !== "user-prompt-submit") await raiseAlarm(dataDir, "gateway-unreachable", "nessun gateway attivo — la sessione NON viene salvata");
 			else {
 				const peek = await peekAlarms(dataDir);
@@ -1728,13 +1818,13 @@ async function main() {
 		}), afterWrite);
 	} catch (err) {
 		await safeLog(logPath, `${event}: ${err.message}`);
-		await reportHookCrash(dataDir, event, err);
+		if (!quiet) await reportHookCrash(dataDir, event, err);
 		if (event === "user-prompt-submit") try {
 			const peek = await peekAlarms(dataDir);
 			if (peek.line) await emitThenAck(JSON.stringify({ systemMessage: peek.line }), [peek.ack]);
 		} catch {}
 	}
-	if (event === "user-prompt-submit" || event === "stop") process.exit(0);
+	if (event === "user-prompt-submit" || event === "stop" || event === "pre-tool-use") process.exit(0);
 }
 function writeStdout(text) {
 	return new Promise((resolve, reject) => {

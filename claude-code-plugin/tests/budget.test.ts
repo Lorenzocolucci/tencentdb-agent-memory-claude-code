@@ -22,6 +22,7 @@ describe("budget.ts vs hooks/hooks.json (drift guard)", () => {
   it("every hook timeout in hooks.json equals budget.ts", () => {
     expect(timeoutOf("SessionStart")).toBe(budget.HOOK_TIMEOUT_S.sessionStart);
     expect(timeoutOf("UserPromptSubmit")).toBe(budget.HOOK_TIMEOUT_S.userPromptSubmit);
+    expect(timeoutOf("PreToolUse")).toBe(budget.HOOK_TIMEOUT_S.preToolUse);
     expect(timeoutOf("PostToolUse")).toBe(budget.HOOK_TIMEOUT_S.postToolUse);
     expect(timeoutOf("PostToolUseFailure")).toBe(budget.HOOK_TIMEOUT_S.postToolUseFailure);
     expect(timeoutOf("Stop")).toBe(budget.HOOK_TIMEOUT_S.stop);
@@ -32,6 +33,8 @@ describe("budget.ts vs hooks/hooks.json (drift guard)", () => {
     expect(budget.UPS_DEADLINE_MS).toBe(5_800);
     expect(budget.RECALL_TIMEOUT_MS).toBe(4_500);
     expect(budget.OBSERVE_TIMEOUT_MS).toBe(2_500);
+    expect(budget.HOOK_TIMEOUT_S.preToolUse).toBe(3);
+    expect(budget.PRETOOL_TIMEOUT_MS).toBe(1_500);
     expect(budget.HOOK_TIMEOUT_S.postToolUse).toBe(4);
     expect(budget.HOOK_TIMEOUT_S.stop).toBe(45);
     expect(budget.STOP_DEADLINE_MS).toBe(40_000);
@@ -42,6 +45,8 @@ describe("budget.ts vs hooks/hooks.json (drift guard)", () => {
     expect(budget.RECALL_TIMEOUT_MS).toBeLessThan(budget.UPS_DEADLINE_MS);
     expect(budget.UPS_DEADLINE_MS).toBeLessThan(budget.HOOK_TIMEOUT_S.userPromptSubmit * 1000);
     expect(budget.OBSERVE_TIMEOUT_MS).toBeLessThan(budget.HOOK_TIMEOUT_S.postToolUse * 1000);
+    expect(budget.PRETOOL_TIMEOUT_MS).toBeLessThan(budget.PRETOOL_DEADLINE_MS);
+    expect(budget.PRETOOL_DEADLINE_MS).toBeLessThan(budget.HOOK_TIMEOUT_S.preToolUse * 1000);
     expect(budget.STOP_DEADLINE_MS).toBeLessThan(budget.HOOK_TIMEOUT_S.stop * 1000);
     // two capture attempts + the 2 s retry gap must fit the Stop deadline
     expect(budget.CAPTURE_TIMEOUT_MS * 2 + 2_000).toBeLessThan(budget.STOP_DEADLINE_MS);
