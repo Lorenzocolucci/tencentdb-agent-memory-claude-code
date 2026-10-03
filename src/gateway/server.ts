@@ -810,6 +810,7 @@ export class TdaiGateway {
         toolOutputIsError: body.tool_output_is_error,
         toolOutputText: body.tool_output_text,
         toolRisk: body.tool_risk,
+        project: body.project,
         skipFileMemory: body.skip_file_memory === true,
       }),
     );

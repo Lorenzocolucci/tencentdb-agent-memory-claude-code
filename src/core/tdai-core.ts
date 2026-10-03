@@ -1148,7 +1148,7 @@ export class TdaiCore {
    */
   private recordFriction(
     store: IMemoryStore,
-    obs: { sessionKey: string; toolName: string; toolInput: unknown; toolOutputText?: string },
+    obs: { sessionKey: string; toolName: string; toolInput: unknown; toolOutputText?: string; project?: string },
   ): { warning?: string; risky?: RiskySignature } {
     if (typeof store.insertEvent !== "function") return {};
 
@@ -1195,6 +1195,7 @@ export class TdaiCore {
       recordedAt: now,
       sessionKey: obs.sessionKey,
       namespace: NAMESPACE,
+      project: obs.project || store.getSessionProject?.(obs.sessionKey),
       type: "bug",
       text: ev.text,
       entities: [...entities, `${SIGNATURE_TAG_PREFIX}${ev.signature}`],
@@ -1229,7 +1230,7 @@ export class TdaiCore {
    */
   private recordDestructive(
     store: IMemoryStore,
-    obs: { sessionKey: string; toolName: string; toolInput: unknown; toolOutputText?: string },
+    obs: { sessionKey: string; toolName: string; toolInput: unknown; toolOutputText?: string; project?: string },
   ): RiskySignature | undefined {
     if (typeof store.insertEvent !== "function") return undefined;
 
@@ -1368,11 +1369,18 @@ export class TdaiCore {
      * plugin asks PostToolUse not to inject the single-file block again.
      */
     skipFileMemory?: boolean;
+    /** Project the tool call ran in (basename of cwd), sent by the plugin. */
+    project?: string;
   }): Promise<{ inject?: string }> {
     if (!obs.sessionKey) return {};
     await this.storeReady?.catch(() => {});
     const store = this.vectorStore;
     if (!store) return {};
+
+    // Sessions that never recall (subagents, `claude -p`) were never registered,
+    // so every event written below landed with project '' (40% of 03/10 events)
+    // and hard project scope hid them from recall.
+    if (obs.project) store.setSessionProject?.(obs.sessionKey, obs.project);
 
     // ── Friction capture: let memory SEE the workshop ──
     // A failed tool call becomes a `bug` event — the exact input bug-clusters
