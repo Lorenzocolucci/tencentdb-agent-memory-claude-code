@@ -17,11 +17,11 @@ import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { readVerdict } from "../src/core/kb/recall-ledger.js";
+import { readInjectionStats, type InjectionStats } from "../src/core/kb/recall-stats.js";
 
-const DB_PATH = join(
-  process.env.USERPROFILE ?? "",
-  ".claude", "plugins", "data", "tdai-memory-tdai-local", "vectors.db",
-);
+const DB_PATH =
+  process.env.TDAI_VERDICT_DB ??
+  join(process.env.USERPROFILE ?? "", ".claude", "plugins", "data", "tdai-memory-tdai-local", "vectors.db");
 
 /** Same key the plugin computes from a cwd (claude-code-plugin/lib/session-key.ts). */
 function sessionKeyFor(cwd: string): string {
@@ -43,6 +43,22 @@ function trim(text: string, max = 76): string {
   return one.length > max ? one.slice(0, max - 1) + "…" : one;
 }
 
+/** Phase 3.12 targets: ≤5 lines/turn, ≥50% silent turns, 0 cross-project lines, used rate per tier. */
+function printInjectionStats(s: InjectionStats): void {
+  const f1 = (n: number | null): string => (n === null ? "n/d" : n.toFixed(1));
+  console.log("  ── Quanto spinge, e dove ──");
+  console.log(`  righe di memoria per turno    : ${f1(s.linesPerTurn)}   (obiettivo ≤ 5)`);
+  console.log(`  turni senza memoria (silenzio): ${f1(s.silentTurnsPct)}%   (obiettivo ≥ 50%)`);
+  console.log(`    turni con iniezione ${s.turnsInjected}, turni silenziosi ${s.turnsSilent}`);
+  console.log(`  righe di un ALTRO progetto    : ${s.crossProjectLines}   (obiettivo 0)`);
+  for (const t of s.tiers) {
+    const rate = t.usedRate === null ? "n/d" : `${(t.usedRate * 100).toFixed(1)}%`;
+    const name = `${t.kind}${t.associative ? " associativo" : " da query"}`;
+    console.log(`   ${name.padEnd(20)} iniettati ${String(t.injected).padStart(6)}  giudicabili ${String(t.judgeable).padStart(6)}  usati ${String(t.used).padStart(5)}  → ${rate}`);
+  }
+  console.log("");
+}
+
 function main(): void {
   const project = arg("project");
   const since = arg("since");
@@ -59,6 +75,10 @@ function main(): void {
     if (project) console.log(`  progetto: ${project}`);
     if (since) console.log(`  da:       ${since}`);
     console.log("");
+
+    printInjectionStats(
+      readInjectionStats(db, { sessionKey: project ? sessionKeyFor(project) : undefined, sinceTs: since }),
+    );
 
     const judgeable = v.judged - v.unjudgeable;
     if (judgeable === 0) {

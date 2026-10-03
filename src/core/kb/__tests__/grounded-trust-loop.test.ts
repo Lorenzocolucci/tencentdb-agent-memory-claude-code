@@ -60,7 +60,10 @@ describe("grounded-trust full loop (seed → gate → interrupt → confirm → 
     const asks = store.getPendingAsks(5);
     const block = renderGroundedTrustInterrupt(asks);
     expect(block).toContain("FERMATI prima di agire");
-    expect(block).toContain("IT60X0542811101000000123456");
+    // 2026-10-03 (approved by Lorenzo): payment/identity values are redacted in the
+    // ask block — it reached sessions of every project, IBAN in clear, 144 times.
+    expect(block).not.toContain("IT60X0542811101000000123456");
+    expect(block).toContain("[dato sensibile omesso]");
     expect(block).toContain(`owner_id:"${evId}"`);
 
     // 5. Lorenzo CONFIRMS → it becomes authoritative (learned forever).

@@ -26,6 +26,7 @@ import type { MemoryRecord } from "../record/l1-writer.js";
 import { initFoundationsSchema } from "../kb/foundations-schema.js";
 import {
   recordInjections,
+  recordSilentTurn,
   judgePending,
   readVerdict,
   type RecordInjectionsParams,
@@ -108,6 +109,12 @@ import {
   type KbIndexBackfillResult,
 } from "../kb/kb-index.js";
 import { beginHeavyTask, endHeavyTask } from "../diagnostics/inflight-registry.js";
+import {
+  selectiveAssociativeExpand,
+  otherProjectKeys as selectiveOtherProjectKeys,
+  chronicNoiseKeys as selectiveChronicNoiseKeys,
+  ownerProjects as selectiveOwnerProjects,
+} from "../kb/selective-store.js";
 import { dirname, join } from "node:path";
 import {
   KB_NAV_SNAPSHOT_FORMAT,
@@ -2389,7 +2396,7 @@ export class VectorStore implements IMemoryStore {
    * interrupt block is rendered from these. Off the critical path: on any failure
    * returns []. Fact text is rendered "attribute: value"; event text is the event.
    */
-  getPendingAsks(limit = 10): Array<{
+  getPendingAsks(limit = 10, opts?: { project?: string }): Array<{
     owner_id: string;
     owner_kind: "fact" | "event";
     text: string;
@@ -2397,7 +2404,11 @@ export class VectorStore implements IMemoryStore {
     stakes_domain: import("../kb/provenance.js").StakesDomain | null;
   }> {
     try {
-      const rows = this.db
+      const wanted = Math.max(1, Math.min(limit, 50));
+      // With a project filter, read a wider window first: the newest asks may all belong
+      // to other projects, and the filter must not starve this project's own.
+      const fetchCount = opts?.project ? Math.min(wanted * 10, 200) : wanted;
+      const fetched = this.db
         .prepare(
           `SELECT owner_id, owner_kind, provenance_json
              FROM memory_lifecycle
@@ -2405,11 +2416,22 @@ export class VectorStore implements IMemoryStore {
             ORDER BY updated_time DESC
             LIMIT ?`,
         )
-        .all(Math.max(1, Math.min(limit, 50))) as Array<{
+        .all(fetchCount) as Array<{
         owner_id: string;
         owner_kind: string;
         provenance_json: string;
       }>;
+      // Phase 3.11: only this project's asks (another project's payment memory is not
+      // this session's business). Unknown project / user-level memory stays askable.
+      const foreign = opts?.project
+        ? this.otherProjectOwnerKeys(
+            fetched.map((r) => ({ owner_id: r.owner_id, owner_kind: r.owner_kind === "fact" ? "fact" : "event" })),
+            opts.project,
+          )
+        : new Set<string>();
+      const rows = fetched
+        .filter((r) => !foreign.has(`${r.owner_kind === "fact" ? "fact" : "event"}:${r.owner_id}`))
+        .slice(0, wanted);
 
       const out: Array<{
         owner_id: string;
@@ -2429,9 +2451,12 @@ export class VectorStore implements IMemoryStore {
           text = ev?.text ?? "";
         } else {
           const f = this.db
-            .prepare("SELECT attribute, value FROM facts WHERE id = ?")
-            .get(r.owner_id) as { attribute: string; value: string } | undefined;
-          text = f ? `${f.attribute}: ${f.value}` : "";
+            .prepare(
+              "SELECT f.attribute AS attribute, f.value AS value, e.name AS name FROM facts f LEFT JOIN entities e ON e.id = f.entity_id WHERE f.id = ?",
+            )
+            .get(r.owner_id) as { attribute: string; value: string; name: string | null } | undefined;
+          // The subject first: a bare "attribute: value" says nothing about what it is about.
+          text = f ? `${f.name ? `${f.name} — ` : ""}${f.attribute}: ${f.value}` : "";
         }
         if (!text) continue;
         out.push({
@@ -2492,18 +2517,37 @@ export class VectorStore implements IMemoryStore {
    */
   associativeExpand(
     seedEntityIds: string[],
-    opts?: { hops?: number; maxNodes?: number; namespace?: string },
+    opts?: {
+      hops?: number;
+      maxNodes?: number;
+      namespace?: string;
+      /**
+       * Phase-3 selective mode: project-scoped relations, hub entities as context not
+       * seeds, per-seed convergence counts, event-first representatives with a subject.
+       */
+      selective?: { project?: string; queryTokens?: readonly string[]; hubFactThreshold: number };
+    },
   ): Array<{
     owner_id: string;
     owner_kind: "fact" | "event";
     text: string;
     entity_id: string;
     activation: number;
+    /** Selective mode only: how many distinct seeds reached this entity. */
+    seedCount?: number;
   }> {
     try {
       const seeds = (seedEntityIds ?? []).filter(Boolean);
       if (seeds.length === 0) return [];
       const namespace = opts?.namespace ?? "default";
+      if (opts?.selective) {
+        return selectiveAssociativeExpand(this.db, seeds, {
+          hops: opts.hops,
+          maxNodes: opts.maxNodes,
+          namespace,
+          ...opts.selective,
+        });
+      }
 
       // Lazy, memoized adjacency over LIVE edges (valid_to IS NULL), weighted by support.
       const memo = new Map<string, WeightedNeighbor[]>();
@@ -2565,26 +2609,41 @@ export class VectorStore implements IMemoryStore {
   /**
    * Record what recall actually injected into a turn (unjudged).
    *
-   * Deliberately separate from reinforceRecalledOwners below: that one rewards
-   * RETRIEVAL, this one only takes note, so usefulness can later be measured
-   * instead of assumed. Never throws.
+   * Takes note only: reinforcement happens later, in judgePendingRecalls, and only
+   * for memories the reply actually used — never on retrieval. Never throws.
    */
   recordRecallInjections(params: RecordInjectionsParams): number {
     if (this.degraded || !this.kbReady) return 0;
     return recordInjections(this.db, params);
   }
 
-  /** Settle the pending ledger rows of a session against the turn just captured. */
+  /**
+   * Settle the pending ledger rows of a session against the turn just captured, then
+   * reinforce ONLY the memories the reply actually drew on (Phase 3.10): reinforcement
+   * rewards use, never mere retrieval.
+   */
   judgePendingRecalls(params: JudgePendingParams): JudgePendingResult {
     if (this.degraded || !this.kbReady) {
-      return { injected: 0, used: 0, unjudgeable: 0, perMemory: [], expired: 0 };
+      return { injected: 0, used: 0, unjudgeable: 0, perMemory: [], expired: 0, usedOwners: [] };
     }
     const diagToken = beginHeavyTask("judge-recall-usefulness");
     try {
-      return judgePending(this.db, params, this.logger);
+      const result = judgePending(this.db, params, this.logger);
+      this.reinforceUsedOwners(result.usedOwners, params.now);
+      return result;
     } finally {
       endHeavyTask(diagToken);
     }
+  }
+
+  /** Reinforce judged-USED fact/event owners (distinct). Best-effort per owner. */
+  private reinforceUsedOwners(owners: ReadonlyArray<{ ownerId: string; ownerKind: string }>, now: string): void {
+    const distinct = new Map<string, { owner_id: string; owner_kind: "fact" | "event" }>();
+    for (const o of owners) {
+      if (o.ownerKind !== "fact" && o.ownerKind !== "event") continue;
+      distinct.set(`${o.ownerKind}:${o.ownerId}`, { owner_id: o.ownerId, owner_kind: o.ownerKind });
+    }
+    if (distinct.size > 0) this.reinforceRecalledOwners([...distinct.values()], now);
   }
 
   /** Aggregate the ledger into the usefulness verdict. Read-only. */
@@ -2598,13 +2657,58 @@ export class VectorStore implements IMemoryStore {
     return readVerdict(this.db, params);
   }
 
+  /** Note a turn on which recall injected nothing (see recordSilentTurn). Never throws. */
+  recordSilentTurn(params: { sessionKey: string; sessionId?: string; namespace?: string; now: string }): void {
+    if (this.degraded || !this.kbReady) return;
+    recordSilentTurn(this.db, params);
+  }
+
   /**
-   * Hebbian reinforcement (Incremento B2a) — "ogni richiamo rinforza" (CMA:
-   * every access reinforces). Bumps each surfaced owner's lifecycle reinforcement
-   * (count → permanence → long-term promotion) so memories that keep being
-   * recalled resist staleness decay and consolidate. Bounded by the caller (top-K)
-   * and best-effort here: a per-owner failure is swallowed so reinforcement NEVER
-   * breaks the recall it rides on. Returns how many owners were reinforced.
+   * Phase 3.7 — keys ("kind:id") of the owners that provably belong to ANOTHER project
+   * than `project`. Unknown project = user-level/chat memory = never in this set.
+   * Best-effort: on error nothing is excluded (fail-open, as every recall read).
+   */
+  otherProjectOwnerKeys(
+    owners: ReadonlyArray<{ owner_id: string; owner_kind: string }>,
+    project: string | undefined,
+  ): Set<string> {
+    if (this.degraded || !this.kbReady) return new Set();
+    try {
+      return selectiveOtherProjectKeys(this.db, owners, project);
+    } catch (err) {
+      this.logger?.warn?.(`${TAG} [scope] otherProjectOwnerKeys failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+      return new Set();
+    }
+  }
+
+  /** Project of each owner (`kind:id` → {project, userLevel}); {} entries for unknown owners. */
+  getOwnerProjects(
+    owners: ReadonlyArray<{ owner_id: string; owner_kind: string }>,
+  ): Map<string, { project: string; userLevel: boolean }> {
+    if (this.degraded || !this.kbReady) return new Map();
+    try {
+      return selectiveOwnerProjects(this.db, owners);
+    } catch {
+      return new Map();
+    }
+  }
+
+  /** Phase 3.10 — owners the ledger shows injected ≥ N times and never used ("kind:id"). */
+  chronicNoiseOwnerKeys(minInjections: number): string[] {
+    if (this.degraded || !this.kbReady) return [];
+    try {
+      return selectiveChronicNoiseKeys(this.db, minInjections);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Lifecycle reinforcement of the given owners (count → permanence → long-term
+   * promotion). Since Phase 3.10 the recall path no longer calls this on retrieval
+   * ("ogni richiamo rinforza" rewarded a memory injected 1,515 times and used 0);
+   * judgePendingRecalls calls it for memories judged USED. Best-effort per owner: a
+   * failure is swallowed. Returns how many owners were reinforced.
    */
   reinforceRecalledOwners(
     owners: Array<{ owner_id: string; owner_kind: "fact" | "event" }>,
@@ -4972,6 +5076,41 @@ export class VectorStore implements IMemoryStore {
       this.kbNavChunkMeta.delete(cid);
     }
     this.kbNavOwnerChunks.delete(ownerId);
+  }
+
+  /** Rarity memo for rareKbTokens: `maxDocs:token` → { rare, atMs }. Bounded, refreshed hourly. */
+  private readonly kbTokenRarityMemo = new Map<string, { rare: boolean; atMs: number }>();
+
+  /**
+   * Phase 3.4 — which of `tokens` are RARE in the KB: mentioned by at most `maxDocs`
+   * documents. The count is bounded by a LIMIT (never scans a common word's postings
+   * beyond maxDocs+1), memoized for an hour. Used to tell a prompt word that names
+   * something ("waba") from a generic one ("problemi"). Fail-closed: errors → not rare.
+   */
+  rareKbTokens(tokens: readonly string[], maxDocs: number): Set<string> {
+    const rare = new Set<string>();
+    if (this.degraded || !this.kbFtsAvailable) return rare;
+    const now = Date.now();
+    let stmt: StatementSync | undefined;
+    for (const token of tokens) {
+      const key = `${maxDocs}:${token}`;
+      const memo = this.kbTokenRarityMemo.get(key);
+      if (memo && now - memo.atMs < 3_600_000) {
+        if (memo.rare) rare.add(token);
+        continue;
+      }
+      try {
+        stmt ??= this.db.prepare("SELECT count(*) AS n FROM (SELECT 1 FROM kb_fts WHERE kb_fts MATCH ? LIMIT ?)");
+        const row = stmt.get(`"${token.replaceAll('"', "")}"`, maxDocs + 1) as { n: number };
+        const isRare = row.n <= maxDocs;
+        if (this.kbTokenRarityMemo.size > 20_000) this.kbTokenRarityMemo.clear();
+        this.kbTokenRarityMemo.set(key, { rare: isRare, atMs: now });
+        if (isRare) rare.add(token);
+      } catch {
+        /* a token FTS5 cannot parse is simply not rare */
+      }
+    }
+    return rare;
   }
 
   /** kb_fts keyword search. Mirrors searchL1Fts (BM25 → 0–1 score). */

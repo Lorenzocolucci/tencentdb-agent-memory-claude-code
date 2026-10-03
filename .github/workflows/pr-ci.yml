@@ -212,7 +212,10 @@ jobs:
           # every single run since 2026-06-16.
           # 1200 KB = today + ~12% headroom. It is meant to come DOWN, never up:
           # if a PR needs it raised, that PR must say why in its description.
-          MAX_KB=1200
+          # 2026-10-03: 1200 -> 1260 for Phase 3 selective recall (+26 KB of source,
+          # PR #20). The tarball ships src/ AND dist/; dropping the duplicate is
+          # tracked separately and should bring this back down.
+          MAX_KB=1260
 
           echo "📦 Package: $TGZ"
           echo "   Size: ${SIZE_KB} KB (limit: ${MAX_KB} KB)"

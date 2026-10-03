@@ -21,6 +21,16 @@ import type { EmbeddingService, EmbeddingCallOptions } from "../store/embedding.
 import { sanitizeText, escapeXmlTags } from "../../utils/sanitize.js";
 import { redactSecrets } from "../../utils/redact-secrets.js";
 import { kbRecall, type KbRecallResult, type PhaseTimings } from "../kb/retrieval.js";
+import { kbRecallSelective } from "../kb/retrieval-selective.js";
+import {
+  ChronicNoiseCache,
+  RecentInjectionLog,
+  distinctiveTokens,
+  ownerKey,
+  resolveSelective,
+  selectAssociative,
+} from "../kb/selective-recall.js";
+import type { SelectiveRecallConfig } from "../../config.js";
 import { isSlowRecall } from "../diagnostics/slow-recall.js";
 import { readPersonaCached, loadPrinciplesCached } from "./projection-cache.js";
 import { buildSituationSeeds } from "../kb/situation-cue.js";
@@ -136,6 +146,8 @@ export interface RecalledMemory {
   content: string;
   score: number;
   type: string;
+  /** KB owner id (fact/event) when the memory came from the KB path — lets tools audit what was shown. */
+  ownerId?: string;
 }
 
 export interface RecallResult {
@@ -161,6 +173,27 @@ export interface RecallResult {
    * RECALL_TIMEOUT, silently dropping the entire session-open injection.
    */
   cornerstoneMiss?: { key: string };
+  /** Set by TdaiCore.handleBeforeRecall from RecallOutcome — never by performAutoRecall itself. */
+  silent?: boolean;
+}
+
+/**
+ * Out-parameter of performAutoRecall: set `silent` when recall COMPLETED and deliberately
+ * has nothing to inject (selective mode). `undefined` is also what a timeout returns, so
+ * the gateway reads this to tell "silent by design" from "failed" and the hook does not
+ * fill the silence with its L0 fallbacks.
+ */
+export interface RecallOutcome {
+  silent?: boolean;
+}
+
+/** A turn with nothing to inject: a verdict of silence only when selective and the search was not degraded. */
+function silentOutcome(
+  params: { cfg: MemoryTdaiConfig; outcome?: RecallOutcome },
+  strategy: string,
+): undefined {
+  if (params.outcome && resolveSelective(params.cfg.recall) && strategy !== "degraded") params.outcome.silent = true;
+  return undefined;
 }
 
 export async function performAutoRecall(params: {
@@ -194,6 +227,8 @@ export async function performAutoRecall(params: {
    * alongside cornerstoneTracker for the cornerstone block to be injected.
    */
   cornerstoneCache?: CornerstoneSessionCache;
+  /** Set to `{}`: filled with `silent` when recall finished with nothing to inject (see RecallOutcome). */
+  outcome?: RecallOutcome;
 }): Promise<RecallResult | undefined> {
   const { cfg, logger } = params;
   const timeoutMs = cfg.recall.timeoutMs ?? 5000;
@@ -229,6 +264,7 @@ async function performAutoRecallInner(params: {
   bannerTracker?: SessionBannerTracker;
   cornerstoneTracker?: CornerstoneInjectionTracker;
   cornerstoneCache?: CornerstoneSessionCache;
+  outcome?: RecallOutcome;
 }): Promise<RecallResult | undefined> {
   const { userText, cfg, pluginDataDir, projectName, logger, vectorStore, embeddingService, bannerTracker, cornerstoneTracker, cornerstoneCache } = params;
   const tRecallStart = performance.now();
@@ -260,11 +296,12 @@ async function performAutoRecallInner(params: {
         const kbResults = await runKbRecall(userText, cfg, logger, vectorStore, embeddingService, projectName, {
           sessionKey: params.sessionKey,
           namespace: "default",
+          sessionId: params.sessionId,
         }, { deferWrites: true });
         return {
           lines: kbResults.map((r) => formatKbRecallLine(r)),
           strategy: "kb",
-          memories: kbResults.map((r) => ({ content: r.text, score: r.score, type: r.owner_kind })),
+          memories: kbResults.map((r) => ({ content: r.text, score: r.score, type: r.owner_kind, ownerId: r.owner_id })),
           timing: { ftsMs: 0, embeddingMs: performance.now() - tKb, ftsHits: 0, embeddingHits: kbResults.length },
         };
       }
@@ -313,13 +350,23 @@ async function performAutoRecallInner(params: {
   }
   const tSearchEnd = performance.now();
 
+  // Phase 3.6 — the stable block (principles, persona, scene navigation, cornerstones,
+  // tools guide) is the SAME text every turn (7-8k of the 10k budget). In selective mode
+  // it ships on the first turn of a session only; the model already holds it afterwards.
+  // A first turn whose recall timed out leaves the tracker pending, so the next turn
+  // retries. Without a tracker (non-cc callers) the old every-turn behaviour stays.
+  const stableBannerKey = params.sessionId ?? params.sessionKey;
+  const sendStableBlock = !resolveSelective(cfg.recall) || !bannerTracker || bannerTracker.pending(stableBannerKey);
+
   // Read persona (L3 layer)
   const tPersonaStart = performance.now();
   let personaContent: string | undefined;
   try {
     // Cached by (mtime,size): the persona projection is large and changes rarely, so
     // it is re-read + re-stripped only when the file actually changed (Phase 2.7).
-    personaContent = await readPersonaCached(path.join(pluginDataDir, "persona.md"), stripSceneNavigation);
+    personaContent = sendStableBlock
+      ? await readPersonaCached(path.join(pluginDataDir, "persona.md"), stripSceneNavigation)
+      : undefined;
     logger?.debug?.(`${TAG} Persona loaded: ${personaContent ? `${personaContent.length} chars` : "empty"}`);
   } catch {
     logger?.debug?.(`${TAG} No persona file found (expected for new users)`);
@@ -331,7 +378,7 @@ async function performAutoRecallInner(params: {
   let sceneNavigation: string | undefined;
   let sceneCount = 0;
   try {
-    const sceneIndex = await readSceneIndex(pluginDataDir);
+    const sceneIndex = sendStableBlock ? await readSceneIndex(pluginDataDir) : [];
     if (sceneIndex.length > 0) {
       sceneCount = sceneIndex.length;
       sceneNavigation = generateSceneNavigation(sceneIndex, pluginDataDir);
@@ -346,7 +393,7 @@ async function performAutoRecallInner(params: {
   // inject?" gate. The north-star is the one thing that must surface even when a
   // fresh project has no persona/scene/memory yet — otherwise the binding vision
   // is silently dropped exactly when it matters most (the "forgot the vision" bug).
-  const principles = await loadPrinciplesCached(pluginDataDir, projectName);
+  const principles = sendStableBlock ? await loadPrinciplesCached(pluginDataDir, projectName) : undefined;
 
   // "Cambio della guardia" — capture the PREVIOUS session's recap on the FIRST
   // turn of a new session, BEFORE the "anything to inject?" gate below. The
@@ -376,7 +423,7 @@ async function performAutoRecallInner(params: {
     );
     logSlowRecallPhases(logger, totalMs, 0, (tPersonaEnd - tPersonaStart), (tSceneEnd - tSceneStart));
     logger?.debug?.(`${TAG} No memories/persona/scenes/principles to inject`);
-    return undefined;
+    return silentOutcome(params, effectiveStrategy);
   }
 
   // Split recall context into stable and dynamic parts to optimize prompt caching.
@@ -419,7 +466,7 @@ async function performAutoRecallInner(params: {
   // calls on the per-turn critical path. The cache is committed by the caller after
   // a real (non-timed-out) result, so a timed-out first turn recomputes next turn.
   let cornerstoneMiss: { key: string } | undefined;
-  if (cornerstoneTracker && cornerstoneCache && vectorStore) {
+  if (sendStableBlock && cornerstoneTracker && cornerstoneCache && vectorStore) {
     const csKey = params.sessionId ?? params.sessionKey;
     const cached = cornerstoneCache.get(csKey);
     if (cached !== undefined) {
@@ -502,7 +549,7 @@ async function performAutoRecallInner(params: {
   // Append memory tools usage guide to the stable part so the agent knows
   // how to actively retrieve deeper context when the injected snippets
   // are not enough. This is static content and benefits from caching.
-  if (stableParts.length > 0 || prependContext) {
+  if (sendStableBlock && (stableParts.length > 0 || prependContext)) {
     stableParts.push(MEMORY_TOOLS_GUIDE);
   }
 
@@ -521,7 +568,7 @@ async function performAutoRecallInner(params: {
   logSlowRecallPhases(logger, totalMs, bannerHealthMs, (tPersonaEnd - tPersonaStart), (tSceneEnd - tSceneStart));
 
   if (!appendSystemContext && !prependContext) {
-    return undefined;
+    return silentOutcome(params, effectiveStrategy);
   }
 
   return {
@@ -649,14 +696,17 @@ export async function runKbRecall(
    * by WHERE WE ARE (recent events + fingerprint + recent files), not only by the
    * query text. Optional — when absent, only the query-cue path runs (old behavior).
    */
-  sit?: { sessionKey: string; namespace: string; situation?: SessionSituation },
+  sit?: { sessionKey: string; namespace: string; situation?: SessionSituation; sessionId?: string },
   /**
    * `deferWrites` (the gateway sets it): the bookkeeping writes (stakes gate, recall
    * ledger, Hebbian reinforcement) run in ONE batched setImmediate after the result
    * is returned, under a short busy_timeout, instead of inline on the critical path.
    * Default false keeps the historical synchronous behaviour (tests, CLIs).
+   *
+   * `injectionLog` / `chronicNoise` (selective mode only): the per-session de-dup log
+   * and the chronic-noise cache; default to process-wide instances.
    */
-  runOpts?: { deferWrites?: boolean },
+  runOpts?: { deferWrites?: boolean; injectionLog?: RecentInjectionLog; chronicNoise?: ChronicNoiseCache },
 ): Promise<KbRecallResult[]> {
   if (!vectorStore) {
     logger?.debug?.(`${TAG} [kb] vectorStore unavailable — KB recall skipped`);
@@ -679,7 +729,19 @@ export async function runKbRecall(
     }
   };
   const recallEmbeddingTimeoutMs = cfg.embedding?.recallTimeoutMs ?? cfg.embedding?.timeoutMs;
+  const selective = resolveSelective(cfg.recall);
   try {
+    if (selective) {
+      // Phase 3 — "silent unless useful": relevance gate, capped associative tail,
+      // project scoping, de-dup, chronic-noise exclusion, no reinforce-on-retrieval.
+      const picked = await runSelectivePipeline({
+        userText, cfg, sel: selective, store: vectorStore, embeddingService, projectName, sit, logger,
+        phases, doWrite, embeddingTimeoutMs: recallEmbeddingTimeoutMs, runOpts,
+      });
+      scheduleRecallWrites(vectorStore, logger, pendingWrites);
+      lastKbRecallPhases = { ...phases, total: performance.now() - tKbTotal };
+      return picked;
+    }
     // Redact secrets before the KB recall query is embedded (same egress guard
     // as the L1 search path above).
     let results = await kbRecall(redactSecrets(userText), {
@@ -825,6 +887,7 @@ export async function runKbRecall(
     if (typeof recordLedger === "function" && sit?.sessionKey) {
       const ledgerParams = {
         sessionKey: sit.sessionKey,
+        sessionId: sit.sessionId,
         namespace: sit.namespace,
         now: new Date().toISOString(),
         injections: visible.map((r) => ({
@@ -879,6 +942,177 @@ export async function runKbRecall(
     lastKbRecallPhases = { ...phases, total: performance.now() - tKbTotal };
     return [];
   }
+}
+
+// ============================
+// Selective recall pipeline (Phase 3 — "silent unless useful")
+// ============================
+
+/** Process-wide de-dup log (one per gateway process); rebuilt if the configured window changes. */
+let sharedInjectionLog: { turns: number; log: RecentInjectionLog } | undefined;
+const sharedChronicNoise = new ChronicNoiseCache();
+
+function injectionLogFor(turns: number): RecentInjectionLog {
+  if (!sharedInjectionLog || sharedInjectionLog.turns !== turns) {
+    sharedInjectionLog = { turns, log: new RecentInjectionLog(turns) };
+  }
+  return sharedInjectionLog.log;
+}
+
+type SelectiveStore = IMemoryStore & {
+  otherProjectOwnerKeys?: (owners: Array<{ owner_id: string; owner_kind: string }>, project: string | undefined) => Set<string>;
+  isKbNavIndexActive?: () => boolean;
+  chronicNoiseOwnerKeys?: (minInjections: number) => string[];
+  associativeExpand?: (
+    seeds: string[],
+    opts?: {
+      hops?: number;
+      maxNodes?: number;
+      selective?: { project?: string; queryTokens?: readonly string[]; hubFactThreshold: number };
+    },
+  ) => Array<{ owner_id: string; owner_kind: "fact" | "event"; text: string; entity_id: string; activation: number; seedCount?: number }>;
+  gateRecalledUnits?: (u: unknown[], now: string) => void;
+  recordRecallInjections?: (p: {
+    sessionKey: string; sessionId?: string; namespace?: string; now: string;
+    injections: Array<{ ownerId: string; ownerKind: string; score: number; associative: boolean; memoryText: string }>;
+  }) => number;
+  recordSilentTurn?: (p: { sessionKey: string; sessionId?: string; namespace?: string; now: string }) => void;
+  rejectedOwnerKeys?: (u: Array<{ owner_id: string; owner_kind: string }>) => Set<string>;
+};
+
+interface SelectivePipelineArgs {
+  userText: string;
+  cfg: MemoryTdaiConfig;
+  sel: SelectiveRecallConfig;
+  store: IMemoryStore;
+  embeddingService?: EmbeddingService;
+  projectName?: string;
+  sit?: { sessionKey: string; namespace: string; situation?: SessionSituation; sessionId?: string };
+  logger?: Logger;
+  phases: PhaseTimings;
+  doWrite: (name: string, run: () => void) => void;
+  embeddingTimeoutMs?: number;
+  runOpts?: { injectionLog?: RecentInjectionLog; chronicNoise?: ChronicNoiseCache };
+}
+
+async function runSelectivePipeline(a: SelectivePipelineArgs): Promise<KbRecallResult[]> {
+  const store = a.store as SelectiveStore;
+  const { sel, sit } = a;
+  const session = sit?.sessionId ?? sit?.sessionKey ?? "";
+  const log = a.runOpts?.injectionLog ?? injectionLogFor(sel.dedupTurns);
+  const recent = session ? log.recent(session) : new Set<string>();
+  const chronic = (a.runOpts?.chronicNoise ?? sharedChronicNoise).keys(store, sel);
+  const hasProject = typeof store.otherProjectOwnerKeys === "function";
+
+  // Owners that must not be shown this turn: another project's, chronic noise, shown in the last N turns.
+  const excludeOwners = (owners: Array<{ owner_id: string; owner_kind: string }>): Set<string> => {
+    const out = new Set<string>();
+    for (const o of owners) {
+      const k = ownerKey(o.owner_kind, o.owner_id);
+      if (recent.has(k) || chronic.has(k)) out.add(k);
+    }
+    if (hasProject) for (const k of store.otherProjectOwnerKeys!(owners, a.projectName)) out.add(k);
+    return out;
+  };
+
+  const vectorReady = !!a.embeddingService && store.isKbNavIndexActive?.() === true;
+  let picked = await kbRecallSelective(redactSecrets(a.userText), {
+    store, embeddingService: a.embeddingService, selective: sel, excludeOwners,
+    skipVector: !vectorReady, allowBruteForceVector: false,
+    embeddingTimeoutMs: a.embeddingTimeoutMs, phaseMs: a.phases, logger: a.logger,
+  });
+
+  picked = dropRejected(store, picked);
+  if (picked.length > 0) picked = picked.concat(selectiveAssociates(a, store, picked, excludeOwners));
+  // Memory text can carry a secret the extractor missed (an api key in a fact value): never inject or log it.
+  picked = picked.slice(0, sel.maxLines).map((r) => ({ ...r, text: redactSecrets(r.text) }));
+
+  if (session) log.commit(session, picked.map((r) => ownerKey(r.owner_kind, r.owner_id)));
+  writeSelectiveBookkeeping(a, store, picked);
+  return picked;
+}
+
+/** Tombstoned (rejected) memories never drive action again — same rule as the legacy path. */
+function dropRejected(store: SelectiveStore, results: KbRecallResult[]): KbRecallResult[] {
+  if (typeof store.rejectedOwnerKeys !== "function" || results.length === 0) return results;
+  const rejected = store.rejectedOwnerKeys(results.map((r) => ({ owner_id: r.owner_id, owner_kind: r.owner_kind })));
+  return rejected.size === 0 ? results : results.filter((r) => !rejected.has(ownerKey(r.owner_kind, r.owner_id)));
+}
+
+/**
+ * The associative tail, selective: only when the query already produced something
+ * relevant, seeded by those hits plus the situation, and only what several seeds
+ * converge on (≥ minAssociativeSeeds), strongly (normalized activation ≥ floor), at
+ * most maxAssociative, within the total line budget.
+ */
+function selectiveAssociates(
+  a: SelectivePipelineArgs,
+  store: SelectiveStore,
+  base: KbRecallResult[],
+  excludeOwners: (owners: Array<{ owner_id: string; owner_kind: string }>) => Set<string>,
+): KbRecallResult[] {
+  const room = Math.min(a.sel.maxAssociative, a.sel.maxLines - base.length);
+  if (room <= 0 || typeof store.associativeExpand !== "function") return [];
+  const t0 = performance.now();
+  try {
+    const querySeeds = [...new Set(base.map((r) => r.entity_id).filter((x): x is string => !!x))];
+    const situationSeeds = a.sit?.sessionKey
+      ? buildSituationSeeds(store, {
+          sessionKey: a.sit.sessionKey, namespace: a.sit.namespace, situation: a.sit.situation,
+          project: a.projectName, logger: a.logger,
+        }).map((s) => s.id)
+      : [];
+    const seeds = [...new Set([...querySeeds, ...situationSeeds])];
+    if (seeds.length < a.sel.minAssociativeSeeds) return [];
+    const expanded = store.associativeExpand(seeds, {
+      hops: 2,
+      maxNodes: a.sel.maxAssociative * 2,
+      selective: { project: a.projectName, queryTokens: distinctiveTokens(a.userText), hubFactThreshold: a.sel.hubFactThreshold },
+    });
+    const have = new Set(base.map((r) => ownerKey(r.owner_kind, r.owner_id)));
+    const blocked = excludeOwners(expanded.map((x) => ({ owner_id: x.owner_id, owner_kind: x.owner_kind })));
+    const fresh = expanded.filter((x) => {
+      const k = ownerKey(x.owner_kind, x.owner_id);
+      return !have.has(k) && !blocked.has(k);
+    });
+    return selectAssociative(fresh, a.sel).slice(0, room).map((x) => ({
+      owner_id: x.owner_id,
+      owner_kind: x.owner_kind,
+      score: x.normalizedActivation,
+      text: x.text,
+      entity_id: x.entity_id,
+      associative: true,
+    }));
+  } catch (err) {
+    a.logger?.warn?.(`${TAG} [kb] selective associative pass failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  } finally {
+    a.phases.expand = performance.now() - t0;
+  }
+}
+
+/** Ledger (with the cc session id), silent-turn marker and the stakes gate. No reinforcement. */
+function writeSelectiveBookkeeping(a: SelectivePipelineArgs, store: SelectiveStore, picked: KbRecallResult[]): void {
+  const now = new Date().toISOString();
+  if (typeof store.gateRecalledUnits === "function" && picked.length > 0) {
+    const units = picked.map((r) => ({ owner_id: r.owner_id, owner_kind: r.owner_kind, text: r.text }));
+    a.doWrite("gate", () => store.gateRecalledUnits!(units, now));
+  }
+  if (!a.sit?.sessionKey) return;
+  const base = { sessionKey: a.sit.sessionKey, sessionId: a.sit.sessionId, namespace: a.sit.namespace, now };
+  if (picked.length === 0) {
+    if (typeof store.recordSilentTurn === "function") a.doWrite("silent", () => store.recordSilentTurn!(base));
+    return;
+  }
+  if (typeof store.recordRecallInjections !== "function") return;
+  const injections = picked.map((r) => ({
+    ownerId: r.owner_id, ownerKind: r.owner_kind, score: r.score, associative: !!r.associative, memoryText: r.text,
+  }));
+  a.doWrite("ledger", () => {
+    try {
+      store.recordRecallInjections!({ ...base, injections });
+    } catch { /* best-effort: bookkeeping never breaks recall */ }
+  });
 }
 
 // ============================

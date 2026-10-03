@@ -385,6 +385,10 @@ async function recallWithFallbacks(
   const error = recall.error ?? null;
   let context = recall.context ?? "";
 
+  // The gateway answered "nothing relevant" on purpose (selective recall): that silence is
+  // the feature. Filling it with an L0 search would put noise back into 50%+ of the turns.
+  if (!context && error === null && recall.silent === true) return { context: "", error };
+
   // Fallback 1: daemon /search/conversations (FTS5 BM25 on L0 table). Only when
   // the gateway ANSWERED (a timeout means it is busy: asking again just queues)
   // and enough of the deadline is left to wait for it.

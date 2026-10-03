@@ -144,7 +144,7 @@ export interface KbRecallOptions {
 export type PhaseTimings = Record<string, number>;
 
 /** Run `fn`, adding its duration to `phaseMs[key]` when a collector is supplied. */
-function timed<T>(phaseMs: PhaseTimings | undefined, key: string, fn: () => T): T {
+export function timed<T>(phaseMs: PhaseTimings | undefined, key: string, fn: () => T): T {
   if (!phaseMs) return fn();
   const t0 = performance.now();
   try {
@@ -189,13 +189,15 @@ export const noopReranker: Reranker = {
 // ============================
 
 /** One owner candidate from a single source, with its rank in that source list. */
-interface RankedCandidate {
+export interface RankedCandidate {
   ownerId: string;
   ownerKind: KbRecallOwnerKind;
   /** 0-based rank within the source list this candidate came from. */
   rank: number;
   /** Raw cosine (0-1) if this candidate came from the vector source, else undefined. */
   cosine?: number;
+  /** BM25-derived 0-1 score if this candidate came from the FTS source, else undefined. */
+  ftsScore?: number;
 }
 
 /** A candidate after RRF fusion across sources (collapsed by owner_id). */
@@ -206,6 +208,8 @@ export interface FusedCandidate {
   rrfScore: number;
   /** Best cosine across vector hits for this owner (undefined if never a vector hit). */
   cosine?: number;
+  /** Best BM25-derived 0-1 score across FTS hits for this owner (undefined if never an FTS hit). */
+  ftsScore?: number;
   /** Whether this owner appeared in the FTS (exact-term) source. */
   fromFts: boolean;
   /** Whether this owner appeared in the entity-name-match source. */
@@ -260,7 +264,7 @@ function tokenizeQuery(query: string): string[] {
 // ============================
 
 /** Source A: BM25 over kb_fts. */
-function recallFts(
+export function recallFts(
   store: IMemoryStore,
   query: string,
   limit: number,
@@ -275,6 +279,7 @@ function recallFts(
       ownerId: r.owner_id,
       ownerKind: normalizeOwnerKind(r.owner_kind),
       rank,
+      ftsScore: r.score,
     }));
   } catch (err) {
     logger?.warn?.(`${TAG} FTS candidate source failed (non-fatal): ${errMsg(err)}`);
@@ -283,7 +288,7 @@ function recallFts(
 }
 
 /** Source B: embed the query (hardened path) + cosine over kb_vec. */
-async function recallVector(
+export async function recallVector(
   store: IMemoryStore,
   embeddingService: EmbeddingService | undefined,
   query: string,
@@ -353,7 +358,7 @@ function recallEntityMatch(
  * contributions (same semantics as the L1 hybrid path). We carry the best cosine
  * + source-membership flags so later stages can calibrate the score.
  */
-function fuseRrf(sources: RankedCandidate[][]): FusedCandidate[] {
+export function fuseRrf(sources: RankedCandidate[][]): FusedCandidate[] {
   const map = new Map<string, FusedCandidate>();
   const SOURCE_FTS = 0;
   const SOURCE_ENTITY = 2;
@@ -367,6 +372,9 @@ function fuseRrf(sources: RankedCandidate[][]): FusedCandidate[] {
         if (cand.cosine != null) {
           existing.cosine = Math.max(existing.cosine ?? 0, cand.cosine);
         }
+        if (cand.ftsScore != null) {
+          existing.ftsScore = Math.max(existing.ftsScore ?? 0, cand.ftsScore);
+        }
         if (sourceIndex === SOURCE_FTS) existing.fromFts = true;
         if (sourceIndex === SOURCE_ENTITY) existing.fromEntityMatch = true;
       } else {
@@ -375,6 +383,7 @@ function fuseRrf(sources: RankedCandidate[][]): FusedCandidate[] {
           ownerKind: cand.ownerKind,
           rrfScore: contribution,
           cosine: cand.cosine,
+          ftsScore: cand.ftsScore,
           fromFts: sourceIndex === SOURCE_FTS,
           fromEntityMatch: sourceIndex === SOURCE_ENTITY,
         });

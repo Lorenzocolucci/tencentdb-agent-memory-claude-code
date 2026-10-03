@@ -80,6 +80,27 @@ export function recordInjections(db: DatabaseSync, params: RecordInjectionsParam
   }
 }
 
+/**
+ * Note a turn on which recall chose to inject NOTHING. The ledger otherwise only
+ * ever sees injections, so "how often is memory silent?" would be unanswerable.
+ * Stored as an already-settled marker row (owner_kind 'turn'); every reader of the
+ * ledger excludes that kind. Never throws.
+ */
+export function recordSilentTurn(
+  db: DatabaseSync,
+  params: { sessionKey: string; sessionId?: string; namespace?: string; now: string },
+): void {
+  try {
+    db.prepare(
+      `INSERT INTO recall_ledger
+         (id, ts, session_key, session_id, owner_id, owner_kind, score, associative, memory_text, judged, unjudgeable, namespace)
+       VALUES (?, ?, ?, ?, 'silent-turn', 'turn', 0, 0, '', 1, 1, ?)`,
+    ).run(ulidLike("rl"), params.now, params.sessionKey, params.sessionId ?? "", params.namespace ?? "default");
+  } catch {
+    /* bookkeeping must never break recall */
+  }
+}
+
 export interface JudgePendingParams {
   sessionKey: string;
   userText: string;
@@ -92,6 +113,8 @@ export interface JudgePendingParams {
 export interface JudgePendingResult extends TurnVerdict {
   /** Rows retired because they were older than the window. */
   expired: number;
+  /** Owners the reply actually drew on — the ONLY ones reinforcement may reward. */
+  usedOwners: Array<{ ownerId: string; ownerKind: string }>;
 }
 
 /**
@@ -104,17 +127,18 @@ export function judgePending(
   logger?: { warn?(msg: string): void },
 ): JudgePendingResult {
   const empty: JudgePendingResult = {
-    injected: 0, used: 0, unjudgeable: 0, perMemory: [], expired: 0,
+    injected: 0, used: 0, unjudgeable: 0, perMemory: [], expired: 0, usedOwners: [],
   };
   try {
     const pending = db
       .prepare(
-        `SELECT id, owner_id, memory_text, ts FROM recall_ledger
-          WHERE session_key = ? AND judged = 0 ORDER BY ts ASC`,
+        `SELECT id, owner_id, owner_kind, memory_text, ts FROM recall_ledger
+          WHERE session_key = ? AND judged = 0 AND owner_kind != 'turn' ORDER BY ts ASC`,
       )
       .all(params.sessionKey) as Array<{
         id: string;
         owner_id: string;
+        owner_kind: string;
         memory_text: string;
         ts: string;
       }>;
@@ -172,7 +196,10 @@ export function judgePending(
       throw err;
     }
 
-    return { ...verdict, expired: expiredIds.length };
+    const usedOwners = fresh
+      .filter((r) => byOwner.get(r.owner_id)?.used)
+      .map((r) => ({ ownerId: r.owner_id, ownerKind: r.owner_kind }));
+    return { ...verdict, expired: expiredIds.length, usedOwners };
   } catch (err) {
     logger?.warn?.(
       `${TAG} judgePending failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
@@ -220,7 +247,7 @@ export function readVerdict(db: DatabaseSync, params: ReadVerdictParams = {}): R
     usefulness: null, topUsed: [], topNoise: [],
   };
   try {
-    const where: string[] = [];
+    const where: string[] = ["owner_kind != 'turn'"]; // silent-turn markers are not memories
     const args: unknown[] = [];
     if (params.sessionKey) { where.push("session_key = ?"); args.push(params.sessionKey); }
     if (params.sinceTs) { where.push("ts >= ?"); args.push(params.sinceTs); }

@@ -18,6 +18,13 @@ export function sanitizeText(text: string): string {
   cleaned = cleaned.replace(/<relevant-scenes>[\s\S]*?<\/relevant-scenes>/g, "");
   cleaned = cleaned.replace(/<scene-navigation>[\s\S]*?<\/scene-navigation>/g, "");
 
+  // Remove Claude Code's machine-generated wrappers (background-task notifications and
+  // messages from another session): they are not what the user said, so they must not be
+  // captured as user turns, extracted into memory, or used as a recall query. An unclosed
+  // block (truncated prompt) is dropped to the end of the text.
+  cleaned = cleaned.replace(/<task-notification>[\s\S]*?(?:<\/task-notification>|$)/g, "");
+  cleaned = cleaned.replace(/^\s*Another Claude session sent a message[\s\S]*$/i, "");
+
   // Remove offload-injected task context blocks (MMD mermaid diagrams)
   cleaned = cleaned.replace(/<current_task_context>[\s\S]*?<\/current_task_context>/g, "");
   cleaned = cleaned.replace(/<history_task_context[\s\S]*?<\/history_task_context>/g, "");

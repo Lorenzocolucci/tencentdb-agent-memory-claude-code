@@ -639,6 +639,7 @@ export class TdaiGateway {
       context,
       strategy: result.recallStrategy,
       memory_count: result.recalledL1Memories?.length ?? 0,
+      ...(!context && result.silent === true ? { silent: true } : {}),
     };
     sendJson(res, 200, response);
   }
