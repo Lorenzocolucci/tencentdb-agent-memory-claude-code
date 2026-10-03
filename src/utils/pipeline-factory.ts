@@ -26,6 +26,7 @@ import { CheckpointManager } from "./checkpoint.js";
 import type { PipelineSessionState } from "./checkpoint.js";
 import { createStoreBundle } from "../core/store/factory.js";
 import type { IMemoryStore } from "../core/store/types.js";
+import type { VectorStoreOptions } from "../core/store/sqlite.js";
 import type { EmbeddingService } from "../core/store/embedding.js";
 import {
   readManifest,
@@ -236,10 +237,11 @@ export function initStores(
   cfg: MemoryTdaiConfig,
   pluginDataDir: string,
   logger: PipelineLogger,
+  storeOptions?: VectorStoreOptions,
 ): Promise<StoreInitResult> {
   const key = pluginDataDir;
   if (!_storeInitCache.has(key)) {
-    _storeInitCache.set(key, _doInitStores(cfg, pluginDataDir, logger));
+    _storeInitCache.set(key, _doInitStores(cfg, pluginDataDir, logger, storeOptions));
   }
   return _storeInitCache.get(key)!;
 }
@@ -269,6 +271,7 @@ async function _doInitStores(
   cfg: MemoryTdaiConfig,
   pluginDataDir: string,
   logger: PipelineLogger,
+  storeOptions?: VectorStoreOptions,
 ): Promise<StoreInitResult> {
   let vectorStore: IMemoryStore | undefined;
   let embeddingService: EmbeddingService | undefined;
@@ -279,6 +282,7 @@ async function _doInitStores(
     const bundle = createStoreBundle(cfg, {
       dataDir: pluginDataDir,
       logger,
+      storeOptions,
     });
     vectorStore = bundle.store;
     embeddingService = bundle.embedding ?? undefined;

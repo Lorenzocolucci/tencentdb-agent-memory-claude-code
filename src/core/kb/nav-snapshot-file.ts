@@ -22,6 +22,7 @@
  */
 
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 
 import type { NavigableIndexTopology } from "./navigable-index.js";
 
@@ -102,6 +103,15 @@ export function readKbNavSnapshot(path: string): string | null {
   try {
     if (!existsSync(path)) return null;
     return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/** Same as {@link readKbNavSnapshot} but the 16 MB read happens off the event loop. */
+export async function readKbNavSnapshotAsync(path: string): Promise<string | null> {
+  try {
+    return await readFile(path, "utf8");
   } catch {
     return null;
   }

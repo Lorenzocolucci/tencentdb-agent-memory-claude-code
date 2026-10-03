@@ -127,6 +127,9 @@ function mulberry32(seed: number): () => number {
   };
 }
 
+/** Nodes processed between yields of the cooperative restore. */
+const RESTORE_YIELD_EVERY = 512;
+
 /**
  * Binary heap. `compare(a, b) < 0` means `a` has priority (comes out first).
  * Min-heap over distance = nearest first; max-heap = farthest first.
@@ -475,6 +478,40 @@ export class NavigableIndex {
     topo: NavigableIndexTopology,
     vecById: Map<string, Float32Array>,
   ): { index: NavigableIndex; placedIds: Set<string>; missingIds: string[] } {
+    const gen = NavigableIndex.restoreSteps(topo, vecById);
+    let step = gen.next();
+    while (!step.done) step = gen.next();
+    return step.value;
+  }
+
+  /**
+   * Same as {@link restoreFromTopology}, but hands the event loop back every `sliceMs`
+   * of work (validating + normalizing ~70k 1024-d vectors is seconds of synchronous CPU,
+   * which froze the HTTP gateway at every boot / reload).
+   */
+  static async restoreFromTopologyCooperative(
+    topo: NavigableIndexTopology,
+    vecById: Map<string, Float32Array>,
+    sliceMs = 8,
+  ): Promise<{ index: NavigableIndex; placedIds: Set<string>; missingIds: string[] }> {
+    const gen = NavigableIndex.restoreSteps(topo, vecById);
+    let sliceStart = performance.now();
+    let step = gen.next();
+    while (!step.done) {
+      if (performance.now() - sliceStart > sliceMs) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        sliceStart = performance.now();
+      }
+      step = gen.next();
+    }
+    return step.value;
+  }
+
+  /** The restore algorithm as a generator: it yields every {@link RESTORE_YIELD_EVERY} nodes, the drivers decide when to pause. */
+  private static *restoreSteps(
+    topo: NavigableIndexTopology,
+    vecById: Map<string, Float32Array>,
+  ): Generator<void, { index: NavigableIndex; placedIds: Set<string>; missingIds: string[] }, void> {
     if (!topo || topo.version !== 1 || !Number.isInteger(topo.dim) || topo.dim <= 0) {
       throw new RangeError("NavigableIndex.restoreFromTopology: invalid or unsupported topology");
     }
@@ -491,6 +528,7 @@ export class NavigableIndex {
     const missingIds: string[] = [];
     let newCount = 0;
     for (let i = 0; i < n; i++) {
+      if (i % RESTORE_YIELD_EVERY === 0) yield;
       const node = topo.nodes[i];
       if (!node || typeof node.id !== "string") {
         throw new RangeError("NavigableIndex.restoreFromTopology: invalid node");
@@ -527,6 +565,7 @@ export class NavigableIndex {
     const placedIds = new Set<string>();
     let maxLevel = 0;
     for (let i = 0; i < n; i++) {
+      if (i % RESTORE_YIELD_EVERY === 0) yield;
       if (oldToNew[i] === -1) continue;
       const node = topo.nodes[i];
       const neighbors: number[][] = node.neighbors.map((layer: number[]) => {
