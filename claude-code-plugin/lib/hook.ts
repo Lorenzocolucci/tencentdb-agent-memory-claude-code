@@ -5,7 +5,7 @@
  *   node ${CLAUDE_PLUGIN_ROOT}/dist/lib/hook.mjs <event-name>
  *
  * Where <event-name> is one of:
- *   session-start | user-prompt-submit | post-tool-use | post-tool-use-failure |
+ *   session-start | user-prompt-submit | pre-tool-use | post-tool-use | post-tool-use-failure |
  *   stop | search | search-stdin | status | clear-session | confirm | reject
  */
 
@@ -14,6 +14,7 @@ import {
   DUPLICATE_PROMPT_WINDOW_MS,
   FALLBACK_MARGIN_MS,
   FALLBACK_MIN_REMAINING_MS,
+  PRETOOL_DEADLINE_MS,
   RECALL_MISS_ALARM_THRESHOLD,
   RECALL_TIMEOUT_MS,
   STOP_DEADLINE_MS,
@@ -42,6 +43,7 @@ const CAPTURE_BACKLOG_ALARM_S = 15 * 60;
 export type HookEvent =
   | "session-start"
   | "user-prompt-submit"
+  | "pre-tool-use"
   | "post-tool-use"
   | "post-tool-use-failure"
   | "stop"
@@ -68,6 +70,8 @@ export interface HookInput {
   upsDeadlineMs?: number;
   /** Override of STOP_DEADLINE_MS (tests). */
   stopDeadlineMs?: number;
+  /** Override of PRETOOL_DEADLINE_MS (tests). */
+  preToolDeadlineMs?: number;
 }
 
 export async function handleHook(event: HookEvent, input: HookInput): Promise<string> {
@@ -78,6 +82,8 @@ export async function handleHook(event: HookEvent, input: HookInput): Promise<st
       return handleSessionStart(data, input.client, dataDir);
     case "user-prompt-submit":
       return handleUserPromptSubmit(data, input.client, dataDir, input);
+    case "pre-tool-use":
+      return handlePreToolUse(data, input.client, input.preToolDeadlineMs ?? PRETOOL_DEADLINE_MS);
     case "post-tool-use":
       return handlePostToolUse(data, input.client);
     case "post-tool-use-failure":
@@ -499,6 +505,57 @@ function stringifyToolOutput(
 /** Max characters of a SUCCESSFUL destructive command's output forwarded. */
 const MAX_DESTRUCTIVE_OUTPUT_CHARS = 400;
 
+/**
+ * PreToolUse (Phase 4): memory that arrives BEFORE the agent acts. Asks the
+ * gateway whether this Bash command / file edit repeats a known mistake in THIS
+ * project. Output is either an `additionalContext` warning, or — for an attested
+ * lesson on a one-way action — `permissionDecision: "deny"` with the reason.
+ *
+ * FAILS OPEN: any error, timeout or unreachable/starting gateway yields "" (exit
+ * 0, no output). Never raises or prints alarms: a memory problem must not become
+ * noise on every tool call, and must never block work.
+ */
+async function handlePreToolUse(
+  data: HookStdin,
+  client: GatewayClient,
+  deadlineMs: number,
+): Promise<string> {
+  const toolName = data.tool_name ?? "";
+  if (!toolName) return "";
+  try {
+    const cwd = data.cwd ?? process.cwd();
+    const command = (data.tool_input as { command?: unknown } | undefined)?.command;
+    const oneWay = toolName === "Bash" ? matchDestructiveCommand(command) : null;
+    const result = await raceDeadline(
+      client.pretool({
+        sessionKey: getSessionKey(cwd),
+        project: getProjectName(cwd),
+        cwd,
+        toolName,
+        toolInput: data.tool_input,
+        oneWay,
+      }),
+      deadlineMs,
+    );
+    const answer = result.timedOut ? null : result.value;
+    if (!answer) return "";
+    if (answer.decision === "deny") {
+      return JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: answer.message,
+        },
+      });
+    }
+    return JSON.stringify({
+      hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: answer.message },
+    });
+  } catch {
+    return "";
+  }
+}
+
 async function handlePostToolUse(data: HookStdin, client: GatewayClient): Promise<string> {
   // Proactive injection by SITUATION (Track A 3+4): when the agent touches a
   // file, surface what the graph already knows about it. Silent (returns "")
@@ -541,6 +598,9 @@ async function handlePostToolUse(data: HookStdin, client: GatewayClient): Promis
     toolOutputIsError: data.tool_output_is_error,
     toolOutputText,
     toolRisk,
+    project: getProjectName(cwd),
+    cwd,
+    skipFileMemory: true,
   });
   if (!context) return "";
 
@@ -578,6 +638,9 @@ async function handlePostToolUseFailure(data: HookStdin, client: GatewayClient):
     toolInput: data.tool_input,
     toolOutputIsError: true,
     toolOutputText,
+    project: getProjectName(cwd),
+    cwd,
+    skipFileMemory: true,
   });
   if (!context) return "";
 
@@ -1027,8 +1090,10 @@ async function main(): Promise<void> {
   // NO SILENT FAILURE #1: losing our own data dir is what actually happened on
   // 2026-08-13 (Claude Code changed the plugin install layout). Everything
   // downstream then failed with "no daemon, skipped" in a log nobody reads.
+  // pre-tool-use runs before EVERY tool call and fails open: it never raises or prints alarms.
+  const quiet = event === "pre-tool-use";
   if (dataDirSource === "fallback") {
-    await raiseAlarm(
+    if (!quiet) await raiseAlarm(
       dataDir,
       "data-dir-lost",
       "il plugin non trova la cartella del gateway — cattura e recall SPENTI",
@@ -1043,7 +1108,7 @@ async function main(): Promise<void> {
   // candidate. Writing there would bury every new memory in a stale database
   // while everything looked healthy.
   if (dataDirIsBackup) {
-    await raiseAlarm(
+    if (!quiet) await raiseAlarm(
       dataDir,
       "writing-to-backup",
       "la memoria sta puntando a una cartella di BACKUP — i nuovi ricordi finirebbero in un archivio vecchio",
@@ -1094,6 +1159,10 @@ async function main(): Promise<void> {
       // logged 6 times over 10 days and nobody ever saw it. `user-prompt-submit`
       // is excluded only because it is the hook that DELIVERS alarms — it
       // already reports the condition below, without recording itself.
+      // pre-tool-use fails open and silent (it runs before EVERY tool call).
+      if (quiet) {
+        return;
+      }
       if (event !== "user-prompt-submit") {
         await raiseAlarm(
           dataDir,
@@ -1138,7 +1207,7 @@ async function main(): Promise<void> {
     // because they all live inside the try block that never completes.
     // Verified live on 2026-08-23: with the token file removed, session-start,
     // user-prompt-submit and stop all exited 0 and said nothing at all.
-    await reportHookCrash(dataDir, event, err);
+    if (!quiet) await reportHookCrash(dataDir, event, err);
     // The prompt hook is the only channel Claude Code renders to the user, so
     // when IT is the one that crashed, it must still speak before it dies.
     if (event === "user-prompt-submit") {
@@ -1153,7 +1222,7 @@ async function main(): Promise<void> {
   // UPS and Stop race a deadline: a request that lost the race is still open and
   // would keep the process alive until Claude Code kills it. Output is already
   // flushed (emitThenAck awaits the write), so leave now.
-  if (event === "user-prompt-submit" || event === "stop") process.exit(0);
+  if (event === "user-prompt-submit" || event === "stop" || event === "pre-tool-use") process.exit(0);
 }
 
 function writeStdout(text: string): Promise<void> {

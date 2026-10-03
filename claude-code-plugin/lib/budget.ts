@@ -15,6 +15,7 @@
 export const HOOK_TIMEOUT_S = {
   sessionStart: 30,
   userPromptSubmit: 7,
+  preToolUse: 3,
   postToolUse: 4,
   postToolUseFailure: 4,
   stop: 45,
@@ -26,6 +27,10 @@ export const UPS_DEADLINE_MS = 5_800;
 export const RECALL_TIMEOUT_MS = 4_500;
 /** POST /observe (PostToolUse): must fit inside the 4 s hook timeout. */
 export const OBSERVE_TIMEOUT_MS = 2_500;
+/** POST /pretool (PreToolUse): the gateway answers from memory in < 300 ms; 1.5 s is the ceiling, hook timeout is 3 s. Fails open. */
+export const PRETOOL_TIMEOUT_MS = 1_500;
+/** PreToolUse: internal deadline for the whole hook body (stdin already read), 0.5 s below the hook timeout. */
+export const PRETOOL_DEADLINE_MS = 2_500;
 /** POST /capture, per attempt (two attempts + 2 s gap, inside STOP_DEADLINE_MS). */
 export const CAPTURE_TIMEOUT_MS = 12_000;
 /** Stop: internal deadline, 5 s below the hook timeout. */

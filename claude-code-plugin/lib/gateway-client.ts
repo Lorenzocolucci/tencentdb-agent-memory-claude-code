@@ -19,7 +19,7 @@
 import http from "node:http";
 import { appendFile, readFile } from "node:fs/promises";
 import { URL } from "node:url";
-import { CAPTURE_TIMEOUT_MS, OBSERVE_TIMEOUT_MS, RECALL_TIMEOUT_MS } from "./budget.js";
+import { CAPTURE_TIMEOUT_MS, OBSERVE_TIMEOUT_MS, PRETOOL_TIMEOUT_MS, RECALL_TIMEOUT_MS } from "./budget.js";
 
 // --- Timeouts live in ./budget.ts (single source of truth, drift-tested against hooks.json) ---
 export { CAPTURE_TIMEOUT_MS, RECALL_TIMEOUT_MS };
@@ -43,6 +43,13 @@ export function resolveCaptureTimeoutMs(env: NodeJS.ProcessEnv = process.env): n
 }
 /** Default timeout for all other requests (health, search, sessionEnd). */
 export const DEFAULT_TIMEOUT_MS = 5_000;
+
+/** A memory warning (additionalContext) or stop (permission deny) for a tool call. */
+export interface PretoolAnswer {
+  decision: "warn" | "deny";
+  message: string;
+  lessonId?: string;
+}
 
 export interface GatewayClientConfig {
   baseUrl: string;
@@ -259,6 +266,11 @@ export class GatewayClient {
     toolOutputText?: string;
     /** Set when a successful Bash command matched the destructive list. */
     toolRisk?: ToolRisk;
+    /** Phase 4.3: project + cwd so a failure can return its matching lesson / past fix. */
+    project?: string;
+    cwd?: string;
+    /** Phase 4.6: `<file-memory>` now arrives before the edit (/pretool). */
+    skipFileMemory?: boolean;
   }): Promise<string> {
     try {
       const token = await this.freshToken();
@@ -272,6 +284,9 @@ export class GatewayClient {
           tool_output_text: payload.toolOutputText,
           tool_output_is_error: payload.toolOutputIsError,
           tool_risk: payload.toolRisk,
+          project: payload.project,
+          cwd: payload.cwd,
+          skip_file_memory: payload.skipFileMemory,
         },
         token,
         OBSERVE_TIMEOUT_MS,
@@ -285,6 +300,49 @@ export class GatewayClient {
     } catch (err) {
       await this.logFailure("POST", "/observe", err instanceof Error ? err.message : String(err));
       return "";
+    }
+  }
+
+  /**
+   * POST /pretool — PreToolUse: ask memory whether this tool call repeats a known
+   * mistake. FAILS OPEN: any error, timeout, 503 (gateway starting) or non-200
+   * returns null and the tool call proceeds untouched.
+   */
+  async pretool(payload: {
+    sessionKey: string;
+    project: string;
+    cwd?: string;
+    toolName: string;
+    toolInput?: unknown;
+    /** Destructive-command label when the action is one-way. */
+    oneWay?: string | null;
+  }): Promise<PretoolAnswer | null> {
+    try {
+      const token = await this.freshToken();
+      const { status, body } = await this.rawRequest(
+        "POST",
+        "/pretool",
+        {
+          session_key: payload.sessionKey,
+          project: payload.project,
+          cwd: payload.cwd,
+          tool_name: payload.toolName,
+          tool_input: payload.toolInput,
+          one_way: payload.oneWay ?? null,
+        },
+        token,
+        PRETOOL_TIMEOUT_MS,
+      );
+      if (status !== 200) {
+        await this.logFailure("POST", "/pretool", this.describeStatus(status, body));
+        return null;
+      }
+      const parsed = JSON.parse(body) as { decision?: string; message?: string; lesson_id?: string };
+      if ((parsed.decision !== "warn" && parsed.decision !== "deny") || !parsed.message) return null;
+      return { decision: parsed.decision, message: parsed.message, lessonId: parsed.lesson_id };
+    } catch (err) {
+      await this.logFailure("POST", "/pretool", err instanceof Error ? err.message : String(err));
+      return null;
     }
   }
 

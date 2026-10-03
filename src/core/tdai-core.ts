@@ -1293,6 +1293,11 @@ export class TdaiCore {
     toolOutputText?: string;
     /** CONTRACT point 1: the plugin flagged this call as destructive. */
     toolRisk?: "destructive";
+    /**
+     * Phase 4.6: `<file-memory>` is served BEFORE the edit by /pretool, so the
+     * plugin asks PostToolUse not to inject the single-file block again.
+     */
+    skipFileMemory?: boolean;
   }): Promise<{ inject?: string }> {
     if (!obs.sessionKey) return {};
     await this.storeReady?.catch(() => {});
@@ -1356,7 +1361,7 @@ export class TdaiCore {
     const surfacedNow: string[] = [];
 
     // ── Path 1: single-file injection (once per file per session) ──
-    if (situation.filePath && fileKey) {
+    if (situation.filePath && fileKey && obs.skipFileMemory !== true) {
       let injectedFiles = this.injectedFilesBySession.get(obs.sessionKey);
       if (!injectedFiles) {
         injectedFiles = new Set<string>();

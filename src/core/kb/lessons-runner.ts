@@ -13,6 +13,7 @@ import type { EmbeddingReader } from "./bug-embeddings.js";
 import { extractErrorSignatures } from "./error-signature-extractor.js";
 import { clusterTrigger, canonicalTrigger, type PerBugBreakdown } from "./lesson-trigger.js";
 import { loadEntityMap, resolvePerBugFiles, loadFixTexts } from "./lessons-runner-db.js";
+import { isRealProjectKey } from "./project-key.js";
 import {
   distillLesson,
   type DistillableCluster,
@@ -161,7 +162,8 @@ async function processCluster(
     db,
     {
       namespace: cluster.namespace,
-      project: cluster.project,
+      // 4.5: only a real project key is stored; junk ("src", "AI", digits) becomes "".
+      project: isRealProjectKey(cluster.project) ? cluster.project : "",
       domain: distilled.domain,
       triggerPattern,
       lessonText: distilled.lessonText,

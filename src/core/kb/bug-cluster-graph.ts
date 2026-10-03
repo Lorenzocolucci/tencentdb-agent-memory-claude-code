@@ -14,6 +14,7 @@ import {
   type BugEventFeatures,
 } from "./bug-similarity.js";
 import { UnionFind } from "./union-find.js";
+import { pickClusterProject } from "./project-key.js";
 import type { FailureCluster } from "./bug-clusters.js";
 
 // ── Internal row shape (subset used here) ─────────────────────────────────────
@@ -126,7 +127,9 @@ export function buildClusters(
       distinctSessionCount: sessionSet.size,
       sessionKeys: [...sessionSet].sort(),
       namespace: firstNode?.namespace ?? "default",
-      project: firstNode?.project ?? "",
+      // Real project key shared by the cluster's events (majority), never the
+      // first event's raw value — that put "src"/"AI"/digits into lessons.project.
+      project: pickClusterProject(sortedIds.map((id) => nodeById.get(id)?.project)),
       files: [...fileUnion].sort(),
       entityIds: [...entityUnion].sort(),
       // errorSignatures populated by B2 (lesson-trigger); intentionally [] here.
