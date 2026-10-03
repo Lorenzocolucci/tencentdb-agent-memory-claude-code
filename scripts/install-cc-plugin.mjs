@@ -26,6 +26,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
@@ -33,6 +34,7 @@ import {
   readFileSync,
   readdirSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { join, dirname, relative, sep } from "node:path";
 import { homedir } from "node:os";
@@ -138,6 +140,29 @@ export function collectInstallFiles(pluginSrc) {
   return files;
 }
 
+export const BUILD_STAMP_FILE = "build-hash.txt";
+
+/** Short sha of the repo HEAD, or "unknown" when git is unavailable. Never throws. */
+function gitShortSha() {
+  try {
+    return execFileSync("git", ["rev-parse", "--short", "HEAD"], { cwd: REPO, encoding: "utf-8" }).trim();
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * Content of the install stamp: sha256 of the bundle that was copied, the repo
+ * commit it was built from, and when. Lets anyone (or /health later) prove which
+ * build is actually installed — see the 2026-08-07 "repo says fixed, machine runs
+ * June" incident in the header of this file.
+ */
+export function buildStampText(pluginSrc, gitSha = gitShortSha(), now = new Date()) {
+  const bundle = readFileSync(join(pluginSrc, "dist", "lib", "hook.mjs"));
+  const sha256 = createHash("sha256").update(bundle).digest("hex");
+  return `sha256=${sha256}\ngit=${gitSha}\ndate=${now.toISOString()}\n`;
+}
+
 function main(argv) {
   const dryRun = argv.includes("--dry-run");
   const pluginSrc = join(REPO, "claude-code-plugin");
@@ -166,6 +191,7 @@ function main(argv) {
     if (!existsSync(join(pluginSrc, from))) throw new Error(`manca ${join(pluginSrc, from)}`);
   }
 
+  const stamp = dryRun ? "" : buildStampText(pluginSrc);
   for (const target of targets) {
     process.stdout.write(`${dryRun ? "Destinazione" : "Installo in"}: ${target}\n`);
     for (const [from, to] of files) {
@@ -178,6 +204,10 @@ function main(argv) {
       mkdirSync(dirname(dst), { recursive: true });
       copyFileSync(src, dst);
       process.stdout.write(`  copiato ${to}\n`);
+    }
+    if (!dryRun) {
+      writeFileSync(join(target, BUILD_STAMP_FILE), stamp);
+      process.stdout.write(`  scritto ${BUILD_STAMP_FILE}\n`);
     }
   }
   process.stdout.write(

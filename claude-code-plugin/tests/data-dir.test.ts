@@ -128,17 +128,20 @@ describe("a BACKUP dir must never outrank the live one", () => {
     expect(res.chosenIsBackup).toBe(false);
   });
 
-  it("a live PID still beats everything, backup or not", () => {
+  // 2026-10-03 (approved by Lorenzo): reversed. A backup with a reused/alive
+  // PID won the election in production at least 3 times and split cursors
+  // into the archive. The live dir must win whenever it exists.
+  it("the live dir beats a backup even when only the backup's PID is alive", () => {
     const { scriptPath, dataRoot } = makeLayout(["cache", "m", "p", "1.0.0"]);
-    makeDataDir(dataRoot, "tdai-memory-tdai-local", 111);
-    const backupAlive = makeDataDir(dataRoot, "tdai-memory-tdai-local.BACKUP-x", 222);
+    const live = makeDataDir(dataRoot, "tdai-memory-tdai-local", 111);
+    makeDataDir(dataRoot, "tdai-memory-tdai-local.BACKUP-x", 222);
 
     const res = resolveDataDirDetailed({
       scriptPath, env: {}, home: tmp,
       isPidAlive: (pid) => pid === 222,
     });
-    expect(res.dir).toBe(backupAlive);
-    expect(res.chosenIsBackup).toBe(true);
+    expect(res.dir).toBe(live);
+    expect(res.chosenIsBackup).toBe(false);
   });
 
   it("recognises the archive naming variants", () => {

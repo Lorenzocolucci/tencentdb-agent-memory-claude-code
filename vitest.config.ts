@@ -12,6 +12,7 @@ export default defineConfig({
     // `_`-prefixed test files are LOCAL-ONLY live-verification harnesses (they hit
     // the real LLM / the live vectors.db) — never run in the normal suite or CI.
     exclude: ["dist/**", "node_modules/**", "**/*.e2e.test.ts", "**/__tests__/_*.test.ts"],
+    setupFiles: ["claude-code-plugin/vitest-setup.ts"],
     testTimeout: 120_000,
     hookTimeout: 120_000,
     clearMocks: true,

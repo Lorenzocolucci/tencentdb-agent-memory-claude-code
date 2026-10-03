@@ -9,15 +9,25 @@
  *   stop | search | search-stdin | status | clear-session | confirm | reject
  */
 
-import { GatewayClient, RECALL_TIMEOUT_MS, resolveCaptureTimeoutMs } from "./gateway-client.js";
+import { GatewayClient, resolveCaptureTimeoutMs, type RecallError } from "./gateway-client.js";
+import {
+  DUPLICATE_PROMPT_WINDOW_MS,
+  FALLBACK_MARGIN_MS,
+  FALLBACK_MIN_REMAINING_MS,
+  RECALL_MISS_ALARM_THRESHOLD,
+  RECALL_TIMEOUT_MS,
+  STOP_DEADLINE_MS,
+  UPS_DEADLINE_MS,
+} from "./budget.js";
 import { getSessionKey, getProjectName } from "./session-key.js";
 import { readAllTurns } from "./transcript.js";
 import { DaemonManager, readDaemonState, clearDaemonState } from "./daemon.js";
 import { resolveDataDirDetailed, type DataDirSource } from "./data-dir.js";
-import { raiseAlarm, clearAlarm, drainAlarms } from "./alarm.js";
+import { raiseAlarm, clearAlarm, peekAlarms } from "./alarm.js";
 import { assessStaleness, describeStaleness, newestTranscriptMs } from "./staleness.js";
 import { matchDestructiveCommand } from "./destructive-commands.js";
 import { appendFile, mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { basename, join } from "node:path";
@@ -48,6 +58,16 @@ export interface HookInput {
   args?: string[];
   /** Where alarms and cursors live. Defaults to the discovered data dir. */
   dataDir?: string;
+  /**
+   * Callbacks to run AFTER the hook output reached stdout (alarm acks). When the
+   * caller does not collect them they run before handleHook returns, which is
+   * the old drain-first behaviour — fine for tests, not for the real process.
+   */
+  afterWrite?: Array<() => Promise<void>>;
+  /** Override of UPS_DEADLINE_MS (tests). */
+  upsDeadlineMs?: number;
+  /** Override of STOP_DEADLINE_MS (tests). */
+  stopDeadlineMs?: number;
 }
 
 export async function handleHook(event: HookEvent, input: HookInput): Promise<string> {
@@ -57,13 +77,13 @@ export async function handleHook(event: HookEvent, input: HookInput): Promise<st
     case "session-start":
       return handleSessionStart(data, input.client, dataDir);
     case "user-prompt-submit":
-      return handleUserPromptSubmit(data, input.client, dataDir);
+      return handleUserPromptSubmit(data, input.client, dataDir, input);
     case "post-tool-use":
       return handlePostToolUse(data, input.client);
     case "post-tool-use-failure":
       return handlePostToolUseFailure(data, input.client);
     case "stop":
-      return handleStop(data, input.client, dataDir);
+      return handleStop(data, input.client, dataDir, input.stopDeadlineMs ?? STOP_DEADLINE_MS);
     case "search":
       return handleSearch(input.args ?? [], input.client);
     case "search-stdin":
@@ -124,6 +144,9 @@ async function handleSessionStart(
     );
     return "";
   }
+  // Booting (503 starting): alive, not ready. Nothing to judge yet — no alarm
+  // raised, none cleared; the next session-start sees the real state.
+  if (health.status === "starting") return "";
   await clearAlarm(dataDir, "gateway-unreachable");
 
   // Reachable but unhappy is a THIRD state, not a synonym for "down". The
@@ -178,50 +201,238 @@ async function handleSessionStart(
   return "";
 }
 
+type DeadlineResult<T> = { timedOut: true } | { timedOut: false; value: T };
+
+/** Resolve with the promise's value, or `{timedOut:true}` after `ms`. The loser keeps running unobserved. */
+async function raceDeadline<T>(work: Promise<T>, ms: number): Promise<DeadlineResult<T>> {
+  let timer: NodeJS.Timeout | undefined;
+  const expiry = new Promise<{ timedOut: true }>((resolve) => {
+    timer = setTimeout(() => resolve({ timedOut: true }), Math.max(0, ms));
+  });
+  try {
+    return await Promise.race([work.then((value) => ({ timedOut: false as const, value })), expiry]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Prompts injected by Claude Code itself, not typed by the user: recall adds nothing. */
+const AUTOMATED_PROMPT_PREFIXES = ["<task-notification>", "Another Claude session sent a message"];
+
+function hashPrompt(prompt: string): string {
+  return createHash("sha1").update(prompt).digest("hex");
+}
+
+/**
+ * True when this exact prompt was already seen in the same cc session less than
+ * DUPLICATE_PROMPT_WINDOW_MS ago (cron / loop repeats). Always records the prompt.
+ * Never throws: a broken cache must not turn recall off.
+ */
+async function isRepeatedPrompt(
+  dataDir: string,
+  sessionId: string | undefined,
+  prompt: string,
+  now: number = Date.now(),
+): Promise<boolean> {
+  if (!sessionId) return false;
+  const dir = join(dataDir, "prompt-cache");
+  const file = join(dir, `${sanitizeCursorId(sessionId)}.json`);
+  const hash = hashPrompt(prompt);
+  let repeated = false;
+  try {
+    const prev = JSON.parse(await readFile(file, "utf-8")) as { hash?: unknown; at?: unknown };
+    repeated =
+      prev.hash === hash && typeof prev.at === "number" && now - prev.at < DUPLICATE_PROMPT_WINDOW_MS;
+  } catch {
+    // no previous prompt recorded
+  }
+  try {
+    await mkdir(dir, { recursive: true });
+    await writeFile(file, JSON.stringify({ hash, at: now }), { mode: 0o600 });
+  } catch {
+    // ignore
+  }
+  return repeated;
+}
+
+async function shouldSkipRecall(dataDir: string, sessionId: string | undefined, prompt: string): Promise<boolean> {
+  const head = prompt.trimStart();
+  if (AUTOMATED_PROMPT_PREFIXES.some((p) => head.startsWith(p))) return true;
+  return isRepeatedPrompt(dataDir, sessionId, prompt);
+}
+
+const RECALL_MISS_FILE = "recall-misses.json";
+
+async function readRecallMisses(dataDir: string): Promise<number> {
+  try {
+    const parsed = JSON.parse(await readFile(join(dataDir, RECALL_MISS_FILE), "utf-8")) as { count?: unknown };
+    return typeof parsed.count === "number" && parsed.count >= 0 ? parsed.count : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function writeRecallMisses(dataDir: string, count: number): Promise<void> {
+  try {
+    await mkdir(dataDir, { recursive: true });
+    await writeFile(join(dataDir, RECALL_MISS_FILE), JSON.stringify({ count }), { mode: 0o600 });
+  } catch {
+    // ignore: a counter that cannot persist must not break the prompt
+  }
+}
+
+/**
+ * Track consecutive recall misses. A miss is a client timeout or the UPS
+ * deadline; an answered recall (even empty) resets the streak. "refused" says
+ * nothing about speed (gateway-unreachable already covers it): left untouched.
+ */
+async function recordRecallOutcome(dataDir: string, outcome: "miss" | "ok" | "unchanged"): Promise<void> {
+  if (outcome === "unchanged") return;
+  if (outcome === "ok") {
+    if ((await readRecallMisses(dataDir)) > 0) await writeRecallMisses(dataDir, 0);
+    await clearAlarm(dataDir, "recall-timeout");
+    return;
+  }
+  const count = (await readRecallMisses(dataDir)) + 1;
+  await writeRecallMisses(dataDir, count);
+  if (count >= RECALL_MISS_ALARM_THRESHOLD) {
+    await raiseAlarm(
+      dataDir,
+      "recall-timeout",
+      `il richiamo della memoria è andato in timeout ${count} prompt di fila — le risposte non usano la memoria`,
+    );
+  }
+}
+
+function outcomeOf(error: RecallError | undefined): "miss" | "ok" | "unchanged" {
+  if (error === "timeout") return "miss";
+  if (error === "refused") return "unchanged";
+  return "ok";
+}
+
 async function handleUserPromptSubmit(
   data: HookStdin,
   client: GatewayClient,
   dataDir: string,
+  input: HookInput = { stdin: "", client },
 ): Promise<string> {
-  const prompt = data.prompt ?? "";
-  const cwd = data.cwd ?? process.cwd();
+  const deadlineAt = Date.now() + (input.upsDeadlineMs ?? UPS_DEADLINE_MS);
   // NO SILENT FAILURE: this hook is the only channel Claude Code renders
   // straight to the user, so every failure recorded elsewhere surfaces here.
-  const alarmLine = await drainAlarms(dataDir);
-  if (!prompt) return alarmLine ? JSON.stringify({ systemMessage: alarmLine }) : "";
+  // Peek, never drain: the alarms are deleted only after the output is written.
+  const alarms = await peekAlarms(dataDir);
+  if (input.afterWrite) input.afterWrite.push(alarms.ack);
+  try {
+    return await promptSubmitOutput(data, client, dataDir, alarms.line, deadlineAt);
+  } finally {
+    if (!input.afterWrite) await alarms.ack();
+  }
+}
 
+async function promptSubmitOutput(
+  data: HookStdin,
+  client: GatewayClient,
+  dataDir: string,
+  alarmLine: string,
+  deadlineAt: number,
+): Promise<string> {
+  const alarmOnly = alarmLine ? JSON.stringify({ systemMessage: alarmLine }) : "";
+  const prompt = data.prompt ?? "";
+  if (!prompt) return alarmOnly;
+  if (await shouldSkipRecall(dataDir, data.session_id, prompt)) return alarmOnly;
+
+  const cwd = data.cwd ?? process.cwd();
   const sessionKey = getSessionKey(cwd);
   const project = getProjectName(cwd);
 
+  const result = await raceDeadline(
+    recallWithFallbacks(client, prompt, sessionKey, project, data.session_id, dataDir, deadlineAt),
+    deadlineAt - Date.now(),
+  );
+  if (result.timedOut) {
+    await safeLog(join(dataDir, "hook.log"), "recall: deadline exceeded");
+    await recordRecallOutcome(dataDir, "miss");
+    return alarmOnly;
+  }
+  await recordRecallOutcome(dataDir, outcomeOf(result.value.error));
+  return formatRecallOutput(result.value.context, alarmLine);
+}
+
+interface RecallOutcome {
+  context: string;
+  error: RecallError;
+}
+
+async function recallWithFallbacks(
+  client: GatewayClient,
+  prompt: string,
+  sessionKey: string,
+  project: string | undefined,
+  sessionId: string | undefined,
+  dataDir: string,
+  deadlineAt: number,
+): Promise<RecallOutcome> {
   // Primary path: L1/L2/L3 recall (structured atoms + persona + scene).
   // Pass cc's session_id so the session-open banner fires once per real session
   // (sessionKey is stable per project and would fire it ~once per gateway boot).
-  const recall = await client.recall(prompt, sessionKey, project, data.session_id);
+  const recall = await client.recall(prompt, sessionKey, project, sessionId);
+  const error = recall.error ?? null;
   let context = recall.context ?? "";
 
-  // Fallback 1: daemon /search/conversations (FTS5 BM25 on L0 table).
-  if (!context) {
-    const conv = await client.searchConversations(prompt, {
-      limit: 3,
-      sessionKey,
-    });
-    if (conv.total > 0 && conv.results) {
-      context = `## Past conversations (relevant to current prompt)\n\n${conv.results}`;
+  // Fallback 1: daemon /search/conversations (FTS5 BM25 on L0 table). Only when
+  // the gateway ANSWERED (a timeout means it is busy: asking again just queues)
+  // and enough of the deadline is left to wait for it.
+  if (!context && error === null) {
+    const remaining = deadlineAt - Date.now();
+    if (remaining >= FALLBACK_MIN_REMAINING_MS) {
+      const conv = await client.searchConversations(prompt, {
+        limit: 3,
+        sessionKey,
+        timeoutMs: remaining - FALLBACK_MARGIN_MS,
+      });
+      if (conv.total > 0 && conv.results) {
+        context = `## Past conversations (relevant to current prompt)\n\n${conv.results}`;
+      }
     }
   }
 
-  // Fallback 2: direct L0 jsonl file scan. Covers the case where FTS5 is
-  // unavailable (e.g. Node.js built-in node:sqlite lacks fts5 module) AND
-  // no embedding service is configured. Reads $TDAI_DATA_DIR/conversations/
-  // and does simple keyword matching — no ranking, but good enough to
-  // surface relevant history on day zero.
-  if (!context) {
-    const dataDir = process.env.TDAI_DATA_DIR;
-    if (dataDir) {
-      context = await searchL0JsonlDirect(join(dataDir, "conversations"), prompt, sessionKey, 3);
-    }
-  }
+  // Fallback 2: direct L0 jsonl scan of the RESOLVED data dir — no gateway, no
+  // ranking, bounded to the newest files and the remaining deadline.
+  if (!context) context = await searchL0Fallback(dataDir, prompt, sessionKey, deadlineAt);
+  return { context, error };
+}
 
+async function searchL0Fallback(
+  dataDir: string,
+  prompt: string,
+  sessionKey: string,
+  deadlineAt: number,
+): Promise<string> {
+  // The resolved dir first. TDAI_DATA_DIR is kept only as a secondary source for
+  // setups that export it; it used to be the ONLY source, and is unset in hooks.
+  const dirs = [dataDir, process.env.TDAI_DATA_DIR].filter(
+    (d, i, all): d is string => !!d && all.indexOf(d) === i,
+  );
+  for (const d of dirs) {
+    const found = await searchL0JsonlDirect(join(d, "conversations"), prompt, sessionKey, 3, deadlineAt);
+    if (found) return found;
+  }
+  return "";
+}
+
+function extractBannerLine(context: string): string {
+  const bannerMatch = context.match(/<session-open-banner>[\s\S]*?<\/session-open-banner>/);
+  if (!bannerMatch) return "";
+  return (
+    bannerMatch[0]
+      .split("\n")
+      .map((s) => s.trim())
+      .filter((s) => s && !s.startsWith("<") && !s.startsWith("FIRST TURN"))[0] ?? ""
+  );
+}
+
+function formatRecallOutput(contextIn: string, alarmLine: string): string {
+  let context = contextIn;
   if (!context) return alarmLine ? JSON.stringify({ systemMessage: alarmLine }) : "";
 
   // Banner visibility fix: the session-open banner ("🧠 …") lives inside
@@ -231,13 +442,7 @@ async function handleUserPromptSubmit(
   // emit it as a top-level `systemMessage`, which Claude Code renders directly
   // to the user — guaranteed visible, once per session (the gateway only puts
   // the banner block in the context on the first turn).
-  const bannerMatch = context.match(/<session-open-banner>[\s\S]*?<\/session-open-banner>/);
-  const bannerLine = bannerMatch
-    ? (bannerMatch[0]
-        .split("\n")
-        .map((s) => s.trim())
-        .filter((s) => s && !s.startsWith("<") && !s.startsWith("FIRST TURN"))[0] ?? "")
-    : "";
+  const bannerLine = extractBannerLine(context);
 
   if (context.length > MAX_INJECT_CHARS) {
     context =
@@ -387,12 +592,33 @@ async function handlePostToolUseFailure(data: HookStdin, client: GatewayClient):
   });
 }
 
+/** Visible wording for a capture that may not have been saved. Not "lost": the cursor stays, the next Stop retries. */
+const CAPTURE_UNCONFIRMED = "salvataggio non confermato — verrà ritentato";
+
 async function handleStop(
   data: HookStdin,
   client: GatewayClient,
   dataDirIn: string,
+  deadlineMs: number = STOP_DEADLINE_MS,
 ): Promise<string> {
   if (data.stop_hook_active === true) return "";
+  if (!data.transcript_path) return "";
+  const result = await raceDeadline(runStop(data, client, dataDirIn), deadlineMs);
+  if (!result.timedOut) return result.value;
+  await raiseAlarm(
+    dataDirIn,
+    "capture-failed",
+    `${CAPTURE_UNCONFIRMED} (il gateway non ha risposto entro ${Math.round(deadlineMs / 1000)} s)`,
+  );
+  await safeLog(join(dataDirIn, "hook.log"), "stop: deadline exceeded — cursor not advanced, will retry");
+  return "";
+}
+
+async function runStop(
+  data: HookStdin,
+  client: GatewayClient,
+  dataDirIn: string,
+): Promise<string> {
   if (!data.transcript_path) return "";
 
   // cc may trigger Stop before the last assistant block is flushed to disk.
@@ -448,12 +674,18 @@ async function handleStop(
   // Phase 3: NO SILENT FAILURE — captureTurn already retries once (2s gap)
   // internally. If both attempts fail, warn visibly in the CC UI so the user
   // knows the session was NOT saved, instead of silently logging to a file.
+  // Same (session, cursor, turn count) => same key, so a retried or duplicated
+  // Stop cannot be stored twice: the gateway dedups by it.
+  const idempotencyKey = createHash("sha1")
+    .update(`${data.session_id ?? cursorId}:${lastSent}:${allTurns.length}`)
+    .digest("hex");
   const captureResult = await client.captureTurn({
     user_content: lastTurn.user,
     assistant_content: lastTurn.assistant,
     messages,
     session_key: sessionKey,
     session_id: data.session_id,
+    idempotency_key: idempotencyKey,
   });
   if (captureResult === null) {
     // NO SILENT FAILURE: stderr now, and a breadcrumb that the NEXT prompt
@@ -461,7 +693,7 @@ async function handleStop(
     await raiseAlarm(
       dataDir,
       "capture-failed",
-      `sessione NON salvata (${newTurns.length} turni persi) — gateway giù o token scaduto`,
+      `${CAPTURE_UNCONFIRMED} (${newTurns.length} turni) — gateway giù o token scaduto`,
     );
     await safeLog(join(dataDir, "hook.log"), "stop: captureTurn failed after retry — session not saved");
     // Do NOT advance the cursor: next Stop will retry the unsent turns.
@@ -643,6 +875,9 @@ async function handleClearSession(data: HookStdin, client: GatewayClient): Promi
 // L0 jsonl direct search (last-resort fallback)
 // ============================================================================
 
+/** Fallback 2 never scans more than this many files (newest first). */
+const MAX_L0_FALLBACK_FILES = 3;
+
 interface L0JsonlRecord {
   sessionKey?: string;
   role?: string;
@@ -655,6 +890,7 @@ async function searchL0JsonlDirect(
   query: string,
   sessionKey: string,
   limit: number,
+  deadlineAt: number = Infinity,
 ): Promise<string> {
   let files: string[];
   try {
@@ -678,7 +914,8 @@ async function searchL0JsonlDirect(
     }),
   );
   withMtime.sort((a, b) => b.mtime - a.mtime);
-  const sortedFiles = withMtime.map((e) => e.name);
+  // Newest MAX_L0_FALLBACK_FILES only: the dir holds ~100 files / 50 MB.
+  const sortedFiles = withMtime.slice(0, MAX_L0_FALLBACK_FILES).map((e) => e.name);
 
   // CJK 2-gram tokens, sans a small stop set. The previous list stopped
   // common content-bearing pronouns ("我们/你们/这个/可以/有没/没有" etc.)
@@ -709,6 +946,7 @@ async function searchL0JsonlDirect(
   const seen = new Set<string>();
 
   for (const f of sortedFiles) {
+    if (Date.now() >= deadlineAt) break;
     // Stream the file line-by-line: large jsonl (multi-MB) used to be
     // readFile'd into memory in full, which OOM'd on long-running sessions.
     let rl;
@@ -722,6 +960,7 @@ async function searchL0JsonlDirect(
     }
     try {
       for await (const line of rl) {
+        if (Date.now() >= deadlineAt) break;
         if (!line.trim()) continue;
         try {
           const rec = JSON.parse(line) as L0JsonlRecord;
@@ -862,10 +1101,10 @@ async function main(): Promise<void> {
           "nessun gateway attivo — la sessione NON viene salvata",
         );
       } else {
-        const line = await drainAlarms(dataDir);
+        const peek = await peekAlarms(dataDir);
         const msg =
-          line || "🚨 SINAPSYS — la memoria NON sta funzionando: nessun gateway attivo";
-        process.stdout.write(JSON.stringify({ systemMessage: msg }));
+          peek.line || "🚨 SINAPSYS — la memoria NON sta funzionando: nessun gateway attivo";
+        await emitThenAck(JSON.stringify({ systemMessage: msg }), [peek.ack]);
       }
       return;
     }
@@ -886,8 +1125,9 @@ async function main(): Promise<void> {
       tokenPath: state.tokenPath,
     });
 
-    const out = await handleHook(event, { stdin, client, args, dataDir });
-    if (out) process.stdout.write(out);
+    const afterWrite: Array<() => Promise<void>> = [];
+    const out = await handleHook(event, { stdin, client, args, dataDir, afterWrite });
+    await emitThenAck(out, afterWrite);
   } catch (err) {
     await safeLog(logPath, `${event}: ${(err as Error).message}`);
     // NO SILENT FAILURE #3: this catch used to STOP at the line above. Every
@@ -903,13 +1143,38 @@ async function main(): Promise<void> {
     // when IT is the one that crashed, it must still speak before it dies.
     if (event === "user-prompt-submit") {
       try {
-        const line = await drainAlarms(dataDir);
-        if (line) process.stdout.write(JSON.stringify({ systemMessage: line }));
+        const peek = await peekAlarms(dataDir);
+        if (peek.line) await emitThenAck(JSON.stringify({ systemMessage: peek.line }), [peek.ack]);
       } catch {
         // fail-open: an alarm that breaks the conversation is worse than the bug.
       }
     }
   }
+  // UPS and Stop race a deadline: a request that lost the race is still open and
+  // would keep the process alive until Claude Code kills it. Output is already
+  // flushed (emitThenAck awaits the write), so leave now.
+  if (event === "user-prompt-submit" || event === "stop") process.exit(0);
+}
+
+function writeStdout(text: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    process.stdout.write(text, (err) => (err ? reject(err) : resolve()));
+  });
+}
+
+/**
+ * Write the hook output, and only if that succeeded run the acks (alarm
+ * deletion). A failed write leaves the alarms on disk for the next prompt.
+ */
+async function emitThenAck(out: string, acks: Array<() => Promise<void>>): Promise<void> {
+  if (out) {
+    try {
+      await writeStdout(out);
+    } catch {
+      return;
+    }
+  }
+  for (const ack of acks) await ack();
 }
 
 /** Max chars of an error message forwarded to the user-facing alarm. */
