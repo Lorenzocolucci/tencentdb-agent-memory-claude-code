@@ -106,7 +106,7 @@ export interface RecallConfig {
    * Must be < timeoutMs. When the search (which depends on the REMOTE embedding
    * provider) exceeds this, it degrades to EMPTY memories while persona/scene/
    * banner (local, no network) are still injected — so an OpenAI outage never
-   * drops the whole session-open injection. Default: 4000. Falls back when unset.
+   * drops the whole session-open injection. Default: 3000. Falls back when unset.
    */
   searchTimeoutMs?: number;
   /**
@@ -556,7 +556,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       scoreThreshold: num(recallGroup, "scoreThreshold") ?? 0.3,
       strategy: validateStrategy(str(recallGroup, "strategy")) ?? "hybrid",
       timeoutMs: num(recallGroup, "timeoutMs") ?? 5000,
-      searchTimeoutMs: num(recallGroup, "searchTimeoutMs") ?? 4000,
+      searchTimeoutMs: num(recallGroup, "searchTimeoutMs") ?? 3000,
       // Default "l1" (legacy recall) so live recall is NOT changed. Any value
       // other than the literal "kb" falls back to "l1" (fail-safe).
       source: str(recallGroup, "source") === "kb" ? "kb" : "l1",

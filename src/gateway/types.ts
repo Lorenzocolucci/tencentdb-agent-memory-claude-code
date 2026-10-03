@@ -45,6 +45,14 @@ export interface HealthResponse {
   capture_backlog?: number;
   capture_oldest_pending_s?: number | null;
   capture_failed?: number;
+  /** Process and machine memory in bytes (diagnoses paging, 2026-10-03). */
+  memory?: {
+    rss: number;
+    heapUsed: number;
+    external: number;
+    machineFree: number;
+    machineTotal: number;
+  };
 }
 
 // ============================
@@ -108,6 +116,12 @@ export interface CaptureRequest {
   session_id?: string;
   user_id?: string;
   messages?: unknown[];
+  /**
+   * Client-chosen key (the plugin sends sha1(session_id + cursor + turn count)).
+   * A repeat of a key already queued or already written is acknowledged but not
+   * stored again - a retried Stop must not store the session twice.
+   */
+  idempotency_key?: string;
 }
 
 export interface CaptureResponse {
@@ -127,6 +141,8 @@ export interface CaptureResponse {
   queued: boolean;
   /** Inbox item id (file name stem) for tracing. */
   inbox_id: string;
+  /** True when the idempotency_key was already queued or written (nothing new stored). */
+  duplicate?: boolean;
 }
 
 // ============================
