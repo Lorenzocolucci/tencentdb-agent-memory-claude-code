@@ -100,6 +100,14 @@ import {
   kbChunkId,
 } from "../kb/kb-queries.js";
 import { NavigableIndex } from "../kb/navigable-index.js";
+import {
+  ensureKbIndexSchema,
+  isKbIndexBackfillEnabled,
+  runKbIndexBackfill,
+  cooccurringCandidateLists,
+  type KbIndexBackfillResult,
+} from "../kb/kb-index.js";
+import { beginHeavyTask, endHeavyTask } from "../diagnostics/inflight-registry.js";
 import { dirname, join } from "node:path";
 import {
   KB_NAV_SNAPSHOT_FORMAT,
@@ -514,10 +522,20 @@ export class VectorStore implements IMemoryStore {
   private kbNavChunkMeta = new Map<string, { ownerId: string; ownerKind: string }>();
   /** ownerId → its chunkIds currently in the index (for delete-then-insert sync). */
   private kbNavOwnerChunks = new Map<string, string[]>();
+  /** Last getMemoryHealth result + the `nowMs` it was computed at (5-min cache, Phase 2.3). */
+  private memoryHealthCache: { atMs: number; value: { healthy: boolean; stale: Array<{ sessionKey: string; project: string; lagHours: number }> } } | null = null;
+  /** sessionKey → `project@epochMs` of the last registry write (skip redundant hot-path writes). */
+  private sessionProjectWritten = new Map<string, { project: string; atMs: number }>();
   /** Cached kb_vec raw-read statements (build-at-boot + reconcile), avoid re-preparing. */
   private stmtKbVecReadAll?: StatementSync;
   private stmtKbVecReadOwner?: StatementSync;
   private stmtKbVecCount?: StatementSync;
+  /** Re-write the session→project registry row at most this often when unchanged (ms). */
+  private static readonly SESSION_PROJECT_REFRESH_MS = 10 * 60 * 1000;
+  /** getMemoryHealth result is reused for this long (ms). */
+  private static readonly MEMORY_HEALTH_CACHE_MS = 5 * 60 * 1000;
+  /** Rows read from kb_vec between event-loop yields in getAllKbVectorsAsync. */
+  private static readonly KB_VEC_READ_YIELD_ROWS = 2000;
   /** Hold the loop at most this long (ms) between yields while building the index. */
   private static readonly KB_NAV_BUILD_YIELD_MS = 12;
   /** Below this many live nodes, don't bother auto-compacting (churn not worth it). */
@@ -2561,7 +2579,12 @@ export class VectorStore implements IMemoryStore {
     if (this.degraded || !this.kbReady) {
       return { injected: 0, used: 0, unjudgeable: 0, perMemory: [], expired: 0 };
     }
-    return judgePending(this.db, params, this.logger);
+    const diagToken = beginHeavyTask("judge-recall-usefulness");
+    try {
+      return judgePending(this.db, params, this.logger);
+    } finally {
+      endHeavyTask(diagToken);
+    }
   }
 
   /** Aggregate the ledger into the usefulness verdict. Read-only. */
@@ -2629,17 +2652,12 @@ export class VectorStore implements IMemoryStore {
 
       // 1. Co-occurrence from events that mention a candidate entity.
       const ids = [...cand];
-      const likeClauses = ids.map(() => "entities_json LIKE ?").join(" OR ");
-      const rows = this.db
-        .prepare(`SELECT entities_json FROM events WHERE namespace = ? AND (${likeClauses})`)
-        .all(namespace, ...ids.map((id) => `%${id}%`)) as Array<{ entities_json: string }>;
-      for (const r of rows) {
-        let ents: string[] = [];
-        try {
-          const parsed = JSON.parse(r.entities_json);
-          if (Array.isArray(parsed)) ents = parsed.filter((e): e is string => typeof e === "string");
-        } catch { /* skip malformed */ }
-        const inCand = ents.filter((e) => cand.has(e));
+      // FAST PATH (Phase 2.2): indexed event_entities join — no LIKE scan of events.
+      // Falls back to the legacy scan until the index is backfilled.
+      const indexed = cooccurringCandidateLists(this.db, ids, namespace);
+      const eventLists: string[][] = indexed ?? this.legacyCooccurrenceLists(ids, namespace);
+      for (const entityList of eventLists) {
+        const inCand = entityList.filter((e) => cand.has(e));
         for (let i = 0; i < inCand.length; i++) {
           for (let j = i + 1; j < inCand.length; j++) {
             addEdge(inCand[i]!, inCand[j]!, 1);
@@ -2669,6 +2687,25 @@ export class VectorStore implements IMemoryStore {
       );
       return new Map();
     }
+  }
+
+  /**
+   * Legacy co-occurrence source (full LIKE scan of events.entities_json). Only used
+   * while the event_entities index has not been backfilled.
+   */
+  private legacyCooccurrenceLists(ids: string[], namespace: string): string[][] {
+    const likeClauses = ids.map(() => "entities_json LIKE ?").join(" OR ");
+    const rows = this.db
+      .prepare(`SELECT entities_json FROM events WHERE namespace = ? AND (${likeClauses})`)
+      .all(namespace, ...ids.map((id) => `%${id}%`)) as Array<{ entities_json: string }>;
+    const out: string[][] = [];
+    for (const r of rows) {
+      try {
+        const parsed: unknown = JSON.parse(r.entities_json);
+        if (Array.isArray(parsed)) out.push(parsed.filter((e): e is string => typeof e === "string"));
+      } catch { /* skip malformed */ }
+    }
+    return out;
   }
 
   /**
@@ -3597,6 +3634,7 @@ export class VectorStore implements IMemoryStore {
       initFoundationsSchema(this.db, this.logger);
 
       this.kbReady = true;
+      this.initKbIndexes();
     } catch (err) {
       this.kbReady = false;
       this.logger?.warn(
@@ -3688,6 +3726,92 @@ export class VectorStore implements IMemoryStore {
     this.logger?.debug?.(
       `${TAG} KB schema initialized (kbReady=${this.kbReady}, kbVec=${this.kbVecReady}, kbFts=${this.kbFtsAvailable})`,
     );
+  }
+
+  /**
+   * Phase 2.1/2.2 hot-path indexes (entities_fts + event_entities): create the
+   * tables and sync triggers (idempotent, additive). A failure here only means
+   * recall keeps using the legacy scans — it never marks the KB unavailable.
+   * The one-time backfill of a database that already holds rows is OPT-IN
+   * (env TDAI_KB_INDEX_BACKFILL), batched and yielding.
+   */
+  private initKbIndexes(): void {
+    try {
+      ensureKbIndexSchema(this.db);
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} kb index schema NOT available (recall uses legacy scans): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+    if (isKbIndexBackfillEnabled()) {
+      setImmediate(() => {
+        void this.startKbIndexBackfill().catch(() => { /* logged inside */ });
+      });
+    }
+  }
+
+  /**
+   * Run (or resume) the batched backfill of entities_fts + event_entities. Safe to
+   * call repeatedly; yields to the event loop between ~40 ms batches. Never throws:
+   * a failure is logged and the indexes simply stay "not ready" (legacy path).
+   */
+  async startKbIndexBackfill(): Promise<KbIndexBackfillResult | null> {
+    if (this.closed || !this.kbReady) return null;
+    const token = beginHeavyTask("kb-index-backfill");
+    try {
+      return await runKbIndexBackfill(this.db, { isClosed: () => this.closed, logger: this.logger });
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} kb index backfill failed (non-fatal, legacy path stays active): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    } finally {
+      endHeavyTask(token);
+    }
+  }
+
+  /**
+   * Run recall-path bookkeeping writes with a SHORT busy_timeout (Phase 2.4): if
+   * another process holds the write lock these writes give up after ~200 ms instead
+   * of stalling the loop for the global 5 s. Synchronous end to end, so nothing can
+   * interleave while the lower timeout is in force; the global value is restored.
+   *
+   * `transaction: true` additionally wraps the callback in ONE write transaction:
+   * the recall bookkeeping is ~20 tiny autocommit INSERT/UPDATEs, each paying its own
+   * WAL commit (measured 100-400 ms per recall on the 4.6 GB DB); one commit pays
+   * once. If the write lock cannot be taken within the timeout it throws (the caller
+   * logs and drops this turn's bookkeeping — it is best-effort by contract).
+   */
+  runWithShortBusyTimeout<T>(fn: () => T, timeoutMs = 200, opts?: { transaction?: boolean }): T {
+    if (this.closed) return fn();
+    try {
+      this.db.prepare(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(timeoutMs))}`).run();
+    } catch { /* keep the default timeout */ }
+    let began = false;
+    try {
+      if (opts?.transaction) {
+        this.db.prepare("BEGIN IMMEDIATE").run();
+        began = true;
+      }
+      const result = fn();
+      if (began) {
+        began = false;
+        this.db.prepare("COMMIT").run();
+      }
+      return result;
+    } catch (err) {
+      if (began) {
+        try {
+          this.db.prepare("ROLLBACK").run();
+        } catch { /* keep the original error */ }
+      }
+      throw err;
+    } finally {
+      try {
+        this.db.prepare("PRAGMA busy_timeout = 5000").run();
+      } catch { /* closed meanwhile */ }
+    }
   }
 
   /** Whether the entity-centric (KB) base tables are available. */
@@ -3849,13 +3973,21 @@ export class VectorStore implements IMemoryStore {
   /** @see IMemoryStore.setSessionProject */
   setSessionProject(sessionKey: string, project: string): void {
     if (!this.kbReady || !sessionKey || !project) return;
+    // Called on EVERY recall: skip the write when the registry already says this
+    // (it only needs refreshing rarely). Never skips a CHANGED project.
+    const last = this.sessionProjectWritten.get(sessionKey);
+    const nowMs = Date.now();
+    if (last && last.project === project && nowMs - last.atMs < VectorStore.SESSION_PROJECT_REFRESH_MS) return;
     try {
-      this.db
-        .prepare(
-          "INSERT INTO session_projects(session_key, project, updated_at) VALUES(?,?,?) " +
-          "ON CONFLICT(session_key) DO UPDATE SET project=excluded.project, updated_at=excluded.updated_at",
-        )
-        .run(sessionKey, project, new Date().toISOString());
+      this.runWithShortBusyTimeout(() =>
+        this.db
+          .prepare(
+            "INSERT INTO session_projects(session_key, project, updated_at) VALUES(?,?,?) " +
+            "ON CONFLICT(session_key) DO UPDATE SET project=excluded.project, updated_at=excluded.updated_at",
+          )
+          .run(sessionKey, project, new Date(nowMs).toISOString()),
+      );
+      this.sessionProjectWritten.set(sessionKey, { project, atMs: nowMs });
     } catch {
       /* best-effort registry — never break recall/capture */
     }
@@ -3905,14 +4037,15 @@ export class VectorStore implements IMemoryStore {
     const LAG_MS = 36 * 3600 * 1000; // events >36h behind their L0 = extraction stalled
     const out = { healthy: true, stale: [] as Array<{ sessionKey: string; project: string; lagHours: number }> };
     if (!this.kbReady) return out;
+    // 5-min cache (Phase 2.3): the banner asks on every session open; the answer
+    // only changes on an hours scale (LAG_MS = 36 h).
+    const cached = this.memoryHealthCache;
+    if (cached && Math.abs(nowMs - cached.atMs) < VectorStore.MEMORY_HEALTH_CACHE_MS) {
+      return { healthy: cached.value.healthy, stale: cached.value.stale.map((x) => ({ ...x })) };
+    }
+    const token = beginHeavyTask("memory-health");
     try {
-      const rows = this.db
-        .prepare(
-          "SELECT l.session_key sk, MAX(l.recorded_at) l0, MIN(l.recorded_at) l0first, " +
-          "(SELECT MAX(e.ts) FROM events e WHERE e.session_key = l.session_key) ev " +
-          "FROM l0_conversations l GROUP BY l.session_key",
-        )
-        .all() as Array<{ sk: string; l0: string | null; l0first: string | null; ev: string | null }>;
+      const rows = this.recentSessionActivity(nowMs - RECENT_L0_MS);
       for (const r of rows) {
         const l0ms = Date.parse(r.l0 ?? "");
         if (!Number.isFinite(l0ms) || nowMs - l0ms > RECENT_L0_MS) continue; // dormant → skip
@@ -3933,10 +4066,41 @@ export class VectorStore implements IMemoryStore {
       }
       out.stale.sort((a, b) => b.lagHours - a.lagHours);
       out.healthy = out.stale.length === 0;
+      this.memoryHealthCache = { atMs: nowMs, value: { healthy: out.healthy, stale: out.stale.map((x) => ({ ...x })) } };
     } catch {
       /* best-effort — health check must never break recall */
+    } finally {
+      endHeavyTask(token);
     }
     return out;
+  }
+
+  /**
+   * Per-session L0/event activity for sessions whose L0 was recorded after
+   * `sinceMs`. Reads only the recent slice through idx_l0_recorded (the legacy
+   * query grouped the WHOLE l0_conversations table). `l0first` (the oldest L0 of
+   * the session, used only when nothing was ever extracted) is looked up for that
+   * rare case alone, over the session's full history — same value as before.
+   */
+  private recentSessionActivity(
+    sinceMs: number,
+  ): Array<{ sk: string; l0: string | null; l0first: string | null; ev: string | null }> {
+    const sinceIso = new Date(sinceMs).toISOString();
+    const recent = this.db
+      .prepare(
+        "SELECT session_key AS sk, MAX(recorded_at) AS l0 FROM l0_conversations INDEXED BY idx_l0_recorded " +
+        "WHERE recorded_at > ? GROUP BY session_key",
+      )
+      .all(sinceIso) as Array<{ sk: string; l0: string | null }>;
+    const evStmt = this.db.prepare("SELECT MAX(ts) AS ev FROM events WHERE session_key = ?");
+    const firstStmt = this.db.prepare("SELECT MIN(recorded_at) AS l0first FROM l0_conversations WHERE session_key = ?");
+    return recent.map((r) => {
+      const ev = (evStmt.get(r.sk) as { ev: string | null } | undefined)?.ev ?? null;
+      const l0first = ev
+        ? null
+        : (firstStmt.get(r.sk) as { l0first: string | null } | undefined)?.l0first ?? null;
+      return { sk: r.sk, l0: r.l0, l0first, ev };
+    });
   }
 
   /** @see IMemoryStore.queryRelationsForEntity */
@@ -4261,8 +4425,14 @@ export class VectorStore implements IMemoryStore {
    * null/NaN distances (zero-vector placeholders), de-dup to the best chunk per
    * owner, trim to topK. Optional `ownerKindFilter` keeps only that kind.
    */
-  searchKbVector(queryEmbedding: Float32Array, topK = 5, ownerKindFilter?: string): KbVectorSearchResult[] {
+  searchKbVector(
+    queryEmbedding: Float32Array,
+    topK = 5,
+    ownerKindFilter?: string,
+    opts?: { allowBruteForce?: boolean },
+  ): KbVectorSearchResult[] {
     if (this.degraded || !this.kbVecReady) return [];
+    const allowBruteForce = opts?.allowBruteForce !== false;
     // Route through the navigable index when it is built. Fall back to the
     // brute-force scan on: an error (null), OR an empty approximate result while
     // the index is non-empty (a pathological ANN/rare-kind miss). Correctness is
@@ -4270,7 +4440,15 @@ export class VectorStore implements IMemoryStore {
     if (this.kbNavIndex) {
       const viaIndex = this.searchKbVectorViaIndex(queryEmbedding, topK, ownerKindFilter);
       if (viaIndex && (viaIndex.length > 0 || this.kbNavIndex.size === 0)) return viaIndex;
+      // Hot-path callers (recall) opt out of the O(N) scan: an empty/failed index
+      // answer is returned as-is instead of falling through to brute force.
+      if (!allowBruteForce) return viaIndex ?? [];
     }
+    // Nav index not published (still building / loading / failed): the brute-force
+    // KNN over kb_vec costs seconds on a synchronous connection. Recall passes
+    // allowBruteForce=false and gets an empty vector part (FTS + entity match + the
+    // associative graph still answer); explicit deep retrieval keeps the default.
+    if (!allowBruteForce) return [];
     try {
       const retrieveCount = topK * VectorStore.CHUNK_RECALL_FANOUT + VectorStore.ZERO_VEC_BUFFER;
       const rows = this.stmtKbVecSearch!.all(
@@ -4401,6 +4579,48 @@ export class VectorStore implements IMemoryStore {
     }
   }
 
+  /**
+   * Same rows as {@link getAllKbVectors}, but read with a cursor (`iterate()`) and
+   * yielding to the event loop every {@link KB_VEC_READ_YIELD_ROWS} rows, so the
+   * boot-time snapshot load / compaction never freezes the loop for the whole
+   * multi-second read (Phase 2.6). Uses its own statement so it cannot collide
+   * with the cached `stmtKbVecReadAll`. Writes that land between yields are
+   * reconciled by the caller through kbNavDirtyOwners (same contract as the
+   * build itself). Aborts (returns what it has) if the store is closed.
+   */
+  async getAllKbVectorsAsync(): Promise<Array<{ chunkId: string; ownerId: string; ownerKind: string; vec: Float32Array }>> {
+    if (this.degraded || !this.kbVecReady) return [];
+    const out: Array<{ chunkId: string; ownerId: string; ownerKind: string; vec: Float32Array }> = [];
+    let dropped = 0;
+    let total = 0;
+    try {
+      const stmt = this.db.prepare("SELECT chunk_id, owner_id, owner_kind, embedding FROM kb_vec");
+      for (const r of stmt.iterate() as IterableIterator<{
+        chunk_id: string; owner_id: string; owner_kind: string; embedding: unknown;
+      }>) {
+        total++;
+        const vec = VectorStore.vecFromCell(r.embedding, this.dimensions);
+        if (vec) out.push({ chunkId: r.chunk_id, ownerId: r.owner_id, ownerKind: r.owner_kind, vec });
+        else dropped++;
+        if (total % VectorStore.KB_VEC_READ_YIELD_ROWS === 0) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          if (this.closed) return out;
+        }
+      }
+      if (dropped > 0) {
+        this.logger?.warn(
+          `${TAG} getAllKbVectorsAsync: ${dropped}/${total} kb_vec rows failed to decode (owners may be missing from the index)`,
+        );
+      }
+      return out;
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} getAllKbVectorsAsync failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return [];
+    }
+  }
+
   /** Live/tombstone counts of the navigable index (null if not built). For health/metrics/tests. */
   getKbNavIndexStats(): { size: number; tombstones: number } | null {
     return this.kbNavIndex ? { size: this.kbNavIndex.size, tombstones: this.kbNavIndex.tombstoneCount } : null;
@@ -4420,8 +4640,9 @@ export class VectorStore implements IMemoryStore {
     this.kbNavBuilding = true;
     this.kbNavDirtyOwners = new Set<string>();
     let published = false;
+    const diagToken = beginHeavyTask("kb-nav-build");
     try {
-      const snapshot = this.getAllKbVectors();
+      const snapshot = await this.getAllKbVectorsAsync();
       // Refuse to publish a lossy index: if a meaningful fraction of rows failed to
       // decode, those owners would be missing AND unreachable (the index short-circuits
       // brute force). Staying on brute force is strictly safer than serving a hole.
@@ -4476,6 +4697,7 @@ export class VectorStore implements IMemoryStore {
       );
       return published;
     } finally {
+      endHeavyTask(diagToken);
       this.kbNavBuilding = false;
       this.kbNavDirtyOwners = null;
     }
@@ -4504,6 +4726,7 @@ export class VectorStore implements IMemoryStore {
     const path = this.kbNavSnapshotPath;
     const idx = this.kbNavIndex;
     if (!path || !idx || this.closed || this.degraded) return;
+    const diagToken = beginHeavyTask("kb-nav-persist");
     try {
       // Defer off the current tick — serialize + stringify are synchronous CPU.
       await new Promise<void>((resolve) => setImmediate(resolve));
@@ -4524,6 +4747,8 @@ export class VectorStore implements IMemoryStore {
       this.logger?.warn?.(
         `${TAG} persistKbNavSnapshot failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
       );
+    } finally {
+      endHeavyTask(diagToken);
     }
   }
 
@@ -4589,8 +4814,9 @@ export class VectorStore implements IMemoryStore {
     this.kbNavBuilding = true;
     this.kbNavDirtyOwners = new Set<string>();
     let published = false;
+    const diagToken = beginHeavyTask("kb-nav-load");
     try {
-      const rows = this.getAllKbVectors();
+      const rows = await this.getAllKbVectorsAsync();
       if (rows.length === 0) return false;
       // Guard a lossy read the same way buildKbNavIndex does.
       if (rows.length < currentRows * (1 - VectorStore.KB_NAV_MAX_DROP_RATIO)) {
@@ -4663,6 +4889,7 @@ export class VectorStore implements IMemoryStore {
       );
       return false;
     } finally {
+      endHeavyTask(diagToken);
       this.kbNavBuilding = false;
       this.kbNavDirtyOwners = null;
     }

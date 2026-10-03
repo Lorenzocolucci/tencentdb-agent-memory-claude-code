@@ -774,7 +774,13 @@ export interface IMemoryStore {
   }>;
 
   /** kb_vec / kb_fts recall primitives (mirror searchL1Vector / searchL1Fts). */
-  searchKbVector?(queryEmbedding: Float32Array, topK?: number, ownerKindFilter?: string): KbVectorSearchResult[];
+  searchKbVector?(
+    queryEmbedding: Float32Array,
+    topK?: number,
+    ownerKindFilter?: string,
+    /** allowBruteForce=false: never fall back to the O(N) kb_vec scan (recall hot path). Default true. */
+    opts?: { allowBruteForce?: boolean },
+  ): KbVectorSearchResult[];
   searchKbFts?(ftsQuery: string, limit?: number): KbFtsSearchResult[];
 
   /** kb_vec / kb_fts chunked write (mirror the l1 chunked write). */
