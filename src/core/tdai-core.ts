@@ -386,6 +386,24 @@ export class TdaiCore {
   // ============================
 
   /**
+   * Config for ONE recall with a caller-supplied overall timeout (the plugin's
+   * remaining deadline). The search budget is kept below it so the search can
+   * degrade to empty memories before the overall race gives up.
+   */
+  private cfgWithRecallTimeout(timeoutMs?: number): MemoryTdaiConfig {
+    if (timeoutMs === undefined) return this.cfg;
+    const searchBudget = Math.max(250, timeoutMs - 500);
+    return {
+      ...this.cfg,
+      recall: {
+        ...this.cfg.recall,
+        timeoutMs,
+        searchTimeoutMs: Math.min(this.cfg.recall.searchTimeoutMs ?? searchBudget, searchBudget),
+      },
+    };
+  }
+
+  /**
    * Handle recall (memory retrieval) before an LLM turn.
    * Maps to: OpenClaw `before_prompt_build` / Hermes `prefetch()`.
    */
@@ -394,6 +412,7 @@ export class TdaiCore {
     sessionKey: string,
     projectName?: string,
     sessionId?: string,
+    options?: { recallTimeoutMs?: number },
   ): Promise<RecallResult> {
     await this.storeReady?.catch(() => {});
 
@@ -406,7 +425,7 @@ export class TdaiCore {
       userText,
       actorId: "default_user",
       sessionKey,
-      cfg: this.cfg,
+      cfg: this.cfgWithRecallTimeout(options?.recallTimeoutMs),
       pluginDataDir: this.dataDir,
       projectName,
       sessionId,

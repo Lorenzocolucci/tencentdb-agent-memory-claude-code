@@ -29,15 +29,28 @@ import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/p
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import type { Logger } from "./types.js";
+import { beginHeavyTask, endHeavyTask } from "./diagnostics/inflight-registry.js";
 
 const TAG = "[capture-inbox]";
 const FAILED_DIR = "failed";
 const DEFAULT_MAX_ATTEMPTS = 5;
 const DEFAULT_RETRY_DELAY_MS = 30_000;
+const PROCESSED_FILE = "processed-ids.log";
+/** Idempotency keys remembered after a capture is written (bounded, survives restart). */
+const DEFAULT_PROCESSED_CAP = 2_000;
+const MAX_KEY_LEN = 80;
 
 export interface InboxItem<T> {
   id: string;
   body: T;
+  /** Client idempotency key (sanitized), when the request carried one. */
+  key?: string;
+}
+
+export interface EnqueueResult {
+  id: string;
+  /** True when the key was already queued or already written: nothing new was stored. */
+  duplicate: boolean;
 }
 
 export interface CaptureInboxStatus {
@@ -62,6 +75,13 @@ export interface CaptureInboxOptions<T> {
   now?: () => number;
   /** Injectable yield between items (tests: no-op). */
   yieldToLoop?: () => Promise<void>;
+  /**
+   * Only the process holding the gateway lock may drain: two processes draining
+   * the same directory write every capture twice. Default: always owner (tests).
+   */
+  isOwner?: () => boolean;
+  /** How many processed idempotency keys to remember (default 2000). */
+  processedCap?: number;
 }
 
 const defaultYield = (): Promise<void> => new Promise((r) => setImmediate(r));
@@ -75,6 +95,11 @@ export class CaptureInbox<T = unknown> {
   private readonly retryDelayMs: number;
   private readonly now: () => number;
   private readonly yieldToLoop: () => Promise<void>;
+  private readonly isOwner: () => boolean;
+  private readonly processedCap: number;
+  /** Insertion-ordered set of keys already written (oldest evicted first). */
+  private readonly processed = new Set<string>();
+  private notOwnerLogged = false;
   private readonly attempts = new Map<string, number>();
   private counter = 0;
   private draining = false;
@@ -93,11 +118,14 @@ export class CaptureInbox<T = unknown> {
     this.retryDelayMs = opts.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
     this.now = opts.now ?? Date.now;
     this.yieldToLoop = opts.yieldToLoop ?? defaultYield;
+    this.isOwner = opts.isOwner ?? (() => true);
+    this.processedCap = opts.processedCap ?? DEFAULT_PROCESSED_CAP;
   }
 
   /** Create the directories and replay whatever a previous process left behind. */
   async start(): Promise<void> {
     await mkdir(this.failedDir, { recursive: true });
+    await this.loadProcessed();
     this.started = true;
     const leftover = (await this.listPending()).length;
     if (leftover > 0) this.logger?.info(`${TAG} replaying ${leftover} pending capture(s) from a previous run`);
@@ -113,24 +141,36 @@ export class CaptureInbox<T = unknown> {
   /**
    * Persist the request and return at once. Time-ordered ids keep FIFO order
    * across restarts; the counter breaks ties inside one millisecond.
+   *
+   * With an `idempotencyKey` the id ends in the key and a repeat of the same
+   * key is a no-op: the plugin re-sends a batch whose ack it never saw, and the
+   * first copy may be queued, in flight, or already written.
    */
-  async enqueue(body: T): Promise<{ id: string }> {
+  async enqueue(body: T, opts: { idempotencyKey?: string } = {}): Promise<EnqueueResult> {
     // Id first (synchronously): call order == id order. Then the writes are
     // chained so file N is on disk before file N+1 — two concurrent Stops must
     // not let the later one be drained first while the earlier is still a .tmp.
-    const id = this.nextId();
+    const key = sanitizeKey(opts.idempotencyKey);
+    const id = this.nextId(key);
     const finalPath = join(this.dir, `${id}.json`);
     const tmpPath = join(this.dir, `${id}.tmp`);
-    const write = async (): Promise<void> => {
+    const write = async (): Promise<EnqueueResult> => {
       await mkdir(this.dir, { recursive: true });
-      await writeFile(tmpPath, JSON.stringify({ id, body }), "utf-8");
+      if (key) {
+        if (this.processed.has(key)) return { id: key, duplicate: true };
+        const queued = (await this.listPending()).find((n) => n.endsWith(`-${key}.json`));
+        if (queued) return { id: queued.slice(0, -".json".length), duplicate: true };
+      }
+      const envelope: InboxItem<T> = key ? { id, body, key } : { id, body };
+      await writeFile(tmpPath, JSON.stringify(envelope), "utf-8");
       await rename(tmpPath, finalPath);
+      return { id, duplicate: false };
     };
     const mine = this.writeChain.then(write, write);
-    this.writeChain = mine.catch(() => {});
-    await mine;
-    if (this.started) this.kick();
-    return { id };
+    this.writeChain = mine.then(() => {}, () => {});
+    const result = await mine;
+    if (this.started && !result.duplicate) this.kick();
+    return result;
   }
 
   async status(): Promise<CaptureInboxStatus> {
@@ -149,9 +189,32 @@ export class CaptureInbox<T = unknown> {
     while (this.currentDrain) await this.currentDrain.catch(() => {});
   }
 
-  private nextId(): string {
+  private nextId(key?: string): string {
     this.counter = (this.counter + 1) % 1_000_000;
-    return `${String(this.now()).padStart(15, "0")}-${String(this.counter).padStart(6, "0")}-${randomBytes(3).toString("hex")}`;
+    const base = `${String(this.now()).padStart(15, "0")}-${String(this.counter).padStart(6, "0")}-${randomBytes(3).toString("hex")}`;
+    return key ? `${base}-${key}` : base;
+  }
+
+  private async loadProcessed(): Promise<void> {
+    const text = await readFile(join(this.dir, PROCESSED_FILE), "utf-8").catch(() => "");
+    for (const line of text.split("\n")) if (line) this.processed.add(line);
+  }
+
+  /** Remember a written key; bounded, persisted atomically (tmp + rename). */
+  private async markProcessed(key: string): Promise<void> {
+    this.processed.delete(key);
+    this.processed.add(key);
+    while (this.processed.size > this.processedCap) {
+      const oldest = this.processed.values().next().value as string;
+      this.processed.delete(oldest);
+    }
+    const path = join(this.dir, PROCESSED_FILE);
+    try {
+      await writeFile(`${path}.tmp`, [...this.processed].join("\n") + "\n", "utf-8");
+      await rename(`${path}.tmp`, path);
+    } catch (err) {
+      this.logger?.warn(`${TAG} could not persist processed ids: ${errMsg(err)}`);
+    }
   }
 
   private async listPending(): Promise<string[]> {
@@ -161,6 +224,13 @@ export class CaptureInbox<T = unknown> {
 
   private kick(): void {
     if (this.stopped) return;
+    if (!this.isOwner()) {
+      if (!this.notOwnerLogged) {
+        this.notOwnerLogged = true;
+        this.logger?.warn(`${TAG} not the gateway lock owner - leaving the inbox undrained`);
+      }
+      return;
+    }
     if (this.draining) {
       this.drainAgain = true;
       return;
@@ -189,8 +259,15 @@ export class CaptureInbox<T = unknown> {
         await this.park(name, `unreadable inbox file: ${errMsg(err)}`);
         continue;
       }
+      if (item.key && this.processed.has(item.key)) {
+        // Written before a crash that left the file behind: do not write twice.
+        await rm(path, { force: true });
+        continue;
+      }
+      const heavy = beginHeavyTask("capture-inbox-drain");
       try {
         await this.processItem(item);
+        if (item.key) await this.markProcessed(item.key);
         await rm(path, { force: true });
         this.attempts.delete(name);
       } catch (err) {
@@ -210,6 +287,8 @@ export class CaptureInbox<T = unknown> {
           t.unref?.();
           return;
         }
+      } finally {
+        endHeavyTask(heavy);
       }
       await this.yieldToLoop();
     }
@@ -223,6 +302,13 @@ export class CaptureInbox<T = unknown> {
     await writeFile(`${to}.error.txt`, `${new Date(this.now()).toISOString()} ${error}\n`, "utf-8").catch(() => {});
     this.logger?.error(`${TAG} ${name} parked in failed/ after ${this.maxAttempts} attempts: ${error}`);
   }
+}
+
+/** Keep a client key filesystem-safe and short; empty/absent -> no key. */
+function sanitizeKey(key: string | undefined): string | undefined {
+  if (typeof key !== "string") return undefined;
+  const clean = key.replace(/[^A-Za-z0-9_]/g, "_").slice(0, MAX_KEY_LEN);
+  return clean.length > 0 ? clean : undefined;
 }
 
 function errMsg(err: unknown): string {

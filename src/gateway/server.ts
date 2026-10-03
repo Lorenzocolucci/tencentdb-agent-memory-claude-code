@@ -19,6 +19,7 @@
 
 import http from "node:http";
 import { timingSafeEqual } from "node:crypto";
+import os from "node:os";
 import { URL } from "node:url";
 import { TdaiCore } from "../core/tdai-core.js";
 import { CaptureInbox } from "../core/capture-inbox.js";
@@ -57,7 +58,10 @@ import type { Logger } from "../core/types.js";
 import { validateAndNormalizeRaw, fillTimestamps, SeedValidationError } from "../core/seed/input.js";
 import { executeSeed } from "../core/seed/seed-runtime.js";
 import type { SeedProgress } from "../core/seed/types.js";
-import { startEventLoopMonitor, resetEventLoopLag } from "../core/diagnostics/event-loop-monitor.js";
+import { startEventLoopMonitor } from "../core/diagnostics/event-loop-monitor.js";
+import { beginHeavyTask, endHeavyTask } from "../core/diagnostics/inflight-registry.js";
+import { acquireGatewayLock, type GatewayLock } from "./gateway-lock.js";
+import { DEADLINE_HEADER, resolveRecallTimeoutMs } from "./recall-deadline.js";
 import { isSlowRecall, composeSlowRecallBreadcrumb } from "../core/diagnostics/slow-recall.js";
 
 const TAG = "[tdai-gateway]";
@@ -84,12 +88,39 @@ const HEALTH_EMBEDDING_PROBE = "ping";
 // Console logger (for standalone gateway — no OpenClaw logger available)
 // ============================
 
+/** Every gateway log line starts with an ISO timestamp (logs are matched to hook.log by time). */
+export function stampLogLine(msg: string, now: Date = new Date()): string {
+  return `${now.toISOString()} ${TAG} ${msg}`;
+}
+
 function createConsoleLogger(): Logger {
   return {
-    debug: (msg: string) => console.debug(`${TAG} ${msg}`),
-    info: (msg: string) => console.info(`${TAG} ${msg}`),
-    warn: (msg: string) => console.warn(`${TAG} ${msg}`),
-    error: (msg: string) => console.error(`${TAG} ${msg}`),
+    debug: (msg: string) => console.debug(stampLogLine(msg)),
+    info: (msg: string) => console.info(stampLogLine(msg)),
+    warn: (msg: string) => console.warn(stampLogLine(msg)),
+    error: (msg: string) => console.error(stampLogLine(msg)),
+  };
+}
+
+/** Run a handler body as a registered heavy task so a slow recall can name it. */
+async function withHeavyTask<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  const token = beginHeavyTask(name);
+  try {
+    return await fn();
+  } finally {
+    endHeavyTask(token);
+  }
+}
+
+/** Process + machine memory for /health: paging (low free RAM) turned 1 s of work into 60 s. */
+function readMemoryStats(): NonNullable<HealthResponse["memory"]> {
+  const m = process.memoryUsage();
+  return {
+    rss: m.rss,
+    heapUsed: m.heapUsed,
+    external: m.external,
+    machineFree: os.freemem(),
+    machineTotal: os.totalmem(),
   };
 }
 
@@ -190,6 +221,10 @@ export class TdaiGateway {
   private startTime = Date.now();
   /** Durable inbox behind POST /capture (sign first, unpack later — see capture-inbox.ts). */
   private captureInbox: CaptureInbox<CaptureRequest>;
+  /** Exclusive `<dataDir>/gateway.lock`; non-null = this process owns the data dir. */
+  private lock: GatewayLock | null = null;
+  /** False while core.initialize() runs: the port is open but every route answers 503 "starting". */
+  private ready = false;
 
   // Cached embedding-liveness result (see HEALTH_EMBEDDING_TTL_MS). null = not
   // probed yet. We never let a probe failure throw out of /health.
@@ -219,6 +254,8 @@ export class TdaiGateway {
     this.captureInbox = new CaptureInbox<CaptureRequest>({
       dir: joinPath(this.config.data.baseDir, "capture-inbox"),
       logger: this.logger,
+      // Only the lock owner may drain (a second drainer writes every capture twice).
+      isOwner: () => this.lock !== null,
       process: async ({ id, body }) => {
         const startMs = Date.now();
         const result = await this.core.handleTurnCommitted({
@@ -240,6 +277,12 @@ export class TdaiGateway {
 
   /**
    * Start the Gateway HTTP server.
+   *
+   * Order matters (2026-10-03): lock -> listen -> initialize. The port is bound
+   * BEFORE the slow core initialize (boot loads ~70k vectors), so a second
+   * launcher sees a busy port at once instead of racing a half-booted store,
+   * and every route answers 503 {status:"starting"} until initialize is done.
+   * Throws GatewayLockHeldError when another live gateway owns the data dir.
    */
   async start(): Promise<void> {
     // Diagnostics: start the passive event-loop lag monitor as EARLY as possible
@@ -251,13 +294,32 @@ export class TdaiGateway {
     // Initialize data directories
     initDataDirectories(this.config.data.baseDir);
 
-    // Initialize core
-    await this.core.initialize();
+    this.lock = await acquireGatewayLock(this.config.data.baseDir);
+    try {
+      await this.listen();
+      await this.core.initialize();
 
-    // Replay captures a previous process accepted but never wrote (crash,
-    // kill, deploy). Runs in the background; boot is not delayed by a backlog.
-    await this.captureInbox.start();
+      // Replay captures a previous process accepted but never wrote (crash,
+      // kill, deploy). Runs in the background; boot is not delayed by a backlog.
+      await this.captureInbox.start();
+      this.ready = true;
+      this.logger.info("Gateway ready");
 
+      // Immune system: resume any extraction backlog frozen by the previous
+      // shutdown (restart amnesia). Fire-and-forget so it never blocks boot —
+      // recovery enqueues L1 passes that drain in the background.
+      this.core.resumeExtraction().catch((err) => {
+        this.logger.warn(
+          `Extraction resume failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    } catch (err) {
+      await this.abortStart();
+      throw err;
+    }
+  }
+
+  private async listen(): Promise<void> {
     // Create HTTP server
     this.server = http.createServer((req, res) => this.handleRequest(req, res));
 
@@ -273,23 +335,27 @@ export class TdaiGateway {
     this.server.keepAliveTimeout = HTTP_KEEP_ALIVE_TIMEOUT_MS;
 
     const { port, host } = this.config.server;
+    const server = this.server;
 
     await new Promise<void>((resolve, reject) => {
-      this.server!.listen(port, host, () => {
+      server.once("error", reject);
+      server.listen(port, host, () => {
+        server.off("error", reject);
         this.startTime = Date.now();
-        this.logger.info(`Gateway listening on http://${host}:${port}`);
-        // Immune system: resume any extraction backlog frozen by the previous
-        // shutdown (restart amnesia). Fire-and-forget so it never blocks boot —
-        // recovery enqueues L1 passes that drain in the background.
-        this.core.resumeExtraction().catch((err) => {
-          this.logger.warn(
-            `Extraction resume failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
+        this.logger.info(`Gateway listening on http://${host}:${port} (starting: initializing core)`);
         resolve();
       });
-      this.server!.on("error", reject);
     });
+  }
+
+  /** Undo a failed start(): close the port and give the lock back. */
+  private async abortStart(): Promise<void> {
+    this.ready = false;
+    const server = this.server;
+    this.server = null;
+    if (server?.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    await this.lock?.release().catch(() => {});
+    this.lock = null;
   }
 
   /**
@@ -297,6 +363,7 @@ export class TdaiGateway {
    */
   async stop(): Promise<void> {
     this.logger.info("Shutting down gateway...");
+    this.ready = false;
 
     if (this.server) {
       await new Promise<void>((resolve) => {
@@ -307,6 +374,10 @@ export class TdaiGateway {
     // Finish the capture in flight, leave the rest on disk for the next start.
     await this.captureInbox.stop();
     await this.core.destroy();
+    await this.lock?.release().catch((err) => {
+      this.logger.warn(`Could not release gateway lock: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    this.lock = null;
     this.logger.info("Gateway stopped");
   }
 
@@ -327,6 +398,13 @@ export class TdaiGateway {
     if (method === "OPTIONS") {
       res.writeHead(204);
       res.end();
+      return;
+    }
+
+    // Port is bound before core.initialize(): until ready, EVERY route (health
+    // included) says "starting". Probes treat 503 as "alive, not ready yet".
+    if (!this.ready) {
+      sendJson(res, 503, { status: "starting" });
       return;
     }
 
@@ -418,6 +496,7 @@ export class TdaiGateway {
         embeddingService: !!this.core.getEmbeddingService(),
       },
       embedding: embeddingOk ? "ok" : "failing",
+      memory: readMemoryStats(),
       last_capture_at: await this.readLastCaptureAt(),
       ...(await this.captureInbox.status().then(
         (s) => ({
@@ -512,19 +591,27 @@ export class TdaiGateway {
       return;
     }
 
+    // The plugin states how long it will wait; recall must answer inside that.
+    const recallTimeoutMs = resolveRecallTimeoutMs(
+      this.config.memory.recall.timeoutMs ?? 5000,
+      req.headers[DEADLINE_HEADER],
+    );
+
     const startMs = Date.now();
-    const result = await this.core.handleBeforeRecall(body.query, body.session_key, body.project, body.session_id);
+    const result = await withHeavyTask("recall", () =>
+      this.core.handleBeforeRecall(body.query, body.session_key, body.project, body.session_id, {
+        recallTimeoutMs,
+      }),
+    );
     const elapsed = Date.now() - startMs;
 
     // Diagnostics breadcrumb: a slow recall means the single event loop was
     // starved (node:sqlite is synchronous). Log WHO was hogging it — the
     // in-flight / just-finished heavy task + the event-loop lag — so the next
     // natural occurrence is attributed deterministically instead of guessed.
-    // Reset the lag window after reading so the next incident measures a fresh
-    // stall.
+    // The lag is a rolling 10 s window with ISO timestamps (no reset needed).
     if (isSlowRecall(elapsed)) {
-      this.logger.warn(`${TAG} ${composeSlowRecallBreadcrumb(elapsed)}`);
-      resetEventLoopLag();
+      this.logger.warn(composeSlowRecallBreadcrumb(elapsed));
     }
 
     // Deliver BOTH the stable context (persona/scene/guide) AND the dynamic
@@ -561,8 +648,13 @@ export class TdaiGateway {
     // cursor never advanced. Now the request is durable on disk before we
     // answer; the write happens in the inbox drain, one item at a time.
     const accepted = Array.isArray(body.messages) && body.messages.length > 0 ? body.messages.length : 2;
-    const { id } = await this.captureInbox.enqueue(body);
-    this.logger.info(`Capture ${id} accepted: ${accepted} message(s) session=${body.session_key}`);
+    const idempotencyKey = typeof body.idempotency_key === "string" ? body.idempotency_key : undefined;
+    const { id, duplicate } = await this.captureInbox.enqueue(body, { idempotencyKey });
+    this.logger.info(
+      duplicate
+        ? `Capture ${id} duplicate ignored (idempotency_key already queued or written): session=${body.session_key}`
+        : `Capture ${id} accepted: ${accepted} message(s) session=${body.session_key}`,
+    );
 
     const response: CaptureResponse = {
       l0_recorded: accepted,
@@ -570,6 +662,7 @@ export class TdaiGateway {
       accepted,
       queued: true,
       inbox_id: id,
+      ...(duplicate ? { duplicate: true } : {}),
     };
     sendJson(res, 200, response);
   }
@@ -653,12 +746,14 @@ export class TdaiGateway {
       return;
     }
 
-    const result = await this.core.searchMemories({
-      query: body.query,
-      limit: body.limit,
-      type: body.type,
-      scene: body.scene,
-    });
+    const result = await withHeavyTask("search-memories", () =>
+      this.core.searchMemories({
+        query: body.query,
+        limit: body.limit,
+        type: body.type,
+        scene: body.scene,
+      }),
+    );
 
     const response: MemorySearchResponse = {
       results: result.text,
@@ -676,11 +771,13 @@ export class TdaiGateway {
       return;
     }
 
-    const result = await this.core.searchConversations({
-      query: body.query,
-      limit: body.limit,
-      sessionKey: body.session_key,
-    });
+    const result = await withHeavyTask("search-conversations", () =>
+      this.core.searchConversations({
+        query: body.query,
+        limit: body.limit,
+        sessionKey: body.session_key,
+      }),
+    );
 
     const response: ConversationSearchResponse = {
       results: result.text,
@@ -701,14 +798,16 @@ export class TdaiGateway {
       return;
     }
 
-    const result = await this.core.handleToolObservation({
-      sessionKey: body.session_key,
-      toolName: body.tool_name,
-      toolInput: body.tool_input,
-      toolOutputIsError: body.tool_output_is_error,
-      toolOutputText: body.tool_output_text,
-      toolRisk: body.tool_risk,
-    });
+    const result = await withHeavyTask("observe", () =>
+      this.core.handleToolObservation({
+        sessionKey: body.session_key,
+        toolName: body.tool_name,
+        toolInput: body.tool_input,
+        toolOutputIsError: body.tool_output_is_error,
+        toolOutputText: body.tool_output_text,
+        toolRisk: body.tool_risk,
+      }),
+    );
 
     const response: ObserveResponse = { context: result.inject ?? "" };
     sendJson(res, 200, response);

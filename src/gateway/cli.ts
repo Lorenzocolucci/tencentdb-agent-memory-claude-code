@@ -22,6 +22,9 @@
 
 import { readFileSync } from "node:fs";
 import { TdaiGateway } from "./server.js";
+import { loadGatewayConfig } from "./config.js";
+import { installCrashHandlers } from "./crash-log.js";
+import { GatewayLockHeldError } from "./gateway-lock.js";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"]);
 
@@ -61,8 +64,8 @@ function loadTokenFromFile(): void {
 async function main(): Promise<void> {
   assertSafeHost();
   loadTokenFromFile();
+  installCrashHandlers(loadGatewayConfig().data.baseDir);
   const gateway = new TdaiGateway();
-  await gateway.start();
 
   let shuttingDown = false;
   const shutdown = async (reason: string): Promise<void> => {
@@ -81,6 +84,19 @@ async function main(): Promise<void> {
 
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));
+
+  // Signals are handled BEFORE start(): the port is bound before the (slow)
+  // core initialize, so a stop request can arrive while still booting.
+  try {
+    await gateway.start();
+  } catch (err) {
+    if (err instanceof GatewayLockHeldError) {
+      // Not a failure: another gateway owns this data dir. Leave it running.
+      process.stderr.write(`${new Date().toISOString()} tdai-memory-gateway: ${err.message}\n`);
+      process.exit(0);
+    }
+    throw err;
+  }
 
   const ccPid = parseInt(process.env.TDAI_CC_PID ?? "0", 10);
   if (Number.isFinite(ccPid) && ccPid > 0) {
