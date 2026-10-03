@@ -21,6 +21,7 @@
  *        [--out report.json] [--label before] [--legacy] [--dims 1024] [--show]
  *
  *   --legacy   run with recall.selective.enabled=false (the pre-Phase-3 behaviour)
+ *   --selective '{"minEvidencePoints":3}'   override selective settings (tuning)
  *   --show     print the memory lines (default: counts only — prompts are private)
  *
  * Prompt set: produced by tools/build-replay-set.mts, kept OUTSIDE the repo.
@@ -122,8 +123,9 @@ async function main(): Promise<void> {
   const store = flag("writes") ? raw : stubWrites(raw);
   const db = (raw as unknown as { db: import("node:sqlite").DatabaseSync }).db;
 
+  const override = arg("selective") ? (JSON.parse(arg("selective")!) as Record<string, unknown>) : {};
   const cfg = parseConfig({
-    recall: { source: "kb", ...(flag("legacy") ? { selective: { enabled: false } } : {}) },
+    recall: { source: "kb", selective: flag("legacy") ? { enabled: false } : override },
   });
   const askMod = (await import("../src/core/kb/grounded-trust-ask.js")) as Record<string, unknown>;
   const buildAsks = askMod.buildGroundedTrustBlock as
@@ -167,7 +169,10 @@ async function main(): Promise<void> {
         const id = (m as { ownerId?: string }).ownerId;
         if (!id) continue;
         const p = ownerProject(db, id, m.type);
-        if (p && p !== project) cross++;
+        if (p && p !== project) {
+          cross++;
+          if (flag("show-cross")) console.log(`   CROSS [${project} #${i}] owner-project=${p} kind=${m.type} :: ${m.content.slice(0, 110)}`);
+        }
       }
       if (flag("show")) {
         console.log(`\n[${project} #${i}] ${lines.length} lines, ${context.length} chars`);
