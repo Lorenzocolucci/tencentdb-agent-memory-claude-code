@@ -705,8 +705,11 @@ export async function runKbRecall(
    *
    * `injectionLog` / `chronicNoise` (selective mode only): the per-session de-dup log
    * and the chronic-noise cache; default to process-wide instances.
+   *
+   * `nowMs` (selective mode only): the clock for recency and the recent-project window;
+   * default Date.now(). The offline eval replays a past prompt at its own time.
    */
-  runOpts?: { deferWrites?: boolean; injectionLog?: RecentInjectionLog; chronicNoise?: ChronicNoiseCache },
+  runOpts?: { deferWrites?: boolean; injectionLog?: RecentInjectionLog; chronicNoise?: ChronicNoiseCache; nowMs?: number },
 ): Promise<KbRecallResult[]> {
   if (!vectorStore) {
     logger?.debug?.(`${TAG} [kb] vectorStore unavailable — KB recall skipped`);
@@ -992,7 +995,7 @@ interface SelectivePipelineArgs {
   phases: PhaseTimings;
   doWrite: (name: string, run: () => void) => void;
   embeddingTimeoutMs?: number;
-  runOpts?: { injectionLog?: RecentInjectionLog; chronicNoise?: ChronicNoiseCache };
+  runOpts?: { injectionLog?: RecentInjectionLog; chronicNoise?: ChronicNoiseCache; nowMs?: number };
 }
 
 async function runSelectivePipeline(a: SelectivePipelineArgs): Promise<KbRecallResult[]> {
@@ -1018,6 +1021,7 @@ async function runSelectivePipeline(a: SelectivePipelineArgs): Promise<KbRecallR
   const vectorReady = !!a.embeddingService && store.isKbNavIndexActive?.() === true;
   let picked = await kbRecallSelective(redactSecrets(a.userText), {
     store, embeddingService: a.embeddingService, selective: sel, excludeOwners,
+    project: a.projectName, nowMs: a.runOpts?.nowMs,
     skipVector: !vectorReady, allowBruteForceVector: false,
     embeddingTimeoutMs: a.embeddingTimeoutMs, phaseMs: a.phases, logger: a.logger,
   });

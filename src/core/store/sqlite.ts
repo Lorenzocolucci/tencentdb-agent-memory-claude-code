@@ -124,6 +124,8 @@ import {
   otherProjectKeys as selectiveOtherProjectKeys,
   chronicNoiseKeys as selectiveChronicNoiseKeys,
   ownerProjects as selectiveOwnerProjects,
+  recentProjectEvents as selectiveRecentProjectEvents,
+  type RecentProjectEventsOptions,
 } from "../kb/selective-store.js";
 import { dirname, join } from "node:path";
 import {
@@ -2801,6 +2803,17 @@ export class VectorStore implements IMemoryStore {
     }
   }
 
+  /** Latest events of `project` inside a time window, newest first (the recent-project-work source). */
+  recentProjectEvents(project: string, opts: RecentProjectEventsOptions): KbEvent[] {
+    if (this.degraded || !this.kbReady) return [];
+    try {
+      return selectiveRecentProjectEvents(this.db, project, opts);
+    } catch (err) {
+      this.logger?.warn?.(`${TAG} [scope] recentProjectEvents failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+      return [];
+    }
+  }
+
   /** Phase 3.10 — owners the ledger shows injected ≥ N times and never used ("kind:id"). */
   chronicNoiseOwnerKeys(minInjections: number): string[] {
     if (this.degraded || !this.kbReady) return [];
@@ -5361,6 +5374,19 @@ export class VectorStore implements IMemoryStore {
       }
     }
     return rare;
+  }
+
+  /**
+   * Which of `tokens` are VERY common in the KB: mentioned by more than `minDocs`
+   * documents (same bounded, memoized count as rareKbTokens). A token FTS5 cannot parse,
+   * or any failure, is not very common — fail toward the ordinary weight.
+   */
+  veryCommonKbTokens(tokens: readonly string[], minDocs: number): Set<string> {
+    if (this.degraded || !this.kbFtsAvailable) return new Set();
+    const notCommon = this.rareKbTokens(tokens, minDocs);
+    const out = new Set<string>();
+    for (const t of tokens) if (!notCommon.has(t) && this.kbTokenRarityMemo.has(`${minDocs}:${t}`)) out.add(t);
+    return out;
   }
 
   /** kb_fts keyword search. Mirrors searchL1Fts (BM25 → 0–1 score). */

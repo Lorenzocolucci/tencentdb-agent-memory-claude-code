@@ -12,6 +12,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { KbEntity, KbEvent, KbFact } from "../store/types.js";
 import {
   queryEntityById,
+  queryEventById,
   queryEventsForEntity,
   queryHeadFacts,
   queryRelationsForEntity,
@@ -100,6 +101,41 @@ export function otherProjectKeys(
   if (!project || project.trim() === "" || owners.length === 0) return out;
   for (const [key, info] of ownerProjects(db, owners)) {
     if (!info.userLevel && projectsConflict(info.project, project)) out.add(key);
+  }
+  return out;
+}
+
+export interface RecentProjectEventsOptions {
+  /** Only events at or before this instant (ISO). */
+  beforeIso: string;
+  /** Only events at or after this instant (ISO). */
+  sinceIso: string;
+  limit: number;
+  namespace?: string;
+}
+
+/**
+ * The latest events of `project` inside [sinceIso, beforeIso], newest first: an event
+ * belongs to the project by its own tag or, when untagged, by its session's registered
+ * project (the same rule as ownerProjects). Walks the (namespace, ts) index from the
+ * newest end and stops at `limit`, so the cost is bounded by the window, not the table.
+ */
+export function recentProjectEvents(db: DatabaseSync, project: string, opts: RecentProjectEventsOptions): KbEvent[] {
+  const p = project.trim();
+  if (p === "" || opts.limit <= 0) return [];
+  const rows = db
+    .prepare(
+      `SELECT e.id FROM events e
+         LEFT JOIN session_projects sp ON sp.session_key = e.session_key
+        WHERE e.namespace = ? AND e.ts <= ? AND e.ts >= ?
+          AND (e.project = ? COLLATE NOCASE OR (TRIM(e.project) = '' AND sp.project = ? COLLATE NOCASE))
+        ORDER BY e.ts DESC LIMIT ?`,
+    )
+    .all(opts.namespace ?? "default", opts.beforeIso, opts.sinceIso, p, p, Math.floor(opts.limit)) as Array<{ id: string }>;
+  const out: KbEvent[] = [];
+  for (const r of rows) {
+    const e = queryEventById(db, r.id);
+    if (e) out.push(e);
   }
   return out;
 }
