@@ -30,12 +30,15 @@ import type { GatewayConfig } from "./config.js";
 import { initDataDirectories } from "../utils/pipeline-factory.js";
 import { SessionFilter } from "../utils/session-filter.js";
 import { composeRecallContext } from "./recall-context.js";
+import { PretoolService } from "../core/kb/pretool-service.js";
 import type {
   HealthResponse,
   RecallRequest,
   RecallResponse,
   ObserveRequest,
   ObserveResponse,
+  PretoolRequestBody,
+  PretoolResponse,
   CaptureRequest,
   CaptureResponse,
   MemorySearchRequest,
@@ -225,6 +228,8 @@ export class TdaiGateway {
   private lock: GatewayLock | null = null;
   /** False while core.initialize() runs: the port is open but every route answers 503 "starting". */
   private ready = false;
+  /** Phase 4 proactive layer (PreToolUse matcher); built lazily from the live store. */
+  private pretool: PretoolService | undefined;
 
   // Cached embedding-liveness result (see HEALTH_EMBEDDING_TTL_MS). null = not
   // probed yet. We never let a probe failure throw out of /health.
@@ -308,6 +313,7 @@ export class TdaiGateway {
       // Immune system: resume any extraction backlog frozen by the previous
       // shutdown (restart amnesia). Fire-and-forget so it never blocks boot —
       // recovery enqueues L1 passes that drain in the background.
+      this.warmPretool();
       this.core.resumeExtraction().catch((err) => {
         this.logger.warn(
           `Extraction resume failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
@@ -424,6 +430,8 @@ export class TdaiGateway {
           return await this.handleSearchConversations(req, res);
         case "POST /observe":
           return await this.handleObserve(req, res);
+        case "POST /pretool":
+          return await this.handlePretool(req, res);
         case "POST /session/end":
           return await this.handleSessionEnd(req, res);
         case "POST /memory/confirm":
@@ -806,10 +814,76 @@ export class TdaiGateway {
         toolOutputIsError: body.tool_output_is_error,
         toolOutputText: body.tool_output_text,
         toolRisk: body.tool_risk,
+        skipFileMemory: body.skip_file_memory === true,
       }),
     );
 
-    const response: ObserveResponse = { context: result.inject ?? "" };
+    // Phase 4.3: friction is recorded by now; hand back the lesson / past fix that
+    // matches this failure (same matcher as /pretool, in-memory, never throws).
+    const pastFix = this.failureMatch(body);
+    const context = [result.inject ?? "", pastFix].filter((p) => p !== "").join("\n\n");
+    const response: ObserveResponse = { context };
+    sendJson(res, 200, response);
+  }
+
+  /** Lazily create the proactive-layer service once the store is up. */
+  private getPretool(): PretoolService | undefined {
+    if (!this.pretool) {
+      this.pretool = PretoolService.fromStore(this.core.getVectorStore(), this.logger);
+    }
+    return this.pretool;
+  }
+
+  /** Build the index in the background shortly after boot so the first tool call already has one. */
+  private warmPretool(): void {
+    const t = setTimeout(() => {
+      this.getPretool()
+        ?.warm()
+        .catch((err) => {
+          this.logger.warn(`pretool warm-up failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+        });
+    }, 3_000);
+    (t as { unref?: () => void }).unref?.();
+  }
+
+  private failureMatch(body: ObserveRequest): string {
+    if (body.tool_output_is_error !== true || !body.project) return "";
+    const item = this.getPretool()?.check({
+      sessionKey: body.session_key,
+      project: body.project,
+      cwd: body.cwd,
+      toolName: body.tool_name,
+      toolInput: body.tool_input,
+      errorText: body.tool_output_text,
+      phase: "failure",
+    });
+    return item ? item.text : "";
+  }
+
+  /**
+   * POST /pretool — PreToolUse hook: memory that arrives BEFORE the agent acts.
+   * In-memory lookup only; fails open (decision "none") on any problem.
+   */
+  private async handlePretool(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await parseJsonBody<PretoolRequestBody>(req);
+    if (!body.session_key || !body.tool_name || typeof body.project !== "string") {
+      sendError(res, 400, "Missing required fields: session_key, tool_name, project");
+      return;
+    }
+    const item = await withHeavyTask("pretool", async () =>
+      this.getPretool()?.check({
+        sessionKey: body.session_key,
+        project: body.project,
+        cwd: body.cwd,
+        toolName: body.tool_name,
+        toolInput: body.tool_input,
+        oneWay: body.one_way ?? null,
+        phase: "pre",
+      }) ?? null,
+    );
+    const response: PretoolResponse = item
+      ? { decision: item.severity, message: item.text, lesson_id: item.lessonId }
+      : { decision: "none", message: "" };
     sendJson(res, 200, response);
   }
 

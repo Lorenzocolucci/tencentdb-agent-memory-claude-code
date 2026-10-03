@@ -98,11 +98,45 @@ export interface ObserveRequest {
    * "destructive" is accepted for now; anything else is a 400.
    */
   tool_risk?: "destructive";
+  /**
+   * Phase 4.3: project (basename of cwd) + cwd of the failing call. When the call
+   * failed and `project` is set, the gateway appends the matching lesson / past
+   * fix (same matcher as /pretool) to `context`.
+   */
+  project?: string;
+  cwd?: string;
+  /**
+   * Phase 4.6: the plugin now serves `<file-memory>` BEFORE Edit/Write (/pretool),
+   * so PostToolUse asks the gateway not to inject the single-file block again.
+   */
+  skip_file_memory?: boolean;
 }
 
 export interface ObserveResponse {
   /** Memory to inject (additionalContext), or "" for silence. */
   context: string;
+}
+
+// ============================
+// /pretool
+// ============================
+
+export interface PretoolRequestBody {
+  session_key: string;
+  project: string;
+  cwd?: string;
+  tool_name: string;
+  tool_input?: unknown;
+  /** Destructive-command label when the plugin classified the action as one-way. */
+  one_way?: string | null;
+}
+
+export interface PretoolResponse {
+  /** "none" = say nothing; "warn" = additionalContext; "deny" = block the call. */
+  decision: "none" | "warn" | "deny";
+  /** Warning text (warn) or the reason shown to the agent (deny). */
+  message: string;
+  lesson_id?: string;
 }
 
 // ============================
