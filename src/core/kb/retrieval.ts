@@ -124,7 +124,34 @@ export interface KbRecallOptions {
    * Fail-open: if the store cannot answer, ranking is unchanged.
    */
   consolidationBoost?: boolean;
+  /**
+   * Allow the vector source to fall back to a brute-force kb_vec scan when the
+   * navigable index is not published (default true: explicit deep retrieval keeps
+   * its behaviour). The recall hot path passes false — an O(N) scan costs seconds
+   * on the single synchronous connection, so it gets an empty vector part instead.
+   */
+  allowBruteForceVector?: boolean;
+  /**
+   * Optional OUT parameter: kbRecall adds the wall-clock ms of each phase here
+   * (`fts`, `vector`, `entityMatch`, `render`, `priming`). Telemetry only — it
+   * never changes results.
+   */
+  phaseMs?: PhaseTimings;
   logger?: Logger;
+}
+
+/** Per-phase wall-clock accumulator (ms). */
+export type PhaseTimings = Record<string, number>;
+
+/** Run `fn`, adding its duration to `phaseMs[key]` when a collector is supplied. */
+function timed<T>(phaseMs: PhaseTimings | undefined, key: string, fn: () => T): T {
+  if (!phaseMs) return fn();
+  const t0 = performance.now();
+  try {
+    return fn();
+  } finally {
+    phaseMs[key] = (phaseMs[key] ?? 0) + (performance.now() - t0);
+  }
 }
 
 /** Lifecycle signal used by the consolidation boost (subset of memory_lifecycle). */
@@ -262,12 +289,13 @@ async function recallVector(
   query: string,
   limit: number,
   embeddingCallOpts: EmbeddingCallOptions | undefined,
+  allowBruteForce: boolean,
   logger?: Logger,
 ): Promise<RankedCandidate[]> {
   if (!store.searchKbVector || !embeddingService) return [];
   try {
     const queryEmbedding = await embeddingService.embed(query, embeddingCallOpts);
-    const rows = store.searchKbVector(queryEmbedding, limit);
+    const rows = store.searchKbVector(queryEmbedding, limit, undefined, { allowBruteForce });
     return rows.map((r, rank) => ({
       ownerId: r.owner_id,
       ownerKind: normalizeOwnerKind(r.owner_kind),
@@ -524,6 +552,8 @@ export async function kbRecall(
     skipVector = false,
     flat = false,
     consolidationBoost = false,
+    allowBruteForceVector = true,
+    phaseMs,
     logger,
   } = options;
 
@@ -545,15 +575,17 @@ export async function kbRecall(
   //    entity-match still seed the graph, and the caller's spreading activation
   //    expands from those seeds — associative recall survives, fast.
   const [ftsCandidates, vectorCandidates, entityCandidates] = await Promise.all([
-    Promise.resolve(recallFts(store, cleanQuery, candidateLimit, logger)),
+    Promise.resolve(timed(phaseMs, "fts", () => recallFts(store, cleanQuery, candidateLimit, logger))),
     skipVector
       ? Promise.resolve<RankedCandidate[]>([])
-      : recallVector(store, embeddingService, cleanQuery, candidateLimit, embeddingCallOpts, logger),
+      : recallVector(store, embeddingService, cleanQuery, candidateLimit, embeddingCallOpts, allowBruteForceVector, logger),
     // Source C (entity-name graph match) is the associative seed. `flat` disables
     // it so the ablation baseline is pure FTS+vector hybrid RRF.
     flat
       ? Promise.resolve<RankedCandidate[]>([])
-      : Promise.resolve(recallEntityMatch(store, cleanQuery, namespace, candidateLimit, logger)),
+      : Promise.resolve(
+          timed(phaseMs, "entityMatch", () => recallEntityMatch(store, cleanQuery, namespace, candidateLimit, logger)),
+        ),
   ]);
 
   if (
@@ -582,10 +614,12 @@ export async function kbRecall(
 
   // ── Render rows (drops superseded facts / missing rows here) ──
   const rendered: RenderedCandidate[] = [];
-  for (const candidate of ranked) {
-    const r = renderCandidate(store, candidate);
-    if (r) rendered.push(r);
-  }
+  timed(phaseMs, "render", () => {
+    for (const candidate of ranked) {
+      const r = renderCandidate(store, candidate);
+      if (r) rendered.push(r);
+    }
+  });
 
   if (rendered.length === 0) {
     logger?.debug?.(`${TAG} no current rows after rendering (all superseded/missing)`);
@@ -615,7 +649,7 @@ export async function kbRecall(
   //    graph-connected ones (co-occurrence ∪ relations) so a weak-but-connected memory
   //    can cross into the top-K — the primer stays invisible. Best-effort, fail-open.
   //    Disabled under `flat` (ablation baseline = no associative amplification).
-  if (!flat) primeRankings(reweighted, store, namespace, logger);
+  if (!flat) timed(phaseMs, "priming", () => primeRankings(reweighted, store, namespace, logger));
 
   reweighted.sort((a, b) => b.ranking - a.ranking);
 

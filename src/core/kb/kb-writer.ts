@@ -33,6 +33,7 @@ import type { EmbeddingService } from "../store/embedding.js";
 import type { Logger } from "../types.js";
 import type { KbDelta } from "./extraction-schema.js";
 import { redactSecrets } from "../../utils/redact-secrets.js";
+import { beginHeavyTask, endHeavyTask } from "../diagnostics/inflight-registry.js";
 import { defaultProvenance, type ProvenanceStamp } from "./provenance.js";
 
 const TAG = "[memory-tdai][kb-writer]";
@@ -139,7 +140,44 @@ export async function applyKbDelta(
 ): Promise<ApplyKbDeltaResult> {
   const namespace = ctx.namespace?.trim() || "default";
   const project = ctx.project ?? "";
-  const { store, sessionKey, now, logger } = ctx;
+
+  // The synchronous write section (steps 1-4: entity/event/fact/relation SQLite
+  // writes) is what can hold the event loop; mark it so a slow recall can name it.
+  // The embedding step below awaits the network, so it is deliberately excluded.
+  const diagToken = beginHeavyTask("apply-kb-delta");
+  let written: WrittenRows;
+  try {
+    written = writeDeltaRows(delta, ctx, namespace, project);
+  } finally {
+    endHeavyTask(diagToken);
+  }
+  const { entities, facts, events, relations } = written;
+
+  // ── 5. Embed (after the write): HEAD facts + new events into kb_vec/kb_fts ──
+  // Only the rows that ended as the current HEAD are worth indexing. upsertFact
+  // returns the HEAD it wrote for cases A/B/C; a case-D backfill returns a CLOSED
+  // historical row (superseded_by set) which we skip — it's not the current
+  // belief, so it must not pollute recall.
+  const embedded = await embedAffected({ facts, events, ctx, namespace });
+
+  return { entities, facts, events, relations, embedded };
+}
+
+interface WrittenRows {
+  entities: KbEntity[];
+  facts: KbFact[];
+  events: KbEvent[];
+  relations: KbRelation[];
+}
+
+/** Steps 1-4 of applyKbDelta: every synchronous SQLite write (no awaits). */
+function writeDeltaRows(
+  delta: KbDelta,
+  ctx: ApplyKbDeltaContext,
+  namespace: string,
+  project: string,
+): WrittenRows {
+  const { store, sessionKey, now } = ctx;
 
   // ── 1. Entities → refMap[ref] = entityId ──
   const refMap = new Map<string, string>();
@@ -230,14 +268,7 @@ export async function applyKbDelta(
     relations.push(upserted);
   }
 
-  // ── 5. Embed (after the write): HEAD facts + new events into kb_vec/kb_fts ──
-  // Only the rows that ended as the current HEAD are worth indexing. upsertFact
-  // returns the HEAD it wrote for cases A/B/C; a case-D backfill returns a CLOSED
-  // historical row (superseded_by set) which we skip — it's not the current
-  // belief, so it must not pollute recall.
-  const embedded = await embedAffected({ facts, events, ctx, namespace });
-
-  return { entities, facts, events, relations, embedded };
+  return { entities, facts, events, relations };
 }
 
 // ============================
