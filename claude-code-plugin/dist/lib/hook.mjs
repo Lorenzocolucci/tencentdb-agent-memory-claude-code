@@ -134,6 +134,10 @@ var GatewayClient = class {
 				project,
 				session_id: sessionId
 			}, token, this.recallTimeoutMs, { "X-TDAI-Deadline-Ms": String(this.recallTimeoutMs) });
+			if (status === 503) return {
+				context: "",
+				error: "refused"
+			};
 			if (status !== 200) {
 				await this.logFailure("POST", "/recall", this.describeStatus(status, body));
 				return {
@@ -1134,6 +1138,7 @@ async function handleSessionStart(_data, client, dataDir) {
 		await raiseAlarm(dataDir, "gateway-unreachable", "il gateway non risponde — NULLA viene salvato in memoria");
 		return "";
 	}
+	if (health.status === "starting") return "";
 	await clearAlarm(dataDir, "gateway-unreachable");
 	if (health.status === "degraded" || health.embedding === "failing") await raiseAlarm(dataDir, "memory-degraded", "l'embedder non risponde bene — la memoria funziona ma richiama peggio");
 	else await clearAlarm(dataDir, "memory-degraded");

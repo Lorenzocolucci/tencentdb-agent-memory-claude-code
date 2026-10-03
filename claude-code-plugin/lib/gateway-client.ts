@@ -108,7 +108,8 @@ export interface GatedMemoryResult {
 
 /** What /health actually tells us. `null` from healthDetailed() = unreachable. */
 export interface HealthDetail {
-  status?: "ok" | "degraded";
+  /** "starting": the gateway is booting and answers 503 on every route (alive, not ready). */
+  status?: "ok" | "degraded" | "starting";
   embedding?: "ok" | "failing";
   last_capture_at?: string | null;
   /** Capture inbox backlog (gateway ≥ 2026-09-06): accepted but not yet written. */
@@ -220,6 +221,9 @@ export class GatewayClient {
         "POST", "/recall", { query, session_key: sessionKey, project, session_id: sessionId }, token,
         this.recallTimeoutMs, { "X-TDAI-Deadline-Ms": String(this.recallTimeoutMs) },
       );
+      // 503 = the gateway is booting (alive, not ready): same handling as a refused
+      // connection — no fallback 1 (it would 503 too), no "slow recall" miss.
+      if (status === 503) return { context: "", error: "refused" };
       if (status !== 200) {
         await this.logFailure("POST", "/recall", this.describeStatus(status, body));
         return { context: "", error: null };

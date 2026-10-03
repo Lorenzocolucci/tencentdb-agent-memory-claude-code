@@ -144,6 +144,9 @@ async function handleSessionStart(
     );
     return "";
   }
+  // Booting (503 starting): alive, not ready. Nothing to judge yet — no alarm
+  // raised, none cleared; the next session-start sees the real state.
+  if (health.status === "starting") return "";
   await clearAlarm(dataDir, "gateway-unreachable");
 
   // Reachable but unhappy is a THIRD state, not a synonym for "down". The
