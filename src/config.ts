@@ -132,6 +132,48 @@ export interface RecallConfig {
    * un-reranked fused order is kept).
    */
   rerank: boolean;
+  /**
+   * "Silent unless useful" injection (Phase 3). When `enabled`, the KB recall path
+   * injects only what clears a relevance gate (possibly nothing), caps the
+   * associative tail and the total number of lines, scopes memories to the current
+   * project, skips what was injected in the last turns and what the ledger shows is
+   * chronic noise, and sends the stable principles/persona block on the first turn
+   * of a session only. Parsed with defaults ON; an absent block (hand-built configs)
+   * keeps the pre-Phase-3 behaviour, and `selective: { enabled: false }` rolls it back.
+   */
+  selective?: SelectiveRecallConfig;
+}
+
+/** Tuning of the Phase-3 selective recall (see RecallConfig.selective). */
+export interface SelectiveRecallConfig {
+  enabled: boolean;
+  /** Relevance floor τ: a query-matched memory below it is not injected. */
+  minRelevance: number;
+  /**
+   * Evidence points a memory must share with the prompt to be a lexical match when no
+   * entity named in the prompt anchors it (rare prompt word = 2 points, common = 1).
+   */
+  minEvidencePoints: number;
+  /** ...and when the memory's entity IS named by a whole word of the prompt. */
+  anchoredMinEvidencePoints: number;
+  /** Hard cap on memory lines per turn (query + associative). */
+  maxLines: number;
+  /** Cap on the associative tail. */
+  maxAssociative: number;
+  /** Associative items need a normalized (0-1) activation of at least this. */
+  minAssociativeActivation: number;
+  /** ...and must be reached from at least this many distinct seeds. */
+  minAssociativeSeeds: number;
+  /** Max memories per entity. */
+  maxFactsPerEntity: number;
+  /** Entities with more head facts than this are context, not seeds. */
+  hubFactThreshold: number;
+  /** Do not re-inject an owner injected in this session's last N turns. */
+  dedupTurns: number;
+  /** Chronic noise: at least this many ledger injections with 0 uses. */
+  chronicNoiseMinInjections: number;
+  /** How long the chronic-noise set is cached. */
+  chronicNoiseCacheMs: number;
 }
 
 /** Embedding service configuration for vector search. */
@@ -347,6 +389,25 @@ export interface MemoryTdaiConfig {
 // ============================
 // Parser
 // ============================
+
+function parseSelective(group: Record<string, unknown>, scoreThreshold: number): SelectiveRecallConfig {
+  return {
+    enabled: bool(group, "enabled") ?? true,
+    // τ defaults to the tuned floor, but never below the pre-existing recall.scoreThreshold (now actually wired).
+    minRelevance: num(group, "minRelevance") ?? Math.max(0.72, scoreThreshold),
+    minEvidencePoints: num(group, "minEvidencePoints") ?? 4,
+    anchoredMinEvidencePoints: num(group, "anchoredMinEvidencePoints") ?? 3,
+    maxLines: num(group, "maxLines") ?? 5,
+    maxAssociative: num(group, "maxAssociative") ?? 3,
+    minAssociativeActivation: num(group, "minAssociativeActivation") ?? 0.3,
+    minAssociativeSeeds: num(group, "minAssociativeSeeds") ?? 2,
+    maxFactsPerEntity: num(group, "maxFactsPerEntity") ?? 2,
+    hubFactThreshold: num(group, "hubFactThreshold") ?? 40,
+    dedupTurns: num(group, "dedupTurns") ?? 10,
+    chronicNoiseMinInjections: num(group, "chronicNoiseMinInjections") ?? 20,
+    chronicNoiseCacheMs: num(group, "chronicNoiseCacheMs") ?? 10 * 60 * 1000,
+  };
+}
 
 /**
  * Parse plugin config from raw user input.
@@ -564,6 +625,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       rerank: bool(recallGroup, "rerank") ?? false,
       // Consolidation wire OFF by default — live ranking unchanged until enabled.
       consolidationBoost: bool(recallGroup, "consolidationBoost") ?? false,
+      selective: parseSelective(obj(recallGroup, "selective"), num(recallGroup, "scoreThreshold") ?? 0.3),
     },
     embedding: {
       enabled: embeddingEnabled,

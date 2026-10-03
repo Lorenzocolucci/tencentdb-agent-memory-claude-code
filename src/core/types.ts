@@ -228,6 +228,8 @@ export interface RecallResult {
   recalledL3Persona?: string | null;
   /** Search strategy used. */
   recallStrategy?: string;
+  /** Recall completed and chose to inject nothing (selective mode) — not a failure. */
+  silent?: boolean;
 }
 
 /** Result from a capture (sync_turn) operation. */

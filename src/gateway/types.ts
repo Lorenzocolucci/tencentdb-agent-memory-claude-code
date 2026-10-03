@@ -73,6 +73,8 @@ export interface RecallResponse {
   context: string;
   strategy?: string;
   memory_count?: number;
+  /** Recall completed and chose to inject nothing: the client must not fill the silence with fallbacks. */
+  silent?: boolean;
 }
 
 // ============================

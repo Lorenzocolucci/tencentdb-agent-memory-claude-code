@@ -59,12 +59,13 @@ import { looksLikeSystemText } from "./kb/behavioral-law-capture.js";
 import { redactSecrets } from "../utils/redact-secrets.js";
 import { applyKbDelta, type KbWriterStore, type ApplyKbDeltaResult } from "./kb/kb-writer.js";
 import type { KbDelta } from "./kb/extraction-schema.js";
-import { performAutoRecall } from "./hooks/auto-recall.js";
+import { performAutoRecall, type RecallOutcome } from "./hooks/auto-recall.js";
 import { SessionBannerTracker } from "./hooks/session-banner.js";
 import { CornerstoneInjectionTracker, buildCornerstones } from "./distinctiveness/cornerstone-runner.js";
 import { beginHeavyTask, endHeavyTask } from "./diagnostics/inflight-registry.js";
 import { CornerstoneSessionCache } from "./distinctiveness/cornerstone-cache.js";
-import { renderGroundedTrustInterrupt } from "./kb/grounded-trust-ask.js";
+import { AskedTracker, buildGroundedTrustBlock, type AskStore } from "./kb/grounded-trust-ask.js";
+import { resolveSelective } from "./kb/selective-recall.js";
 import { performAutoCapture } from "./hooks/auto-capture.js";
 import { executeMemorySearch, formatSearchResponse } from "./tools/memory-search.js";
 import { executeConversationSearch, formatConversationSearchResponse } from "./tools/conversation-search.js";
@@ -238,6 +239,8 @@ export class TdaiCore {
    * does not re-inject. Cleared for a session in {@link handleSessionEnd}.
    */
   private readonly injectedFilesBySession = new Map<string, Set<string>>();
+  /** Grounded-trust asks already raised per cc session (each ask is put once per session). */
+  private readonly askedTracker = new AskedTracker();
 
   /**
    * The rolling situation per session (Context Fingerprint / Idea 1): the SHAPE
@@ -421,7 +424,9 @@ export class TdaiCore {
     // relies on it. Best-effort, never blocks a turn.
     if (projectName) this.vectorStore?.setSessionProject?.(sessionKey, projectName);
 
+    const outcome: RecallOutcome = {};
     const result = await performAutoRecall({
+      outcome,
       userText,
       actorId: "default_user",
       sessionKey,
@@ -471,17 +476,18 @@ export class TdaiCore {
     // Grounded Trust Phase 3: surface the INTERRUPT for any uncertain, high-stakes
     // memory now pending Lorenzo's confirmation. Prepended to the turn context so
     // the agent must raise it before acting. Best-effort: never breaks the turn.
-    const out: RecallResult = result ?? {};
+    const out: RecallResult = result ?? (outcome.silent ? { silent: true } : {});
     try {
-      const store = this.vectorStore as
-        | { getPendingAsks?: (n?: number) => import("./kb/grounded-trust-ask.js").PendingAsk[] }
-        | undefined;
-      if (store && typeof store.getPendingAsks === "function") {
-        const asks = store.getPendingAsks(5);
-        const block = renderGroundedTrustInterrupt(asks);
-        if (block) {
-          out.prependContext = out.prependContext ? `${block}\n\n${out.prependContext}` : block;
-        }
+      // Phase 3.11: this project's asks only, each once per session, values redacted.
+      // (hand-built configs without the selective block keep the old every-turn global ask)
+      const scoped = resolveSelective(this.cfg.recall) !== null;
+      const block = buildGroundedTrustBlock((this.vectorStore ?? {}) as AskStore, {
+        project: scoped ? projectName : undefined,
+        sessionId: scoped ? sessionId : undefined,
+        tracker: scoped ? this.askedTracker : undefined,
+      });
+      if (block) {
+        out.prependContext = out.prependContext ? `${block}\n\n${out.prependContext}` : block;
       }
     } catch (err) {
       this.logger?.warn?.(
