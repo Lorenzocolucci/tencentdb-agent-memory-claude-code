@@ -514,6 +514,11 @@ export class VectorStore implements IMemoryStore {
   private stmtL0FtsInsert!: StatementSync;
   private stmtL0FtsDelete!: StatementSync;
   private stmtL0FtsSearch!: StatementSync;
+  /** Fast L0 FTS paths (rowid lookups) — see {@link VectorStore.ftsDeleteL0}. */
+  private stmtL0FtsDeleteByRowid!: StatementSync;
+  private stmtL0FtsRowidOwner!: StatementSync;
+  private stmtL0FtsInsertAtRowid!: StatementSync;
+  private stmtL0MetaRowid!: StatementSync;
 
   // ── KB (Entity-Centric Core) — Phase 1 ──
   /** `true` once entities/facts/events/relations tables exist. */
@@ -920,6 +925,7 @@ export class VectorStore implements IMemoryStore {
       );
     }
     this.stmtL0DeleteMeta = this.db.prepare("DELETE FROM l0_conversations WHERE record_id = ?");
+    this.stmtL0MetaRowid = this.db.prepare("SELECT rowid AS rid FROM l0_conversations WHERE record_id = ?");
 
     this.stmtL0GetMeta = this.db.prepare(`
       SELECT session_key, session_id, role, message_text, recorded_at, timestamp
@@ -1066,6 +1072,18 @@ export class VectorStore implements IMemoryStore {
       `);
 
       this.stmtL0FtsDelete = this.db.prepare("DELETE FROM l0_fts WHERE record_id = ?");
+      // `record_id` is an UNINDEXED FTS5 column, so the statement above is a FULL
+      // SCAN of l0_fts_content (47k rows: 300-870 ms per call, measured 2026-10-03 on
+      // a live-DB copy — it WAS the whole `l0VecIndex` capture cost). New L0 rows
+      // therefore get FTS rowid = l0_conversations.rowid, and every later
+      // delete/update goes by rowid (0.1 ms). Rows written before this change keep
+      // an unrelated rowid: the verified-by-owner check falls back to the slow scan.
+      this.stmtL0FtsDeleteByRowid = this.db.prepare("DELETE FROM l0_fts WHERE rowid = ?");
+      this.stmtL0FtsRowidOwner = this.db.prepare("SELECT record_id FROM l0_fts WHERE rowid = ?");
+      this.stmtL0FtsInsertAtRowid = this.db.prepare(`
+        INSERT INTO l0_fts (rowid, message_text, message_text_original, record_id, session_key, session_id, role, recorded_at, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
 
       this.stmtL0FtsSearch = this.db.prepare(`
         SELECT record_id, message_text_original AS message_text, session_key, session_id, role, recorded_at, timestamp,
@@ -1770,6 +1788,8 @@ export class VectorStore implements IMemoryStore {
 
       this.db.exec("BEGIN");
       try {
+        // Row id BEFORE the upsert: tells a fresh row (no FTS row to delete) from an update.
+        const priorRowid = (this.stmtL0MetaRowid.get(record.id) as { rid: number | bigint } | undefined)?.rid;
         this.stmtL0UpsertMeta.run(
           record.id,
           record.sessionKey,
@@ -1801,17 +1821,7 @@ export class VectorStore implements IMemoryStore {
         // Sync FTS5 (delete + re-insert to handle updates)
         if (this.ftsAvailable) {
           try {
-            this.stmtL0FtsDelete.run(record.id);
-            this.stmtL0FtsInsert.run(
-              tokenizeForFts(record.messageText), // message_text — segmented for indexing
-              record.messageText,                 // message_text_original — raw for display
-              record.id,
-              record.sessionKey,
-              record.sessionId,
-              record.role,
-              record.recordedAt,
-              record.timestamp,
-            );
+            this.syncL0Fts(record, priorRowid);
           } catch (ftsErr) {
             // FTS write failure is non-fatal — log and continue
             this.logger?.warn(
@@ -1835,6 +1845,47 @@ export class VectorStore implements IMemoryStore {
       );
       return false;
     }
+  }
+
+  /**
+   * Write the l0_fts row for a record, replacing any previous one WITHOUT a table
+   * scan. `priorRowid` is the l0_conversations rowid before this upsert (undefined
+   * = brand-new record, so no old FTS row exists unless the DB is inconsistent).
+   */
+  private syncL0Fts(record: L0Record, priorRowid: number | bigint | undefined): void {
+    if (priorRowid !== undefined) this.ftsDeleteL0(record.id, priorRowid);
+    const metaRow = this.stmtL0MetaRowid.get(record.id) as { rid: number | bigint } | undefined;
+    const rowid = metaRow?.rid;
+    // Rowid aligned with the metadata row, unless a legacy FTS row already sits there.
+    const aligned = rowid !== undefined && this.stmtL0FtsRowidOwner.get(rowid) === undefined;
+    const segmented = tokenizeForFts(record.messageText); // message_text — segmented for indexing
+    if (aligned) {
+      this.stmtL0FtsInsertAtRowid.run(
+        rowid, segmented, record.messageText, record.id, record.sessionKey,
+        record.sessionId, record.role, record.recordedAt, record.timestamp,
+      );
+    } else {
+      this.stmtL0FtsInsert.run(
+        segmented, record.messageText, record.id, record.sessionKey,
+        record.sessionId, record.role, record.recordedAt, record.timestamp,
+      );
+    }
+  }
+
+  /**
+   * Delete a record's l0_fts row. Fast path: the FTS row at the metadata rowid is
+   * ours (verified by record_id). Otherwise (rows written before rowid alignment,
+   * or after a VACUUM renumbered the metadata table) fall back to the full scan.
+   */
+  private ftsDeleteL0(recordId: string, metaRowid: number | bigint | undefined): void {
+    if (metaRowid !== undefined) {
+      const owner = this.stmtL0FtsRowidOwner.get(metaRowid) as { record_id: string } | undefined;
+      if (owner?.record_id === recordId) {
+        this.stmtL0FtsDeleteByRowid.run(metaRowid);
+        return;
+      }
+    }
+    this.stmtL0FtsDelete.run(recordId);
   }
 
   /**
@@ -2005,10 +2056,11 @@ export class VectorStore implements IMemoryStore {
     try {
       this.db.exec("BEGIN");
       try {
+        const metaRowid = (this.stmtL0MetaRowid.get(recordId) as { rid: number | bigint } | undefined)?.rid;
         this.stmtL0DeleteMeta.run(recordId);
         if (this.vecTablesReady) this.stmtL0DeleteVec!.run(recordId);
         if (this.ftsAvailable) {
-          try { this.stmtL0FtsDelete.run(recordId); } catch { /* non-fatal */ }
+          try { this.ftsDeleteL0(recordId, metaRowid); } catch { /* non-fatal */ }
         }
         this.db.exec("COMMIT");
       } catch (err) {
