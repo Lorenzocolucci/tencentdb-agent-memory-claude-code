@@ -136,11 +136,14 @@ describe("KB data layer (temp DB)", () => {
     }
   });
 
-  it("kb_vec uses the chunked owner-partitioned vec0 schema with the right dims", () => {
+  // 2026-10-03 (approved by Lorenzo): fresh DBs are compact. The partition-key
+  // layout put one owner per 8-slot chunk (8x bloat, 1.8 s per L0 upsert live).
+  it("kb_vec uses the compact vec0 schema (no partition key) with the right dims", () => {
     const sql = (dbAll(store, "SELECT sql FROM sqlite_master WHERE name='kb_vec'")[0].sql) as string;
     expect(sql).toMatch(/chunk_id/i);
     expect(sql).toMatch(/owner_id/i);
-    expect(sql).toMatch(/partition key/i);
+    expect(sql).not.toMatch(/partition key/i);
+    expect(sql).toMatch(/chunk_size=256/);
     expect(sql).toMatch(/float\[4\]/);
   });
 
