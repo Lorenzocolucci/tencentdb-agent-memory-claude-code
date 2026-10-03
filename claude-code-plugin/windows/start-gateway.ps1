@@ -46,7 +46,9 @@ param(
   [string]$DataDir = (Join-Path $env:USERPROFILE '.claude\plugins\data\tdai-memory-tdai-local'),
   # Gateway entry point. Default resolves to the built dist of this repo
   # (<repo>\dist\src\gateway\cli.mjs); override for a global/npm install.
-  [string]$GatewayCli = (Join-Path $PSScriptRoot '..\..\dist\src\gateway\cli.mjs'),
+  # Blank = resolved in the body: Windows PowerShell 5.1 leaves $PSScriptRoot
+  # empty inside param() defaults, so Join-Path there throws before any code runs.
+  [string]$GatewayCli = '',
   # node.exe; leave blank to resolve from PATH.
   [string]$NodeExe = ''
 )
@@ -176,7 +178,21 @@ function Invoke-GatewayLaunch {
     $cmd = Get-Command node -ErrorAction SilentlyContinue
     if ($cmd) { $script:NodeExe = $cmd.Source } else { throw "node.exe not found (set -NodeExe)" }
   }
-  if (-not (Test-Path $GatewayCli)) { throw "Gateway entry not found: $GatewayCli (build the repo or set -GatewayCli)" }
+  # An installed copy (e.g. %USERPROFILE%\tdai-gateway) sits outside the repo, so the
+  # repo-relative default does not exist there: fall back to $env:TDAI_GATEWAY_CLI,
+  # then to a one-line gateway.cli.txt next to this script holding the cli.mjs path.
+  if ([string]::IsNullOrWhiteSpace($GatewayCli)) {
+    $script:GatewayCli = Join-Path $PSScriptRoot '..\..\dist\src\gateway\cli.mjs'
+  }
+  if (-not (Test-Path $GatewayCli)) {
+    $pathFile = Join-Path $PSScriptRoot 'gateway.cli.txt'
+    if (-not [string]::IsNullOrWhiteSpace($env:TDAI_GATEWAY_CLI)) {
+      $script:GatewayCli = $env:TDAI_GATEWAY_CLI
+    } elseif (Test-Path $pathFile) {
+      $script:GatewayCli = (Get-Content -Path $pathFile -TotalCount 1).Trim()
+    }
+  }
+  if (-not (Test-Path $GatewayCli)) { throw "Gateway entry not found: $GatewayCli (build the repo, set -GatewayCli, TDAI_GATEWAY_CLI or gateway.cli.txt)" }
   $cli = (Resolve-Path $GatewayCli).Path
 
   New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
