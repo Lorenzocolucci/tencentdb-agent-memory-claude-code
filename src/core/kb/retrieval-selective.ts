@@ -34,18 +34,19 @@ import {
 } from "./retrieval.js";
 import { isNoiseAttribute } from "./spreading-activation.js";
 import {
+  candidateClass,
   distinctiveTokens,
   evidencePoints,
   matchedTokenCount,
   ownerKey,
   relevanceScore,
+  selectiveFtsQuery,
   totalPoints,
   withSubject,
 } from "./selective-recall.js";
 import { rankFactsForQuery } from "./selective-store.js";
 
 const TAG = "[memory-tdai] [kb-recall-selective]";
-const CANDIDATE_FANOUT = 3;
 const ENTITIES_MATCHED = 8;
 const FACTS_PER_ENTITY_CANDIDATES = 4;
 const EVENTS_PER_ENTITY_CANDIDATES = 2;
@@ -61,6 +62,10 @@ export interface KbSelectiveOptions
     "store" | "embeddingService" | "namespace" | "embeddingTimeoutMs" | "skipVector" | "allowBruteForceVector" | "phaseMs" | "logger"
   > {
   selective: SelectiveRecallConfig;
+  /** The current project: drives the recent-project-work source and the per-class evidence bars. */
+  project?: string;
+  /** Clock (ms) for recency and the recent window; defaults to Date.now() (replays pass the prompt's time). */
+  nowMs?: number;
   /** Owner keys ("kind:id") to drop before ranking: other projects, chronic noise, recently shown. */
   excludeOwners?: (owners: Array<{ owner_id: string; owner_kind: string }>) => Set<string>;
 }
@@ -84,13 +89,17 @@ export async function kbRecallSelective(query: string, options: KbSelectiveOptio
     logger?.debug?.(`${TAG} no distinctive words in the prompt — nothing to retrieve`);
     return [];
   }
-  const limit = selective.maxLines * CANDIDATE_FANOUT;
+  const limit = selective.candidatePool;
+  const nowMs = options.nowMs ?? Date.now();
   const embeddingCallOpts: EmbeddingCallOptions | undefined = options.embeddingTimeoutMs
     ? { timeoutMs: options.embeddingTimeoutMs }
     : undefined;
 
   const [fts, vector, entity] = await Promise.all([
-    Promise.resolve(timed(phaseMs, "fts", () => recallFts(store, tokens.join(" "), limit, logger))),
+    Promise.resolve(timed(phaseMs, "fts", () =>
+      selective.stemLength > 0
+        ? recallFtsStemmed(store, tokens, selective.stemLength, limit, logger)
+        : recallFts(store, tokens.join(" "), limit, logger))),
     skipVector
       ? Promise.resolve<RankedCandidate[]>([])
       : withBudget(
@@ -100,13 +109,22 @@ export async function kbRecallSelective(query: string, options: KbSelectiveOptio
         ),
     Promise.resolve(timed(phaseMs, "entityMatch", () => recallEntitySelective(store, tokens, namespace, selective, limit, logger))),
   ]);
-  if (fts.length + vector.length + entity.length === 0) return [];
+  const recent = timed(phaseMs, "recentEvents", () => recallRecentProjectEvents(store, options.project, namespace, selective, nowMs, logger));
+  if (fts.length + vector.length + entity.length + recent.length === 0) return [];
 
-  const rendered = timed(phaseMs, "render", () => renderAll(store, fuseRrf([fts, vector, entity])));
-  const rare = readRareTokens(store, tokens);
-  const maxPoints = totalPoints(tokens, rare);
-  const excluded = options.excludeOwners?.(rendered.map((c) => ({ owner_id: c.result.owner_id, owner_kind: c.result.owner_kind }))) ?? new Set<string>();
-  const nowMs = Date.now();
+  const rendered = timed(phaseMs, "render", () => renderAll(store, fuseRrf([fts, vector, entity, recent])));
+  const rare = readRareTokens(store, tokens, RARE_TOKEN_MAX_DOCS);
+  const veryCommon = readVeryCommonTokens(store, tokens, selective.veryCommonTokenMinDocs);
+  const maxPoints = totalPoints(tokens, rare, veryCommon);
+  const owners = rendered.map((c) => ({ owner_id: c.result.owner_id, owner_kind: c.result.owner_kind }));
+  const excluded = options.excludeOwners?.(owners) ?? new Set<string>();
+  const projects = readOwnerProjects(store, options.project ? owners : []);
+  const gate = {
+    minPoints: selective.minEvidencePoints,
+    anchoredMinPoints: selective.anchoredMinEvidencePoints,
+    recentEventMinPoints: selective.recentEventMinPoints,
+    unknownProjectMinPoints: selective.unknownProjectMinPoints,
+  };
 
   const scored = rendered
     .filter((c) => !excluded.has(ownerKey(c.result.owner_kind, c.result.owner_id)))
@@ -118,10 +136,11 @@ export async function kbRecallSelective(query: string, options: KbSelectiveOptio
           // Anchored = the memory's subject is named by a whole word of the prompt,
           // whichever route (entity match, FTS, vector) brought the candidate in.
           entityMatch: c.fused.fromEntityMatch || (c.subject !== undefined && matchedTokenCount(tokens, c.subject) > 0),
-          points: evidencePoints(tokens, c.body, rare),
+          points: evidencePoints(tokens, c.body, rare, veryCommon, selective.stemLength),
           maxPoints,
+          cls: classOf(c, projects, options.project, nowMs, selective.recentEventDays),
         },
-        { minPoints: selective.minEvidencePoints, anchoredMinPoints: selective.anchoredMinEvidencePoints },
+        gate,
       );
       const ranking =
         relevance *
@@ -138,6 +157,88 @@ export async function kbRecallSelective(query: string, options: KbSelectiveOptio
     .map((s) => ({ ...s.c.result, score: s.relevance }));
 }
 
+/** Source A with stems: the prompt words OR their prefixes (see selectiveFtsQuery), BM25-ranked. */
+function recallFtsStemmed(
+  store: IMemoryStore,
+  tokens: readonly string[],
+  stemLength: number,
+  limit: number,
+  logger?: KbSelectiveOptions["logger"],
+): RankedCandidate[] {
+  const query = selectiveFtsQuery(tokens, stemLength);
+  if (!query || !store.searchKbFts) return [];
+  try {
+    return store.searchKbFts(query, limit).map((r, rank) => ({
+      ownerId: r.owner_id,
+      ownerKind: r.owner_kind === "event" ? ("event" as const) : ("fact" as const),
+      rank,
+      ftsScore: r.score,
+    }));
+  } catch (err) {
+    logger?.warn?.(`${TAG} stemmed FTS source failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+}
+
+/** Project of each candidate owner ("kind:id"), from the store; empty when the store cannot say. */
+function readOwnerProjects(
+  store: IMemoryStore,
+  owners: Array<{ owner_id: string; owner_kind: string }>,
+): Map<string, { project: string; userLevel: boolean }> {
+  if (owners.length === 0) return new Map();
+  try {
+    const fn = (store as { getOwnerProjects?: (o: typeof owners) => Map<string, { project: string; userLevel: boolean }> }).getOwnerProjects;
+    return typeof fn === "function" ? fn.call(store, owners) : new Map();
+  } catch {
+    return new Map(); // unknown project info → every candidate keeps the default bar
+  }
+}
+
+function classOf(
+  c: SelCandidate,
+  projects: Map<string, { project: string; userLevel: boolean }>,
+  project: string | undefined,
+  nowMs: number,
+  recentEventDays: number,
+) {
+  const info = projects.get(ownerKey(c.result.owner_kind, c.result.owner_id));
+  if (!info) return "default" as const;
+  return candidateClass({ kind: c.result.owner_kind, ts: c.result.ts, ...info }, project, nowMs, recentEventDays);
+}
+
+/**
+ * Source D, "recent project work": the latest events of the current project from the
+ * last `recentEventDays` days. The global sources rank every project together, so the
+ * current project's fresh work is easily crowded out; this source brings it in, and the
+ * relevance gate still decides (a recent project event needs `recentEventMinPoints`).
+ */
+function recallRecentProjectEvents(
+  store: IMemoryStore,
+  project: string | undefined,
+  namespace: string,
+  selective: SelectiveRecallConfig,
+  nowMs: number,
+  logger?: KbSelectiveOptions["logger"],
+): RankedCandidate[] {
+  if (!project || selective.recentEventDays <= 0 || selective.recentEventScan <= 0) return [];
+  const fn = (store as {
+    recentProjectEvents?: (p: string, o: { beforeIso: string; sinceIso: string; limit: number; namespace?: string }) => Array<{ id: string }>;
+  }).recentProjectEvents;
+  if (typeof fn !== "function") return [];
+  try {
+    const events = fn.call(store, project, {
+      beforeIso: new Date(nowMs).toISOString(),
+      sinceIso: new Date(nowMs - selective.recentEventDays * 86_400_000).toISOString(),
+      limit: selective.recentEventScan,
+      namespace,
+    });
+    return events.map((e, rank) => ({ ownerId: e.id, ownerKind: "event" as const, rank }));
+  } catch (err) {
+    logger?.warn?.(`${TAG} recent-project-events source failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+}
+
 /** The remote query embedding must not hold the lexical sources hostage: past this it counts as empty. */
 const VECTOR_BUDGET_MS = 1500;
 
@@ -150,13 +251,27 @@ async function withBudget<T>(work: Promise<T>, ms: number, fallback: T): Promise
   }
 }
 
-/** Words of the prompt that few KB documents mention (the store answers from a bounded FTS count). */
-function readRareTokens(store: IMemoryStore, tokens: readonly string[]): Set<string> {
+/** Words of the prompt that at most `maxDocs` KB documents mention (the store answers from a bounded FTS count). */
+function readRareTokens(store: IMemoryStore, tokens: readonly string[], maxDocs: number): Set<string> {
   try {
     const fn = (store as { rareKbTokens?: (t: readonly string[], maxDocs: number) => Set<string> }).rareKbTokens;
-    return typeof fn === "function" ? fn.call(store, tokens, RARE_TOKEN_MAX_DOCS) : new Set<string>();
+    return typeof fn === "function" ? fn.call(store, tokens, maxDocs) : new Set<string>();
   } catch {
     return new Set<string>(); // fail-closed on rarity: fewer points, never more noise
+  }
+}
+
+/**
+ * Words of the prompt that MORE than `minDocs` KB documents mention (0 = tier off). When
+ * the store cannot answer, no word is very common (the two-tier weights apply).
+ */
+function readVeryCommonTokens(store: IMemoryStore, tokens: readonly string[], minDocs: number): Set<string> | undefined {
+  if (minDocs <= 0) return undefined;
+  try {
+    const fn = (store as { veryCommonKbTokens?: (t: readonly string[], minDocs: number) => Set<string> }).veryCommonKbTokens;
+    return typeof fn === "function" ? fn.call(store, tokens, minDocs) : undefined;
+  } catch {
+    return undefined;
   }
 }
 

@@ -174,6 +174,37 @@ export interface SelectiveRecallConfig {
   chronicNoiseMinInjections: number;
   /** How long the chronic-noise set is cached. */
   chronicNoiseCacheMs: number;
+  /**
+   * Candidates fetched per source (FTS, vector, entity) before project scoping and the
+   * relevance gate. The sources are global, so a small pool is crowded out by other
+   * projects' hits before the project filter runs.
+   */
+  candidatePool: number;
+  /**
+   * Window (days) of the "recent project work" source: events of the current project
+   * from the last N days are candidates and need only `recentEventMinPoints` of shared
+   * evidence (the ledger: such events were used ~60% of the times shown). 0 = off.
+   */
+  recentEventDays: number;
+  /** How many of the latest current-project events the recent source scans. */
+  recentEventScan: number;
+  /** Evidence points a recent current-project event needs. */
+  recentEventMinPoints: number;
+  /**
+   * Evidence points a memory with NO project label (and not about the user) needs when
+   * no entity named in the prompt anchors it (the ledger: such facts were used ~1%).
+   */
+  unknownProjectMinPoints: number;
+  /**
+   * A prompt word mentioned by more than this many KB documents is worth half a point
+   * (a three-tier IDF approximation: rare 2, ordinary 1, very common 0.5). 0 = off.
+   */
+  veryCommonTokenMinDocs: number;
+  /**
+   * Stem length N for Italian/English variants: a prompt word longer than N also matches
+   * memory words sharing its first N letters ("idempotency" ~ "idempotenza"). 0 = exact words.
+   */
+  stemLength: number;
 }
 
 /** Embedding service configuration for vector search. */
@@ -406,6 +437,14 @@ function parseSelective(group: Record<string, unknown>, scoreThreshold: number):
     dedupTurns: num(group, "dedupTurns") ?? 10,
     chronicNoiseMinInjections: num(group, "chronicNoiseMinInjections") ?? 20,
     chronicNoiseCacheMs: num(group, "chronicNoiseCacheMs") ?? 10 * 60 * 1000,
+    // Tuned 2026-10-03 with tools/recall-eval.mts on the recall-ledger ground truth (train split).
+    candidatePool: num(group, "candidatePool") ?? 30,
+    recentEventDays: num(group, "recentEventDays") ?? 14,
+    recentEventScan: num(group, "recentEventScan") ?? 30,
+    recentEventMinPoints: num(group, "recentEventMinPoints") ?? 3,
+    unknownProjectMinPoints: num(group, "unknownProjectMinPoints") ?? 6,
+    veryCommonTokenMinDocs: num(group, "veryCommonTokenMinDocs") ?? 1000,
+    stemLength: num(group, "stemLength") ?? 0,
   };
 }
 

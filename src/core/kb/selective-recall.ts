@@ -100,17 +100,58 @@ export function evidencePoints(
   tokens: readonly string[],
   text: string,
   rare: ReadonlySet<string>,
+  veryCommon?: ReadonlySet<string>,
+  stemLength = 0,
 ): number {
   if (tokens.length === 0) return 0;
-  const words = wordSet(text);
+  const match = tokenMatcher(text, stemLength);
   let points = 0;
-  for (const t of tokens) if (words.has(t)) points += rare.has(t) ? RARE_TOKEN_POINTS : 1;
+  for (const t of tokens) if (match(t)) points += tokenPoints(t, rare, veryCommon);
   return points;
 }
 
+/**
+ * Whole-word membership in `text`, plus — with a stem length N > 0 — a prompt word longer
+ * than N matches any text word sharing its first N letters ("idempotency" ~ "idempotenza",
+ * "deploy" ~ "deployed"): prompts and memories mix Italian and English.
+ */
+function tokenMatcher(text: string, stemLength: number): (token: string) => boolean {
+  const words = wordSet(text);
+  if (stemLength <= 0) return (t) => words.has(t);
+  const stems = new Set<string>();
+  for (const w of words) if (w.length >= stemLength) stems.add(w.slice(0, stemLength));
+  return (t) => words.has(t) || (t.length > stemLength && stems.has(t.slice(0, stemLength)));
+}
+
+/**
+ * The FTS5 query of the selective path: the OR of the quoted prompt words and, with a
+ * stem length N > 0, a prefix term for each word longer than N (same rule as the points).
+ */
+export function selectiveFtsQuery(tokens: readonly string[], stemLength: number): string | null {
+  const terms: string[] = [];
+  for (const raw of tokens) {
+    const t = raw.replaceAll('"', "");
+    if (!t) continue;
+    terms.push(`"${t}"`);
+    if (stemLength > 0 && t.length > stemLength) terms.push(`"${t.slice(0, stemLength)}"*`);
+  }
+  return terms.length > 0 ? terms.join(" OR ") : null;
+}
+
+/**
+ * A word thousands of KB documents mention is worth half a point: it is in every
+ * project's history ("deploy", "test", "agent"), so sharing it is weak evidence.
+ */
+export const VERY_COMMON_TOKEN_POINTS = 0.5;
+
+function tokenPoints(t: string, rare: ReadonlySet<string>, veryCommon?: ReadonlySet<string>): number {
+  if (rare.has(t)) return RARE_TOKEN_POINTS;
+  return veryCommon?.has(t) ? VERY_COMMON_TOKEN_POINTS : 1;
+}
+
 /** Total points a prompt could earn (all its distinctive words matched). */
-export function totalPoints(tokens: readonly string[], rare: ReadonlySet<string>): number {
-  return tokens.reduce((n, t) => n + (rare.has(t) ? RARE_TOKEN_POINTS : 1), 0);
+export function totalPoints(tokens: readonly string[], rare: ReadonlySet<string>, veryCommon?: ReadonlySet<string>): number {
+  return tokens.reduce((n, t) => n + tokenPoints(t, rare, veryCommon), 0);
 }
 
 export interface RelevanceEvidence {
@@ -124,7 +165,47 @@ export interface RelevanceEvidence {
   points: number;
   /** Points the prompt could earn at most. */
   maxPoints: number;
+  /** What the ledger says a memory of this kind is worth (see candidateClass). Default: "default". */
+  cls?: CandidateClass;
 }
+
+/**
+ * Classes of candidate whose evidence bar differs, from the recall ledger (2026-10-03,
+ * 44k judged injections): a same-project EVENT from the last days was used ~60% of the
+ * times it was shown, older same-project events ~20%, bare facts 5-10%, facts of no
+ * known project ~1%.
+ *   - "recent-project-event": an event of the current project inside the recent window;
+ *   - "unknown-project": a memory with no project label that is not about the user
+ *     (chat imports, untagged events) — usually another project's work, unlabeled;
+ *   - "default": everything else.
+ */
+export type CandidateClass = "default" | "recent-project-event" | "unknown-project";
+
+export function candidateClass(
+  c: { kind: string; ts?: string; project: string; userLevel: boolean },
+  currentProject: string | undefined,
+  nowMs: number,
+  recentEventDays: number,
+): CandidateClass {
+  const current = normalizeProject(currentProject);
+  if (current === "") return "default";
+  const own = normalizeProject(c.project);
+  if (own === "") return c.userLevel ? "default" : "unknown-project";
+  if (c.kind !== "event" || recentEventDays <= 0 || own !== current) return "default";
+  const t = c.ts ? Date.parse(c.ts) : NaN;
+  return Number.isFinite(t) && t <= nowMs && nowMs - t <= recentEventDays * 86_400_000 ? "recent-project-event" : "default";
+}
+
+/** Evidence points each class needs (the two class-specific bars are optional: absent = the default bar). */
+export interface EvidenceGate {
+  minPoints: number;
+  anchoredMinPoints: number;
+  recentEventMinPoints?: number;
+  unknownProjectMinPoints?: number;
+}
+
+/** A recent project event that earned its points clears τ on its own: the points gate is its bar. */
+const RECENT_EVENT_LEXICAL_BASE = 1;
 
 /**
  * A REAL 0-1 relevance for one candidate — the score the gate compares to τ.
@@ -141,15 +222,22 @@ export interface RelevanceEvidence {
  */
 export function relevanceScore(
   e: RelevanceEvidence,
-  gate: { minPoints: number; anchoredMinPoints: number } = { minPoints: MIN_EVIDENCE_POINTS, anchoredMinPoints: MIN_EVIDENCE_POINTS },
+  gate: EvidenceGate = { minPoints: MIN_EVIDENCE_POINTS, anchoredMinPoints: MIN_EVIDENCE_POINTS },
 ): number {
-  const vector = e.cosine != null ? clamp01(e.cosine) : 0;
-  const needed = e.entityMatch ? gate.anchoredMinPoints : gate.minPoints;
-  if (e.points < needed || e.maxPoints <= 0) return vectorOnlyRelevance(vector, e.maxPoints);
+  const cls = e.cls ?? "default";
+  // Unknown project: lexical evidence or an anchor only — a bare cosine is not enough
+  // to show a memory that is, more often than not, another project's.
+  const vector = e.cosine != null && cls !== "unknown-project" ? clamp01(e.cosine) : 0;
+  const needed = neededPoints(e.entityMatch, cls, gate);
+  const noEvidence = e.points < needed || (cls === "recent-project-event" && e.points <= 0);
+  if (noEvidence || e.maxPoints <= 0) return vectorOnlyRelevance(vector, e.maxPoints);
   const coverage = Math.min(1, e.points / Math.min(e.maxPoints, 2 * needed));
   // No BM25 score (the candidate came from the entity-name source): an anchored memory that
   // already earned its evidence points is as strong as a good FTS hit; an un-anchored one is not.
-  const lexicalBase = e.ftsScore != null ? clamp01(e.ftsScore) : e.entityMatch ? 0.8 : 0.5;
+  const lexicalBase =
+    cls === "recent-project-event"
+      ? RECENT_EVENT_LEXICAL_BASE
+      : e.ftsScore != null ? clamp01(e.ftsScore) : e.entityMatch ? 0.8 : 0.5;
   let lexical = lexicalBase * (0.5 + 0.5 * coverage);
   if (e.entityMatch) lexical = Math.min(1, lexical + 0.1 * coverage);
   return Math.max(vector, clamp01(lexical));
@@ -161,6 +249,13 @@ export function relevanceScore(
  * "... — Procedi"), so the raw cosine alone is only trusted for a prompt with enough
  * distinctive words AND a cosine above that band.
  */
+function neededPoints(anchored: boolean, cls: CandidateClass, gate: EvidenceGate): number {
+  if (cls === "recent-project-event" && gate.recentEventMinPoints != null) return gate.recentEventMinPoints;
+  if (anchored) return gate.anchoredMinPoints;
+  if (cls === "unknown-project" && gate.unknownProjectMinPoints != null) return gate.unknownProjectMinPoints;
+  return gate.minPoints;
+}
+
 export const VECTOR_ONLY_MIN_COSINE = 0.86;
 export const VECTOR_ONLY_MIN_PROMPT_POINTS = 3;
 
