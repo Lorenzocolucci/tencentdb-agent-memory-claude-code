@@ -11,6 +11,7 @@ import path from "node:path";
 import type { MemoryTdaiConfig } from "../../config.js";
 import type { IMemoryStore, IEmbeddingService, StoreLogger } from "./types.js";
 import { VectorStore } from "./sqlite.js";
+import type { VectorStoreOptions } from "./sqlite.js";
 import { TcvdbMemoryStore } from "./tcvdb.js";
 import { createEmbeddingService, NoopEmbeddingService } from "./embedding.js";
 import type { EmbeddingService } from "./embedding.js";
@@ -40,7 +41,7 @@ export interface StoreBundle {
  */
 export function createStoreBundle(
   config: MemoryTdaiConfig,
-  options: { dataDir: string; logger?: StoreLogger },
+  options: { dataDir: string; logger?: StoreLogger; storeOptions?: VectorStoreOptions },
 ): StoreBundle {
   const { logger } = options;
 
@@ -124,7 +125,7 @@ export function createStoreBundle(
       // dimensions from config (0 when provider="none" → vec0 deferred)
       const dims = config.embedding.dimensions;
       const dbPath = path.join(options.dataDir, "vectors.db");
-      const store = new VectorStore(dbPath, dims, logger);
+      const store = new VectorStore(dbPath, dims, logger, options.storeOptions);
 
       logger?.debug?.(
         `${TAG} Store created: backend=sqlite, dbPath=${dbPath}, dimensions=${dims}, ` +

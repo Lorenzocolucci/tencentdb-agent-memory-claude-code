@@ -14,6 +14,7 @@ export default defineConfig({
   entry: [
     "./index.ts",
     "./src/gateway/cli.ts",
+    "./src/worker/worker-main.ts",
     "./src/cli/reindex-standalone.ts",
     "./src/cli/canonicalize-attributes-standalone.ts",
     "./src/cli/reconcile-entities-standalone.ts",

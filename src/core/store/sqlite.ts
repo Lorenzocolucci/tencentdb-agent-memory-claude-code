@@ -131,7 +131,7 @@ import {
   decodeKbNavSnapshot,
   deleteKbNavSnapshot,
   encodeKbNavSnapshot,
-  readKbNavSnapshot,
+  readKbNavSnapshotAsync,
   writeKbNavSnapshotAtomic,
 } from "../kb/nav-snapshot-file.js";
 
@@ -437,6 +437,14 @@ export interface L0FtsSearchResult {
 // VectorStore class
 // ============================
 
+/** Constructor options for {@link VectorStore} (all optional; defaults = single-process behaviour). */
+export interface VectorStoreOptions {
+  /** SQLite busy_timeout in ms (default 5000). The gateway passes a short one. */
+  busyTimeoutMs?: number;
+  /** Nav-index role (default "leader"). See {@link VectorStore.kbNavRole}. */
+  kbNavRole?: "leader" | "follower";
+}
+
 export class VectorStore implements IMemoryStore {
   private db: DatabaseSync;
   private readonly dimensions: number;
@@ -514,6 +522,11 @@ export class VectorStore implements IMemoryStore {
   private stmtL0FtsInsert!: StatementSync;
   private stmtL0FtsDelete!: StatementSync;
   private stmtL0FtsSearch!: StatementSync;
+  /** Fast L0 FTS paths (rowid lookups) — see {@link VectorStore.ftsDeleteL0}. */
+  private stmtL0FtsDeleteByRowid!: StatementSync;
+  private stmtL0FtsRowidOwner!: StatementSync;
+  private stmtL0FtsInsertAtRowid!: StatementSync;
+  private stmtL0MetaRowid!: StatementSync;
 
   // ── KB (Entity-Centric Core) — Phase 1 ──
   /** `true` once entities/facts/events/relations tables exist. */
@@ -550,13 +563,18 @@ export class VectorStore implements IMemoryStore {
   /** Cached kb_vec raw-read statements (build-at-boot + reconcile), avoid re-preparing. */
   private stmtKbVecReadAll?: StatementSync;
   private stmtKbVecReadOwner?: StatementSync;
+  /** Compact layout: chunk ids of an owner via the owner side table (indexed), then one PK read per chunk. */
+  private stmtKbOwnerChunks?: StatementSync;
+  private stmtKbVecReadChunk?: StatementSync;
   private stmtKbVecCount?: StatementSync;
   /** Re-write the session→project registry row at most this often when unchanged (ms). */
   private static readonly SESSION_PROJECT_REFRESH_MS = 10 * 60 * 1000;
   /** getMemoryHealth result is reused for this long (ms). */
   private static readonly MEMORY_HEALTH_CACHE_MS = 5 * 60 * 1000;
   /** Rows read from kb_vec between event-loop yields in getAllKbVectorsAsync. */
-  private static readonly KB_VEC_READ_YIELD_ROWS = 2000;
+  private static readonly KB_VEC_READ_YIELD_ROWS = 500;
+  /** Max ms the owner re-sync holds the event loop before yielding. */
+  private static readonly KB_NAV_RESYNC_SLICE_MS = 8;
   /** Hold the loop at most this long (ms) between yields while building the index. */
   private static readonly KB_NAV_BUILD_YIELD_MS = 12;
   /** Below this many live nodes, don't bother auto-compacting (churn not worth it). */
@@ -569,6 +587,21 @@ export class VectorStore implements IMemoryStore {
   // ── kb_vec navigable-index snapshot persistence (Incremento b) ──
   /** Absolute path of the on-disk graph-only snapshot, or null for an in-memory DB (no persistence). */
   private readonly kbNavSnapshotPath: string | null;
+  /** Database file (":memory:" / "" = no second connection possible). */
+  private readonly dbPath: string;
+  /**
+   * Phase 5 process split. `leader` (default; the worker or a single-process run) builds,
+   * compacts and PERSISTS the nav index. `follower` (the HTTP gateway) only loads the
+   * published snapshot and re-syncs owners the worker reports as changed — it never
+   * builds, compacts or writes the snapshot, so none of that CPU runs on the HTTP loop.
+   */
+  private readonly kbNavRole: "leader" | "follower";
+  /** busy_timeout (ms) of this connection; the gateway uses a short one so it never sleeps on the worker's write lock. */
+  private readonly busyTimeoutMs: number;
+  /** Called with the owner id after every committed upsertKbVector (the worker forwards it to the gateway). */
+  private kbVecChangeListener: ((ownerId: string) => void) | null = null;
+  /** Called after the nav snapshot file was (re)written (the worker tells the gateway to reload). */
+  private kbNavPublishedListener: (() => void) | null = null;
   /** Reject a snapshot whose rowCount drifted below this fraction of the current DB (mass change → rebuild). */
   private static readonly KB_NAV_SNAPSHOT_MIN_ROW_RATIO = 0.5;
   /** Reject a snapshot whose rowCount is above this multiple of the current DB (mass change → rebuild). */
@@ -582,9 +615,12 @@ export class VectorStore implements IMemoryStore {
    * Note: After construction, you MUST call `init()` to load the sqlite-vec
    * extension and create the schema.
    */
-  constructor(dbPath: string, dimensions: number, logger?: Logger) {
+  constructor(dbPath: string, dimensions: number, logger?: Logger, opts: VectorStoreOptions = {}) {
     this.dimensions = dimensions;
     this.logger = logger;
+    this.dbPath = dbPath;
+    this.kbNavRole = opts.kbNavRole ?? "leader";
+    this.busyTimeoutMs = Math.max(0, Math.floor(opts.busyTimeoutMs ?? 5000));
 
     // The graph-only nav-index snapshot lives next to the DB file. In-memory DBs
     // (":memory:" / empty path, used in tests) have no directory → no persistence.
@@ -596,7 +632,7 @@ export class VectorStore implements IMemoryStore {
     this.db = new DbSync(dbPath, { allowExtension: true });
 
     // Set busy timeout so concurrent processes retry instead of failing with SQLITE_BUSY
-    this.db.exec("PRAGMA busy_timeout = 5000");
+    this.db.exec(`PRAGMA busy_timeout = ${this.busyTimeoutMs}`);
 
     // Enable WAL mode for better concurrent read performance
     this.db.exec("PRAGMA journal_mode = WAL");
@@ -920,6 +956,7 @@ export class VectorStore implements IMemoryStore {
       );
     }
     this.stmtL0DeleteMeta = this.db.prepare("DELETE FROM l0_conversations WHERE record_id = ?");
+    this.stmtL0MetaRowid = this.db.prepare("SELECT rowid AS rid FROM l0_conversations WHERE record_id = ?");
 
     this.stmtL0GetMeta = this.db.prepare(`
       SELECT session_key, session_id, role, message_text, recorded_at, timestamp
@@ -1066,6 +1103,18 @@ export class VectorStore implements IMemoryStore {
       `);
 
       this.stmtL0FtsDelete = this.db.prepare("DELETE FROM l0_fts WHERE record_id = ?");
+      // `record_id` is an UNINDEXED FTS5 column, so the statement above is a FULL
+      // SCAN of l0_fts_content (47k rows: 300-870 ms per call, measured 2026-10-03 on
+      // a live-DB copy — it WAS the whole `l0VecIndex` capture cost). New L0 rows
+      // therefore get FTS rowid = l0_conversations.rowid, and every later
+      // delete/update goes by rowid (0.1 ms). Rows written before this change keep
+      // an unrelated rowid: the verified-by-owner check falls back to the slow scan.
+      this.stmtL0FtsDeleteByRowid = this.db.prepare("DELETE FROM l0_fts WHERE rowid = ?");
+      this.stmtL0FtsRowidOwner = this.db.prepare("SELECT record_id FROM l0_fts WHERE rowid = ?");
+      this.stmtL0FtsInsertAtRowid = this.db.prepare(`
+        INSERT INTO l0_fts (rowid, message_text, message_text_original, record_id, session_key, session_id, role, recorded_at, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
 
       this.stmtL0FtsSearch = this.db.prepare(`
         SELECT record_id, message_text_original AS message_text, session_key, session_id, role, recorded_at, timestamp,
@@ -1352,7 +1401,7 @@ export class VectorStore implements IMemoryStore {
           : " (no embedding — metadata-only write)"),
       );
 
-      this.db.exec("BEGIN");
+      this.db.exec("BEGIN IMMEDIATE");
       try {
         // Upsert metadata (INSERT OR UPDATE)
         this.stmtUpsertMeta.run(
@@ -1552,7 +1601,7 @@ export class VectorStore implements IMemoryStore {
   deleteL1(recordId: string): boolean {
     if (this.degraded) return false;
     try {
-      this.db.exec("BEGIN");
+      this.db.exec("BEGIN IMMEDIATE");
       try {
         this.stmtDeleteMeta.run(recordId);
         if (this.vecTablesReady) this.stmtDeleteVec!.run(recordId);
@@ -1585,7 +1634,7 @@ export class VectorStore implements IMemoryStore {
     if (recordIds.length === 0) return true;
 
     try {
-      this.db.exec("BEGIN");
+      this.db.exec("BEGIN IMMEDIATE");
       try {
         for (const id of recordIds) {
           this.stmtDeleteMeta.run(id);
@@ -1631,7 +1680,7 @@ export class VectorStore implements IMemoryStore {
       const expiredCount = row?.cnt ?? 0;
       if (expiredCount <= 0) return 0;
 
-      this.db.exec("BEGIN");
+      this.db.exec("BEGIN IMMEDIATE");
       try {
         if (this.vecTablesReady) {
           this.db.prepare(
@@ -1768,8 +1817,10 @@ export class VectorStore implements IMemoryStore {
           : " (no embedding — metadata-only write)"),
       );
 
-      this.db.exec("BEGIN");
+      this.db.exec("BEGIN IMMEDIATE");
       try {
+        // Row id BEFORE the upsert: tells a fresh row (no FTS row to delete) from an update.
+        const priorRowid = (this.stmtL0MetaRowid.get(record.id) as { rid: number | bigint } | undefined)?.rid;
         this.stmtL0UpsertMeta.run(
           record.id,
           record.sessionKey,
@@ -1801,17 +1852,7 @@ export class VectorStore implements IMemoryStore {
         // Sync FTS5 (delete + re-insert to handle updates)
         if (this.ftsAvailable) {
           try {
-            this.stmtL0FtsDelete.run(record.id);
-            this.stmtL0FtsInsert.run(
-              tokenizeForFts(record.messageText), // message_text — segmented for indexing
-              record.messageText,                 // message_text_original — raw for display
-              record.id,
-              record.sessionKey,
-              record.sessionId,
-              record.role,
-              record.recordedAt,
-              record.timestamp,
-            );
+            this.syncL0Fts(record, priorRowid);
           } catch (ftsErr) {
             // FTS write failure is non-fatal — log and continue
             this.logger?.warn(
@@ -1835,6 +1876,47 @@ export class VectorStore implements IMemoryStore {
       );
       return false;
     }
+  }
+
+  /**
+   * Write the l0_fts row for a record, replacing any previous one WITHOUT a table
+   * scan. `priorRowid` is the l0_conversations rowid before this upsert (undefined
+   * = brand-new record, so no old FTS row exists unless the DB is inconsistent).
+   */
+  private syncL0Fts(record: L0Record, priorRowid: number | bigint | undefined): void {
+    if (priorRowid !== undefined) this.ftsDeleteL0(record.id, priorRowid);
+    const metaRow = this.stmtL0MetaRowid.get(record.id) as { rid: number | bigint } | undefined;
+    const rowid = metaRow?.rid;
+    // Rowid aligned with the metadata row, unless a legacy FTS row already sits there.
+    const aligned = rowid !== undefined && this.stmtL0FtsRowidOwner.get(rowid) === undefined;
+    const segmented = tokenizeForFts(record.messageText); // message_text — segmented for indexing
+    if (aligned) {
+      this.stmtL0FtsInsertAtRowid.run(
+        rowid, segmented, record.messageText, record.id, record.sessionKey,
+        record.sessionId, record.role, record.recordedAt, record.timestamp,
+      );
+    } else {
+      this.stmtL0FtsInsert.run(
+        segmented, record.messageText, record.id, record.sessionKey,
+        record.sessionId, record.role, record.recordedAt, record.timestamp,
+      );
+    }
+  }
+
+  /**
+   * Delete a record's l0_fts row. Fast path: the FTS row at the metadata rowid is
+   * ours (verified by record_id). Otherwise (rows written before rowid alignment,
+   * or after a VACUUM renumbered the metadata table) fall back to the full scan.
+   */
+  private ftsDeleteL0(recordId: string, metaRowid: number | bigint | undefined): void {
+    if (metaRowid !== undefined) {
+      const owner = this.stmtL0FtsRowidOwner.get(metaRowid) as { record_id: string } | undefined;
+      if (owner?.record_id === recordId) {
+        this.stmtL0FtsDeleteByRowid.run(metaRowid);
+        return;
+      }
+    }
+    this.stmtL0FtsDelete.run(recordId);
   }
 
   /**
@@ -1868,7 +1950,7 @@ export class VectorStore implements IMemoryStore {
         return false;
       }
 
-      this.db.exec("BEGIN");
+      this.db.exec("BEGIN IMMEDIATE");
       try {
         this.stmtL0DeleteVec!.run(recordId);
         for (let i = 0; i < chunkVectors.length; i++) {
@@ -2003,12 +2085,13 @@ export class VectorStore implements IMemoryStore {
   deleteL0(recordId: string): boolean {
     if (this.degraded) return false;
     try {
-      this.db.exec("BEGIN");
+      this.db.exec("BEGIN IMMEDIATE");
       try {
+        const metaRowid = (this.stmtL0MetaRowid.get(recordId) as { rid: number | bigint } | undefined)?.rid;
         this.stmtL0DeleteMeta.run(recordId);
         if (this.vecTablesReady) this.stmtL0DeleteVec!.run(recordId);
         if (this.ftsAvailable) {
-          try { this.stmtL0FtsDelete.run(recordId); } catch { /* non-fatal */ }
+          try { this.ftsDeleteL0(recordId, metaRowid); } catch { /* non-fatal */ }
         }
         this.db.exec("COMMIT");
       } catch (err) {
@@ -2045,7 +2128,7 @@ export class VectorStore implements IMemoryStore {
       const expiredCount = row?.cnt ?? 0;
       if (expiredCount <= 0) return 0;
 
-      this.db.exec("BEGIN");
+      this.db.exec("BEGIN IMMEDIATE");
       try {
         if (this.vecTablesReady) {
           if (this.l0VecCompact) {
@@ -2241,7 +2324,7 @@ export class VectorStore implements IMemoryStore {
     supersededFactId?: string;
   }): void {
     try {
-      this.db.prepare("BEGIN").run();
+      this.db.prepare("BEGIN IMMEDIATE").run();
       try {
         confirmProvenance(this.db, {
           ownerId: params.ownerId,
@@ -2313,7 +2396,7 @@ export class VectorStore implements IMemoryStore {
     factId?: string;
   }): void {
     try {
-      this.db.prepare("BEGIN").run();
+      this.db.prepare("BEGIN IMMEDIATE").run();
       try {
         rejectProvenance(this.db, {
           ownerId: params.ownerId,
@@ -3020,7 +3103,7 @@ export class VectorStore implements IMemoryStore {
     // Transaction control via prepared statements (BEGIN/COMMIT/ROLLBACK) — same
     // effect as a raw multi-statement call, kept here so each per-record write
     // stays atomic (no orphan vectors).
-    const txBegin = () => { this.db.prepare("BEGIN").run(); };
+    const txBegin = () => { this.db.prepare("BEGIN IMMEDIATE").run(); };
     const txCommit = () => { this.db.prepare("COMMIT").run(); };
     const txRollback = () => { try { this.db.prepare("ROLLBACK").run(); } catch { /* ignore */ } };
 
@@ -3802,6 +3885,16 @@ export class VectorStore implements IMemoryStore {
         this.stmtKbVecReadOwner = this.db.prepare(
           "SELECT chunk_id, owner_kind, embedding FROM kb_vec WHERE owner_id = ?",
         );
+        if (this.kbVecCompact) {
+          // `WHERE owner_id = ?` on the compact vec0 is a FULL SCAN of every vector (~2 s on 73k rows,
+          // measured 2026-10-03 in the gateway profile): owner lookups go through the side table.
+          this.stmtKbOwnerChunks = this.db.prepare(
+            `SELECT chunk_id FROM ${ownerTableName("kb_vec")} WHERE owner_id = ?`,
+          );
+          this.stmtKbVecReadChunk = this.db.prepare(
+            "SELECT chunk_id, owner_kind, embedding FROM kb_vec WHERE chunk_id = ?",
+          );
+        }
         this.stmtKbVecCount = this.db.prepare("SELECT count(*) AS c FROM kb_vec");
         this.kbVecReady = true;
       } catch (err) {
@@ -3869,7 +3962,8 @@ export class VectorStore implements IMemoryStore {
       );
       return;
     }
-    if (isKbIndexBackfillEnabled()) {
+    // The opt-in backfill is heavy: in a split deployment only the leader (worker) runs it.
+    if (isKbIndexBackfillEnabled() && this.kbNavRole !== "follower") {
       setImmediate(() => {
         void this.startKbIndexBackfill().catch(() => { /* logged inside */ });
       });
@@ -3934,7 +4028,7 @@ export class VectorStore implements IMemoryStore {
       throw err;
     } finally {
       try {
-        this.db.prepare("PRAGMA busy_timeout = 5000").run();
+        this.db.prepare(`PRAGMA busy_timeout = ${this.busyTimeoutMs}`).run();
       } catch { /* closed meanwhile */ }
     }
   }
@@ -4469,7 +4563,7 @@ export class VectorStore implements IMemoryStore {
     const chunkVectors = VectorStore.toChunkVectors(chunks);
     if (chunkVectors.length === 0) return false;
     try {
-      this.db.exec("BEGIN");
+      this.db.exec("BEGIN IMMEDIATE");
       try {
         this.stmtKbVecDelete!.run(ownerId);
         for (let i = 0; i < chunkVectors.length; i++) {
@@ -4486,6 +4580,8 @@ export class VectorStore implements IMemoryStore {
         try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
         throw err;
       }
+      // Tell the gateway process (worker only) which owner changed. Best-effort.
+      try { this.kbVecChangeListener?.(ownerId); } catch { /* listener must not break a committed write */ }
       // Best-effort navigable-index sync — NEVER affects the (committed) DB result.
       try {
         if (this.kbNavBuilding && this.kbNavDirtyOwners) {
@@ -4718,8 +4814,14 @@ export class VectorStore implements IMemoryStore {
     const out: Array<{ chunkId: string; ownerId: string; ownerKind: string; vec: Float32Array }> = [];
     let dropped = 0;
     let total = 0;
+    // The cursor stays open across event-loop yields (minutes under load). On THIS connection that
+    // pins a read snapshot, and the next write on it then fails at once with "database is locked"
+    // (SQLITE_BUSY_SNAPSHOT) as soon as the other process has committed anything since. Measured
+    // 2026-10-03: the worker lost L0 / kb_vec writes while the nav index loaded. So the long read
+    // gets its own short-lived read-only connection and never touches the writer's snapshot.
+    const reader = this.openNavReadConnection();
     try {
-      const stmt = this.db.prepare("SELECT chunk_id, owner_id, owner_kind, embedding FROM kb_vec");
+      const stmt = (reader ?? this.db).prepare("SELECT chunk_id, owner_id, owner_kind, embedding FROM kb_vec");
       for (const r of stmt.iterate() as IterableIterator<{
         chunk_id: string; owner_id: string; owner_kind: string; embedding: unknown;
       }>) {
@@ -4743,6 +4845,32 @@ export class VectorStore implements IMemoryStore {
         `${TAG} getAllKbVectorsAsync failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
       );
       return [];
+    } finally {
+      try { reader?.close(); } catch { /* already closed */ }
+    }
+  }
+
+  /** Short-lived read-only connection for the long nav-index read; null = fall back to the main connection. */
+  private openNavReadConnection(): DatabaseSync | null {
+    if (!this.dbPath || this.dbPath === ":memory:") return null;
+    try {
+      const { DatabaseSync: DbSync } = requireNodeSqlite();
+      const db = new DbSync(this.dbPath, { readOnly: true, allowExtension: true });
+      try {
+        db.enableLoadExtension(true);
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        require("sqlite-vec").load(db);
+        db.prepare("PRAGMA busy_timeout = 5000").run();
+      } catch (err) {
+        db.close();
+        throw err;
+      }
+      return db;
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} nav read connection unavailable, reading on the main connection: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
     }
   }
 
@@ -4837,7 +4965,94 @@ export class VectorStore implements IMemoryStore {
    */
   async initKbNavIndex(): Promise<boolean> {
     if (await this.tryLoadKbNavSnapshot()) return true;
+    if (this.kbNavRole === "follower") return false; // never build on the gateway loop: wait for the worker's snapshot
     return this.buildKbNavIndex();
+  }
+
+  /**
+   * Follower entry point (the HTTP gateway): (re)load the index from the snapshot the
+   * worker published. Replaces a previously published index atomically; returns false
+   * (index unchanged) when there is no usable snapshot yet — recall then answers with
+   * its non-vector paths until the worker publishes one.
+   */
+  async followKbNavIndex(opts: { skipIfActive?: boolean } = {}): Promise<boolean> {
+    // A boot-time load may still be running; wait for it (bounded) instead of dropping the reload.
+    const deadline = Date.now() + 5 * 60_000;
+    while (this.kbNavBuilding && !this.closed && Date.now() < deadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 200));
+    }
+    // "Make sure there is an index" callers do not want a second 70k-vector load right after the first.
+    if (opts.skipIfActive && this.kbNavIndex) return true;
+    return this.tryLoadKbNavSnapshot();
+  }
+
+  /**
+   * Follower: the worker reports these kb_vec owners as written. Re-read each owner's
+   * rows and re-apply them to the index (an owner with no rows is removed). While a
+   * (re)load is in flight the owners are queued and reconciled when it publishes.
+   */
+  resyncKbOwners(ownerIds: readonly string[]): number {
+    if (this.closed || ownerIds.length === 0) return 0;
+    if (this.kbNavBuilding && this.kbNavDirtyOwners) {
+      for (const id of ownerIds) this.kbNavDirtyOwners.add(id);
+      return ownerIds.length;
+    }
+    if (!this.kbNavIndex) return 0;
+    for (const id of ownerIds) this.kbNavResyncQueue.add(id);
+    if (!this.kbNavResyncRunning) {
+      this.kbNavResyncRunning = true;
+      void this.drainResyncQueue();
+    }
+    return ownerIds.length;
+  }
+
+  /** Owners waiting to be re-applied to the index (follower; drained in short slices). */
+  private readonly kbNavResyncQueue = new Set<string>();
+  private kbNavResyncRunning = false;
+
+  /** Re-sync queued owners, handing the event loop back every {@link VectorStore.KB_NAV_RESYNC_SLICE_MS} ms. */
+  private async drainResyncQueue(): Promise<void> {
+    try {
+      let sliceStart = performance.now();
+      while (this.kbNavResyncQueue.size > 0 && !this.closed) {
+        const id = this.kbNavResyncQueue.values().next().value as string;
+        this.kbNavResyncQueue.delete(id);
+        if (this.kbNavBuilding && this.kbNavDirtyOwners) {
+          this.kbNavDirtyOwners.add(id); // a reload started meanwhile: it reconciles this owner on publish
+        } else if (this.kbNavIndex) {
+          this.resyncOwnerFromDb(id);
+        }
+        if (performance.now() - sliceStart > VectorStore.KB_NAV_RESYNC_SLICE_MS) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          sliceStart = performance.now();
+        }
+      }
+    } finally {
+      this.kbNavResyncRunning = false;
+    }
+  }
+
+  /** Re-sync a set of owners, yielding between slices (used to reconcile after a snapshot load). */
+  private async resyncOwnersSliced(ownerIds: Iterable<string>): Promise<void> {
+    let sliceStart = performance.now();
+    for (const id of ownerIds) {
+      if (this.closed) return;
+      this.resyncOwnerFromDb(id);
+      if (performance.now() - sliceStart > VectorStore.KB_NAV_RESYNC_SLICE_MS) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        sliceStart = performance.now();
+      }
+    }
+  }
+
+  /** Worker side: be told about every committed kb_vec owner write. */
+  setKbVecChangeListener(listener: ((ownerId: string) => void) | null): void {
+    this.kbVecChangeListener = listener;
+  }
+
+  /** Worker side: be told after the nav snapshot file was rewritten. */
+  setKbNavPublishedListener(listener: (() => void) | null): void {
+    this.kbNavPublishedListener = listener;
   }
 
   /**
@@ -4851,6 +5066,7 @@ export class VectorStore implements IMemoryStore {
     const path = this.kbNavSnapshotPath;
     const idx = this.kbNavIndex;
     if (!path || !idx || this.closed || this.degraded) return;
+    if (this.kbNavRole === "follower") return; // only the leader (worker) publishes the snapshot
     const diagToken = beginHeavyTask("kb-nav-persist");
     try {
       // Defer off the current tick — serialize + stringify are synchronous CPU.
@@ -4868,6 +5084,7 @@ export class VectorStore implements IMemoryStore {
       this.logger?.debug?.(
         `${TAG} kb-nav snapshot persisted: ${topology.nodes.length} nodes → ${path}`,
       );
+      try { this.kbNavPublishedListener?.(); } catch { /* notification is best-effort */ }
     } catch (err) {
       this.logger?.warn?.(
         `${TAG} persistKbNavSnapshot failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
@@ -4891,7 +5108,7 @@ export class VectorStore implements IMemoryStore {
     if (!path || this.closed || this.degraded || !this.kbVecReady || this.dimensions <= 0) return false;
     if (this.kbNavBuilding) return false;
 
-    const raw = readKbNavSnapshot(path);
+    const raw = await readKbNavSnapshotAsync(path);
     if (raw == null) return false; // no snapshot yet → clean build
 
     let file;
@@ -4963,7 +5180,7 @@ export class VectorStore implements IMemoryStore {
       }
 
       // Re-attach the persisted graph to the fresh vectors (skips HNSW build).
-      const { index, placedIds, missingIds } = NavigableIndex.restoreFromTopology(file.topology, vecById);
+      const { index, placedIds, missingIds } = await NavigableIndex.restoreFromTopologyCooperative(file.topology, vecById);
 
       // Insert ids the DB has but the snapshot didn't (memories added since) with
       // a proper greedy insertion, yielding so a large delta cannot starve recall.
@@ -4988,12 +5205,10 @@ export class VectorStore implements IMemoryStore {
       published = true;
 
       // Reconcile owners written while we were loading (their DB vec is authoritative).
+      // Sliced: the worker keeps writing during a long load, the set can be large.
       const dirty = this.kbNavDirtyOwners;
       this.kbNavDirtyOwners = null;
-      for (const ownerId of dirty) {
-        if (this.closed) break;
-        this.resyncOwnerFromDb(ownerId);
-      }
+      await this.resyncOwnersSliced(dirty);
 
       this.logger?.info(
         `${TAG} kb-nav index LOADED from snapshot: ${index.size} live nodes ` +
@@ -5008,7 +5223,8 @@ export class VectorStore implements IMemoryStore {
       }
       return true;
     } catch (err) {
-      if (!published) this.kbNavIndex = null; // never publish a partial load
+      // never publish a partial load; a follower RELOADING keeps the index it already serves
+      if (!published && this.kbNavRole !== "follower") this.kbNavIndex = null;
       this.logger?.warn(
         `${TAG} tryLoadKbNavSnapshot failed (${err instanceof Error ? err.message : String(err)}) — rebuilding`,
       );
@@ -5039,6 +5255,7 @@ export class VectorStore implements IMemoryStore {
   private maybeCompactKbNavIndex(): void {
     const idx = this.kbNavIndex;
     if (!idx || this.kbNavBuilding || this.closed) return;
+    if (this.kbNavRole === "follower") return; // the worker compacts and republishes; the gateway reloads
     if (idx.size < VectorStore.KB_NAV_REBUILD_MIN_LIVE) return;
     if (idx.tombstoneCount <= idx.size * VectorStore.KB_NAV_REBUILD_TOMBSTONE_RATIO) return;
     // Defer off this write's tick: buildKbNavIndex's synchronous prefix (a full
@@ -5051,13 +5268,25 @@ export class VectorStore implements IMemoryStore {
     });
   }
 
+  /** The current kb_vec rows of one owner, without scanning the vector table in the compact layout. */
+  private readKbOwnerRows(ownerId: string): Array<{ chunk_id: string; owner_kind: string; embedding: unknown }> {
+    type Row = { chunk_id: string; owner_kind: string; embedding: unknown };
+    if (this.kbVecCompact && this.stmtKbOwnerChunks && this.stmtKbVecReadChunk) {
+      const out: Row[] = [];
+      for (const { chunk_id } of this.stmtKbOwnerChunks.all(ownerId) as Array<{ chunk_id: string }>) {
+        const row = this.stmtKbVecReadChunk.get(chunk_id) as Row | undefined;
+        if (row) out.push(row);
+      }
+      return out;
+    }
+    return (this.stmtKbVecReadOwner?.all(ownerId) ?? []) as Row[];
+  }
+
   /** Re-apply an owner's CURRENT kb_vec state to the index (used to reconcile dirty owners). */
   private resyncOwnerFromDb(ownerId: string): void {
     if (!this.kbNavIndex) return;
     try {
-      const rows = (this.stmtKbVecReadOwner?.all(ownerId) ?? []) as Array<{
-        chunk_id: string; owner_kind: string; embedding: unknown;
-      }>;
+      const rows = this.readKbOwnerRows(ownerId);
       const entries: Array<{ chunkId: string; ownerKind: string; vec: Float32Array }> = [];
       for (const r of rows) {
         const vec = VectorStore.vecFromCell(r.embedding, this.dimensions);

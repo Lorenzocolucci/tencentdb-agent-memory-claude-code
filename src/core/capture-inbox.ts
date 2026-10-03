@@ -82,6 +82,13 @@ export interface CaptureInboxOptions<T> {
   isOwner?: () => boolean;
   /** How many processed idempotency keys to remember (default 2000). */
   processedCap?: number;
+  /**
+   * false = enqueue-only (the gateway when a worker process drains the same
+   * directory): files are written durably, never processed here. Because another
+   * process then owns `processed-ids.log`, the idempotency check re-reads it when
+   * its mtime changes. Default true.
+   */
+  drain?: boolean;
 }
 
 const defaultYield = (): Promise<void> => new Promise((r) => setImmediate(r));
@@ -97,6 +104,9 @@ export class CaptureInbox<T = unknown> {
   private readonly yieldToLoop: () => Promise<void>;
   private readonly isOwner: () => boolean;
   private readonly processedCap: number;
+  private readonly drainEnabled: boolean;
+  /** mtime of processed-ids.log at the last load (enqueue-only mode reloads on change). */
+  private processedMtimeMs = -1;
   /** Insertion-ordered set of keys already written (oldest evicted first). */
   private readonly processed = new Set<string>();
   private notOwnerLogged = false;
@@ -120,6 +130,7 @@ export class CaptureInbox<T = unknown> {
     this.yieldToLoop = opts.yieldToLoop ?? defaultYield;
     this.isOwner = opts.isOwner ?? (() => true);
     this.processedCap = opts.processedCap ?? DEFAULT_PROCESSED_CAP;
+    this.drainEnabled = opts.drain !== false;
   }
 
   /** Create the directories and replay whatever a previous process left behind. */
@@ -130,6 +141,11 @@ export class CaptureInbox<T = unknown> {
     const leftover = (await this.listPending()).length;
     if (leftover > 0) this.logger?.info(`${TAG} replaying ${leftover} pending capture(s) from a previous run`);
     this.kick();
+  }
+
+  /** Ask the drain loop to look for work now (no-op when stopped, not owner, or enqueue-only). */
+  poke(): void {
+    if (this.started) this.kick();
   }
 
   /** Stop draining after the current item; pending files stay on disk for the next start. */
@@ -157,6 +173,7 @@ export class CaptureInbox<T = unknown> {
     const write = async (): Promise<EnqueueResult> => {
       await mkdir(this.dir, { recursive: true });
       if (key) {
+        if (!this.drainEnabled) await this.refreshProcessed();
         if (this.processed.has(key)) return { id: key, duplicate: true };
         const queued = (await this.listPending()).find((n) => n.endsWith(`-${key}.json`));
         if (queued) return { id: queued.slice(0, -".json".length), duplicate: true };
@@ -196,8 +213,18 @@ export class CaptureInbox<T = unknown> {
   }
 
   private async loadProcessed(): Promise<void> {
-    const text = await readFile(join(this.dir, PROCESSED_FILE), "utf-8").catch(() => "");
+    const file = join(this.dir, PROCESSED_FILE);
+    this.processedMtimeMs = (await stat(file).catch(() => null))?.mtimeMs ?? -1;
+    const text = await readFile(file, "utf-8").catch(() => "");
     for (const line of text.split("\n")) if (line) this.processed.add(line);
+  }
+
+  /** Enqueue-only mode: the worker process appends to processed-ids.log, so re-read it when it changed. */
+  private async refreshProcessed(): Promise<void> {
+    const m = (await stat(join(this.dir, PROCESSED_FILE)).catch(() => null))?.mtimeMs ?? -1;
+    if (m === this.processedMtimeMs) return;
+    this.processed.clear();
+    await this.loadProcessed();
   }
 
   /** Remember a written key; bounded, persisted atomically (tmp + rename). */
@@ -223,7 +250,7 @@ export class CaptureInbox<T = unknown> {
   }
 
   private kick(): void {
-    if (this.stopped) return;
+    if (this.stopped || !this.drainEnabled) return;
     if (!this.isOwner()) {
       if (!this.notOwnerLogged) {
         this.notOwnerLogged = true;

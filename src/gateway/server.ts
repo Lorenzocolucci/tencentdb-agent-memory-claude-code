@@ -25,6 +25,7 @@ import { TdaiCore } from "../core/tdai-core.js";
 import { CaptureInbox } from "../core/capture-inbox.js";
 import { StandaloneHostAdapter } from "../adapters/standalone/host-adapter.js";
 import { join as joinPath } from "node:path";
+import { fileURLToPath } from "node:url";
 import { loadGatewayConfig } from "./config.js";
 import type { GatewayConfig } from "./config.js";
 import { initDataDirectories } from "../utils/pipeline-factory.js";
@@ -58,10 +59,14 @@ import type {
 import { parseKbDelta } from "../core/kb/extraction-schema.js";
 import { buildRawDeltaFromFacts } from "./kb-write-delta.js";
 import type { Logger } from "../core/types.js";
-import { validateAndNormalizeRaw, fillTimestamps, SeedValidationError } from "../core/seed/input.js";
-import { executeSeed } from "../core/seed/seed-runtime.js";
-import type { SeedProgress } from "../core/seed/types.js";
-import { startEventLoopMonitor } from "../core/diagnostics/event-loop-monitor.js";
+import { fillTimestamps } from "../core/seed/input.js";
+import { SeedValidationError } from "../core/seed/input.js";
+import { runSeedRequest, sanitizeConfigOverride as sanitizeOverride } from "./seed-service.js";
+import { createCaptureProcessor } from "./capture-processor.js";
+import { WorkerSupervisor, WorkerRemoteError, type WorkerStatus } from "../worker/worker-supervisor.js";
+import { WorkerUnavailableError } from "../core/heavy-delegate.js";
+import type { WorkerEvent } from "../worker/protocol.js";
+import { startEventLoopMonitor, readEventLoopLag } from "../core/diagnostics/event-loop-monitor.js";
 import { beginHeavyTask, endHeavyTask } from "../core/diagnostics/inflight-registry.js";
 import { acquireGatewayLock, type GatewayLock } from "./gateway-lock.js";
 import { DEADLINE_HEADER, resolveRecallTimeoutMs } from "./recall-deadline.js";
@@ -160,61 +165,30 @@ function sendError(res: http.ServerResponse, status: number, message: string): v
   sendJson(res, status, { error: message } satisfies GatewayErrorResponse);
 }
 
-// ============================
-// Config-override sanitization (security)
-// ============================
-
-/** Credential / endpoint keys that an external caller must NEVER be able to set
- *  via /seed's `config_override`. Allowing `baseUrl` would let an authenticated
- *  caller redirect our LLM/embedding traffic (and the bundled API key) to an
- *  attacker-controlled server (key exfiltration / SSRF); allowing `apiKey`
- *  would let them swap in their own key or read ours back indirectly. */
-const FORBIDDEN_OVERRIDE_KEYS = ["apiKey", "baseUrl", "proxyUrl"] as const;
-/** Sub-objects of the plugin config that carry credentials/endpoints. */
-const CREDENTIAL_SECTIONS = ["llm", "embedding"] as const;
-
-/**
- * Return a NEW, sanitized copy of a `config_override` object with credential and
- * endpoint keys (apiKey / baseUrl / proxyUrl) stripped from its `llm` and
- * `embedding` sub-objects. The original is never mutated. Everything else
- * (tuning knobs like model, maxTokens, temperature, timeoutMs, dimensions, …)
- * is preserved so legitimate overrides keep working.
- *
- * `stripped` lists the dotted paths that were removed, so the caller can log a
- * security-relevant event when an override tries to set forbidden keys.
- */
-export function sanitizeConfigOverride(
-  override: Record<string, unknown> | undefined | null,
-): { sanitized: Record<string, unknown>; stripped: string[] } {
-  const stripped: string[] = [];
-  if (!override || typeof override !== "object") {
-    return { sanitized: {}, stripped };
-  }
-
-  // Shallow copy of the top level (immutability — never touch the input).
-  const sanitized: Record<string, unknown> = { ...override };
-
-  for (const section of CREDENTIAL_SECTIONS) {
-    const sub = sanitized[section];
-    if (sub && typeof sub === "object" && !Array.isArray(sub)) {
-      // Copy the sub-object and delete forbidden keys from the COPY only.
-      const subCopy: Record<string, unknown> = { ...(sub as Record<string, unknown>) };
-      for (const key of FORBIDDEN_OVERRIDE_KEYS) {
-        if (key in subCopy) {
-          delete subCopy[key];
-          stripped.push(`${section}.${key}`);
-        }
-      }
-      sanitized[section] = subCopy;
-    }
-  }
-
-  return { sanitized, stripped };
-}
+/** Re-exported from seed-service.ts (kept here: tests and callers import it from the server module). */
+export const sanitizeConfigOverride = sanitizeOverride;
 
 // ============================
 // Gateway Server
 // ============================
+
+/** How heavy work is executed (Phase 5). */
+export interface GatewayOptions {
+  /**
+   * `process` (the daemon default, see cli.ts): a supervised worker process owns every heavy
+   * job and this process only serves HTTP. `inline` (default for library/test use, and
+   * `TDAI_WORKER=inline` as a rollback switch): everything runs in this process, as before.
+   */
+  workerMode?: "process" | "inline";
+  /** Worker entry file; defaults to the sibling `../worker/worker-main.mjs` of the built bundle. */
+  workerEntry?: string;
+  /** Node flags for the worker child (tests pass the tsx loader). */
+  workerExecArgv?: string[];
+  workerEnv?: NodeJS.ProcessEnv;
+}
+
+/** Heap cap of the worker process (it holds its own nav index + extraction state). */
+const WORKER_MAX_OLD_SPACE_MB = 3072;
 
 export class TdaiGateway {
   private config: GatewayConfig;
@@ -230,6 +204,10 @@ export class TdaiGateway {
   private ready = false;
   /** Phase 4 proactive layer (PreToolUse matcher); built lazily from the live store. */
   private pretool: PretoolService | undefined;
+  /** Phase 5: supervised worker process (null in inline mode). */
+  private supervisor: WorkerSupervisor | null = null;
+  private navReloadRunning = false;
+  private navReloadPending = false;
 
   // Cached embedding-liveness result (see HEALTH_EMBEDDING_TTL_MS). null = not
   // probed yet. We never let a probe failure throw out of /health.
@@ -237,9 +215,10 @@ export class TdaiGateway {
   /** In-flight probe promise, so concurrent /health calls share one probe. */
   private embeddingProbeInFlight: Promise<boolean> | null = null;
 
-  constructor(configOverrides?: Partial<GatewayConfig>) {
+  constructor(configOverrides?: Partial<GatewayConfig>, options: GatewayOptions = {}) {
     this.config = loadGatewayConfig(configOverrides);
     this.logger = createConsoleLogger();
+    const processMode = options.workerMode === "process";
 
     // Create host adapter
     const adapter = new StandaloneHostAdapter({
@@ -249,34 +228,34 @@ export class TdaiGateway {
       platform: "gateway",
     });
 
-    // Create core
+    // Create core. In process mode this is the HTTP side only: no scheduler, nav index
+    // follows the worker's snapshot, heavy work goes to the supervisor (set below).
     this.core = new TdaiCore({
       hostAdapter: adapter,
       config: this.config.memory,
       sessionFilter: new SessionFilter(this.config.memory.capture.excludeAgents),
+      role: processMode ? "gateway" : "full",
     });
+
+    if (processMode) {
+      this.supervisor = new WorkerSupervisor({
+        entry: options.workerEntry ?? defaultWorkerEntry(),
+        execArgv: options.workerExecArgv ?? [`--max-old-space-size=${WORKER_MAX_OLD_SPACE_MB}`, ...inheritedLoaderArgs()],
+        env: options.workerEnv,
+        logger: this.logger,
+        onEvent: (event) => this.onWorkerEvent(event),
+      });
+      this.core.setHeavyDelegate(this.supervisor);
+    }
 
     this.captureInbox = new CaptureInbox<CaptureRequest>({
       dir: joinPath(this.config.data.baseDir, "capture-inbox"),
       logger: this.logger,
       // Only the lock owner may drain (a second drainer writes every capture twice).
       isOwner: () => this.lock !== null,
-      process: async ({ id, body }) => {
-        const startMs = Date.now();
-        const result = await this.core.handleTurnCommitted({
-          userText: body.user_content,
-          assistantText: body.assistant_content,
-          messages: body.messages ?? [
-            { role: "user", content: body.user_content },
-            { role: "assistant", content: body.assistant_content },
-          ],
-          sessionKey: body.session_key,
-          sessionId: body.session_id,
-        });
-        this.logger.info(
-          `Capture ${id} written in ${Date.now() - startMs}ms: l0=${result.l0RecordedCount} session=${body.session_key}`,
-        );
-      },
+      // Process mode: the gateway only enqueues (durable file); the worker drains.
+      drain: !processMode,
+      process: createCaptureProcessor(this.core, this.logger),
     });
   }
 
@@ -309,6 +288,9 @@ export class TdaiGateway {
       await this.captureInbox.start();
       this.ready = true;
       this.logger.info("Gateway ready");
+      // Heavy work lives in the worker: spawn it only once this process owns the lock and
+      // the store schema is initialised. Non-blocking: recall never waits for the worker.
+      this.supervisor?.start();
 
       // Immune system: resume any extraction backlog frozen by the previous
       // shutdown (restart amnesia). Fire-and-forget so it never blocks boot —
@@ -379,6 +361,10 @@ export class TdaiGateway {
 
     // Finish the capture in flight, leave the rest on disk for the next start.
     await this.captureInbox.stop();
+    // Worker: let it finish its current capture item, then exit (it also exits when this channel closes).
+    await this.supervisor?.stop().catch((err) => {
+      this.logger.warn(`Worker stop failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
     await this.core.destroy();
     await this.lock?.release().catch((err) => {
       this.logger.warn(`Could not release gateway lock: ${err instanceof Error ? err.message : String(err)}`);
@@ -449,6 +435,12 @@ export class TdaiGateway {
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      if (err instanceof WorkerUnavailableError) {
+        // Heavy operation while the worker restarts: the caller retries; recall/capture are unaffected.
+        this.logger.warn(`Request [${method} ${pathname}] needs the worker, which is unavailable: ${msg}`);
+        sendError(res, 503, msg);
+        return;
+      }
       this.logger.error(`Request error [${method} ${pathname}]: ${msg}`);
       sendError(res, 500, msg);
     }
@@ -505,6 +497,8 @@ export class TdaiGateway {
       },
       embedding: embeddingOk ? "ok" : "failing",
       memory: readMemoryStats(),
+      event_loop: this.readLoopLag(),
+      ...(this.supervisor ? { worker: this.workerHealth(this.supervisor.status()) } : {}),
       last_capture_at: await this.readLastCaptureAt(),
       ...(await this.captureInbox.status().then(
         (s) => ({
@@ -659,6 +653,7 @@ export class TdaiGateway {
     const accepted = Array.isArray(body.messages) && body.messages.length > 0 ? body.messages.length : 2;
     const idempotencyKey = typeof body.idempotency_key === "string" ? body.idempotency_key : undefined;
     const { id, duplicate } = await this.captureInbox.enqueue(body, { idempotencyKey });
+    if (!duplicate) this.supervisor?.notifyCapture();
     this.logger.info(
       duplicate
         ? `Capture ${id} duplicate ignored (idempotency_key already queued or written): session=${body.session_key}`
@@ -954,107 +949,113 @@ export class TdaiGateway {
       return;
     }
 
-    // Validate and normalize input (reuses seed CLI's validation layers 2-6)
-    let input;
     try {
-      input = validateAndNormalizeRaw(body.data, {
-        sessionKey: body.session_key,
-        strictRoundRole: body.strict_round_role,
-        autoFillTimestamps: body.auto_fill_timestamps ?? true,
-      });
+      // Minutes of synchronous SQLite + LLM work: in process mode it runs in the worker.
+      const response = this.supervisor
+        ? await this.supervisor.request<SeedResponse>("seed", { body })
+        : await runSeedRequest(body, { config: this.config, logger: this.logger });
+      sendJson(res, 200, response);
     } catch (err) {
       if (err instanceof SeedValidationError) {
-        sendJson(res, 400, {
-          error: err.message,
-          validation_errors: err.errors,
-        });
+        sendJson(res, 400, { error: err.message, validation_errors: err.errors });
+        return;
+      }
+      if (err instanceof WorkerRemoteError && err.code === "seed-validation") {
+        sendJson(res, 400, { error: err.message, validation_errors: err.details });
         return;
       }
       throw err;
     }
-
-    this.logger.info(
-      `Seed request: ${input.sessions.length} session(s), ` +
-      `${input.totalRounds} round(s), ${input.totalMessages} message(s)`,
-    );
-
-    // Resolve output directory: use gateway's data dir with a timestamped subfolder
-    const now = new Date();
-    const pad = (n: number) => String(n).padStart(2, "0");
-    const ts =
-      `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-` +
-      `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-    const outputDir = `${this.config.data.baseDir}/seed-${ts}`;
-
-    // Merge config overrides if provided
-    // Start with the base memory config + inject llm config from gateway settings
-    const baseConfig = this.config.memory as unknown as Record<string, unknown>;
-    let pluginConfig: Record<string, unknown> = {
-      ...baseConfig,
-      llm: {
-        enabled: true,
-        baseUrl: this.config.llm.baseUrl,
-        apiKey: this.config.llm.apiKey,
-        model: this.config.llm.model,
-        maxTokens: this.config.llm.maxTokens,
-        // RC5: honor configured temperature (Kimi/Moonshot requires exactly 1).
-        temperature: this.config.llm.temperature,
-        timeoutMs: this.config.llm.timeoutMs,
-      },
-    };
-    if (body.config_override) {
-      // SECURITY: strip credential/endpoint keys (apiKey / baseUrl / proxyUrl)
-      // from the llm + embedding sections BEFORE merging. Without this, an
-      // authenticated caller could redirect baseUrl to an attacker-controlled
-      // server and exfiltrate the bundled API key (key exfil / SSRF).
-      const { sanitized: safeOverride, stripped } = sanitizeConfigOverride(body.config_override);
-      if (stripped.length > 0) {
-        this.logger.warn(
-          `Seed config_override attempted to set forbidden credential/endpoint key(s): ` +
-          `${stripped.join(", ")} — ignored`,
-        );
-      }
-      for (const key of Object.keys(safeOverride)) {
-        const baseVal = pluginConfig[key];
-        const overVal = safeOverride[key];
-        if (baseVal && typeof baseVal === "object" && !Array.isArray(baseVal) &&
-            overVal && typeof overVal === "object" && !Array.isArray(overVal)) {
-          pluginConfig[key] = { ...(baseVal as Record<string, unknown>), ...(overVal as Record<string, unknown>) };
-        } else {
-          pluginConfig[key] = overVal;
-        }
-      }
-    }
-
-    // Execute seed pipeline (blocking — this may take minutes for large inputs)
-    const summary = await executeSeed(input, {
-      outputDir,
-      openclawConfig: {},
-      pluginConfig,
-      logger: this.logger as import("../utils/pipeline-factory.js").PipelineLogger,
-      onProgress: (progress: SeedProgress) => {
-        this.logger.debug?.(
-          `Seed progress: [${progress.currentRound}/${progress.totalRounds}] ` +
-          `session=${progress.sessionKey} stage=${progress.stage}`,
-        );
-      },
-    });
-
-    this.logger.info(
-      `Seed complete: sessions=${summary.sessionsProcessed}, rounds=${summary.roundsProcessed}, ` +
-      `l0=${summary.l0RecordedCount}, duration=${(summary.durationMs / 1000).toFixed(1)}s`,
-    );
-
-    const response: SeedResponse = {
-      sessions_processed: summary.sessionsProcessed,
-      rounds_processed: summary.roundsProcessed,
-      messages_processed: summary.messagesProcessed,
-      l0_recorded: summary.l0RecordedCount,
-      duration_ms: summary.durationMs,
-      output_dir: summary.outputDir,
-    };
-    sendJson(res, 200, response);
   }
+
+  // ============================
+  // Worker integration (Phase 5)
+  // ============================
+
+  /** Event-loop lag of THIS process over the rolling window (the number Phase 5 is judged on). */
+  private readLoopLag(): NonNullable<HealthResponse["event_loop"]> | undefined {
+    const lag = readEventLoopLag();
+    return lag ? { p99Ms: Math.round(lag.p99Ms), maxMs: Math.round(lag.maxMs), meanMs: Math.round(lag.meanMs) } : undefined;
+  }
+
+  private workerHealth(s: WorkerStatus): NonNullable<HealthResponse["worker"]> {
+    return {
+      state: s.state,
+      pid: s.pid,
+      restarts: s.restarts,
+      heartbeat_age_s: s.heartbeatAgeS,
+      rss: s.rss,
+      active: [...s.active],
+      lag_p99_ms: s.lagP99Ms === null ? null : Math.round(s.lagP99Ms),
+      lag_max_ms: s.lagMaxMs === null ? null : Math.round(s.lagMaxMs),
+    };
+  }
+
+  /** Worker -> gateway events: keep the nav index in step with what the worker writes. */
+  private onWorkerEvent(event: WorkerEvent): void {
+    const store = this.core.getVectorStore() as
+      | { resyncKbOwners?: (ids: readonly string[]) => number }
+      | undefined;
+    if (event.t === "kb-owners") {
+      store?.resyncKbOwners?.(event.owners);
+    } else if (event.t === "nav-published") {
+      this.reloadNavIndex(true);
+    } else if (event.t === "ready" && !this.isNavIndexActive()) {
+      this.reloadNavIndex(false); // a snapshot may have appeared while the worker booted
+    }
+  }
+
+  private isNavIndexActive(): boolean {
+    const store = this.core.getVectorStore() as { isKbNavIndexActive?: () => boolean } | undefined;
+    return store?.isKbNavIndexActive?.() ?? true;
+  }
+
+  /** Reload the nav index from the worker's snapshot; overlapping requests coalesce into one rerun. */
+  private reloadNavIndex(force: boolean): void {
+    const store = this.core.getVectorStore() as
+      | { followKbNavIndex?: (opts?: { skipIfActive?: boolean }) => Promise<boolean> }
+      | undefined;
+    if (!store?.followKbNavIndex) return;
+    if (this.navReloadRunning) {
+      this.navReloadPending = this.navReloadPending || force;
+      return;
+    }
+    this.navReloadRunning = true;
+    store
+      .followKbNavIndex({ skipIfActive: !force })
+      .catch((err) =>
+        this.logger.warn(`nav index reload failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`),
+      )
+      .finally(() => {
+        this.navReloadRunning = false;
+        if (this.navReloadPending) {
+          this.navReloadPending = false;
+          this.reloadNavIndex(true);
+        }
+      });
+  }
+}
+
+/** `--import <loader>` flags this process was started with (e.g. tsx in dev / benchmarks), so the worker can load the same sources. */
+function inheritedLoaderArgs(): string[] {
+  const out: string[] = [];
+  const argv = process.execArgv;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    if ((a === "--import" || a === "--require" || a === "--loader") && argv[i + 1] !== undefined) {
+      out.push(a, argv[i + 1]!);
+      i++;
+    } else if (a.startsWith("--import=") || a.startsWith("--require=") || a.startsWith("--loader=")) {
+      out.push(a);
+    }
+  }
+  return out;
+}
+
+/** The worker bundle sits next to the gateway bundle: `dist/src/gateway/cli.mjs` -> `dist/src/worker/worker-main.mjs`. */
+function defaultWorkerEntry(): string {
+  const ext = import.meta.url.endsWith(".ts") ? "ts" : "mjs";
+  return fileURLToPath(new URL(`../worker/worker-main.${ext}`, import.meta.url));
 }
 
 // ============================
