@@ -28,7 +28,7 @@ describe("budget.ts vs hooks/hooks.json (drift guard)", () => {
   });
 
   it("matches the agreed budget table", () => {
-    expect(budget.HOOK_TIMEOUT_S.userPromptSubmit).toBe(6.5);
+    expect(budget.HOOK_TIMEOUT_S.userPromptSubmit).toBe(7);
     expect(budget.UPS_DEADLINE_MS).toBe(5_800);
     expect(budget.RECALL_TIMEOUT_MS).toBe(4_500);
     expect(budget.OBSERVE_TIMEOUT_MS).toBe(2_500);

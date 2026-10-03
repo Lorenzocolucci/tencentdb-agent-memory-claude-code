@@ -14,13 +14,13 @@
 /** Seconds, exactly as written in hooks/hooks.json (Claude Code unit). */
 export const HOOK_TIMEOUT_S = {
   sessionStart: 30,
-  userPromptSubmit: 6.5,
+  userPromptSubmit: 7,
   postToolUse: 4,
   postToolUseFailure: 4,
   stop: 45,
 } as const;
 
-/** UserPromptSubmit: one deadline for recall + fallbacks, 0.7 s below the hook timeout. */
+/** UserPromptSubmit: one deadline for recall + fallbacks, 1.2 s below the hook timeout (integer seconds: fractional support in Claude Code is undocumented). */
 export const UPS_DEADLINE_MS = 5_800;
 /** POST /recall client timeout. Also sent to the gateway as X-TDAI-Deadline-Ms. */
 export const RECALL_TIMEOUT_MS = 4_500;
