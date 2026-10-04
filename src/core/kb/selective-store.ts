@@ -19,6 +19,7 @@ import {
 } from "./kb-queries.js";
 import { isNoiseAttribute, spreadActivation, type WeightedNeighbor } from "./spreading-activation.js";
 import { matchedTokenCount, ownerKey, projectsConflict, withSubject } from "./selective-recall.js";
+import { ownersNamingIdentity, projectIdentityIds } from "./project-identity.js";
 
 /** Entity types that are about the USER, not a project: shown in every project. */
 const USER_LEVEL_ENTITY_TYPES = new Set(["person", "preference"]);
@@ -91,17 +92,28 @@ export function ownerProjects(
   return out;
 }
 
-/** Keys (`kind:id`) of the owners that belong provably to ANOTHER project than `project`. */
+/**
+ * Keys (`kind:id`) of the owners that belong provably to ANOTHER project than `project`
+ * and are not ABOUT it: a memory captured elsewhere that names one of `project`'s
+ * identity entities (see project-identity.ts) stays in scope.
+ */
 export function otherProjectKeys(
   db: DatabaseSync,
   owners: ReadonlyArray<{ owner_id: string; owner_kind: string }>,
   project: string | undefined,
+  nowMs?: number,
 ): Set<string> {
   const out = new Set<string>();
   if (!project || project.trim() === "" || owners.length === 0) return out;
+  const foreign: Array<{ owner_id: string; owner_kind: string }> = [];
   for (const [key, info] of ownerProjects(db, owners)) {
-    if (!info.userLevel && projectsConflict(info.project, project)) out.add(key);
+    if (info.userLevel || !projectsConflict(info.project, project)) continue;
+    out.add(key);
+    const at = key.indexOf(":");
+    foreign.push({ owner_kind: key.slice(0, at), owner_id: key.slice(at + 1) });
   }
+  if (foreign.length === 0) return out;
+  for (const key of ownersNamingIdentity(db, foreign, projectIdentityIds(db, project, nowMs))) out.delete(key);
   return out;
 }
 
