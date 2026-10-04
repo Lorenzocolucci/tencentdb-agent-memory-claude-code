@@ -370,7 +370,9 @@ function renderEvent(
   entityOf: (id: string) => KbEntity | null,
 ): SelCandidate | null {
   const event = store.queryEventById?.(fused.ownerId) ?? null;
-  if (!event) return null;
+  // A session recap already has its own <session-recap> block; ranked as a memory it
+  // duplicated it and took the slot of the real answer (live 05/10/2026).
+  if (!event || event.type === "session_recap") return null;
   const firstEntity = event.entities[0];
   const subject = firstEntity ? entityOf(firstEntity)?.name : undefined;
   return {
