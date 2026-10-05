@@ -26,12 +26,27 @@ import { SIGNATURE_TAG_PREFIX } from "./destructive-capture.js";
 import { isRealProjectKey } from "./project-key.js";
 import { willingnessTier } from "./stance-track-record.js";
 import type { PretoolBugRow, PretoolEntityRow, PretoolLessonRow, PretoolSource } from "./pretool-queries.js";
-import { learnToolLesson, matchToolLesson, renderToolLesson, type ToolLesson } from "./tool-lessons.js";
+import { learnToolLesson, matchToolLesson, parseFriction, renderToolLesson, type ToolLesson } from "./tool-lessons.js";
+import { errorKey } from "./repeat-guard.js";
 
 /** Index lifetime. */
 export const REFRESH_MS = 5 * 60 * 1000;
 /** Bug events read per page between event-loop yields. */
 const BUG_PAGE = 500;
+/** How far back a failure counts as "the same error hit another session". */
+export const CROSS_SESSION_DAYS = 14;
+const EMPTY_SET: ReadonlySet<string> = new Set();
+
+function noteErrorSession(into: Map<string, Set<string>>, r: PretoolBugRow): void {
+  const f = parseFriction(r.text);
+  if (!f || !r.session_key) return;
+  const toolInput = f.tool === "Bash" ? { command: f.input } : { file_path: f.input };
+  const k = errorKey({ sessionKey: r.session_key, toolName: f.tool, toolInput, errorText: f.error });
+  if (!k) return;
+  const set = into.get(k.key) ?? new Set<string>();
+  set.add(r.session_key);
+  into.set(k.key, set);
+}
 /** A lesson is "attested" (may block) from this many evidence events… */
 export const ATTESTED_EVIDENCE = 3;
 const MAX_TRACKED_SESSIONS = 200;
@@ -40,7 +55,7 @@ const MAX_TEXT = 220;
 
 export type PretoolPhase = "pre" | "failure";
 export type PretoolSeverity = "warn" | "deny";
-export type PretoolKind = "lesson" | "recurring-bug";
+export type PretoolKind = "lesson" | "recurring-bug" | "repeat";
 
 export interface PretoolRequest {
   sessionKey: string;
@@ -330,6 +345,8 @@ export class PretoolMatcher {
   private readonly shown = new Map<string, Set<string>>();
   /** Tool-behaviour lessons (tool-lessons.ts), rebuilt with the index. */
   private toolLessons: ToolLesson[] = [];
+  /** Error key → sessions it hit in the last CROSS_SESSION_DAYS (see repeat-guard.ts). */
+  private errorSessions = new Map<string, Set<string>>();
   private readonly now: () => number;
   private readonly refreshMs: number;
 
@@ -385,6 +402,8 @@ export class PretoolMatcher {
       if (entry) projectBucket(next, tag).lessons.push(entry);
     }
 
+    const errorSessions = new Map<string, Set<string>>();
+    const since = new Date(this.now() - CROSS_SESSION_DAYS * 86_400_000).toISOString();
     let after = "";
     for (;;) {
       await yieldToEventLoop();
@@ -393,10 +412,12 @@ export class PretoolMatcher {
       after = page[page.length - 1].id;
       this.indexBugPage(next, page);
       for (const r of page) if (evidenceIds.has(r.id)) evidenceText.set(r.id, r.text);
+      for (const r of page) if (r.session_key && r.ts && r.ts >= since) noteErrorSession(errorSessions, r);
       if (page.length < BUG_PAGE) break;
     }
 
     this.toolLessons = buildToolLessons(allLessons, evidenceText);
+    this.errorSessions = errorSessions;
     this.index = next;
     this.builtAt = this.now();
   }
@@ -417,6 +438,11 @@ export class PretoolMatcher {
   }
 
   /** Synchronous, in-memory. At most one item; null = say nothing. */
+  /** Sessions (other than none) where this error key happened recently. */
+  sessionsWithError(key: string): ReadonlySet<string> {
+    return this.errorSessions.get(key) ?? EMPTY_SET;
+  }
+
   match(req: PretoolRequest): PretoolItem | null {
     this.kickRefresh();
     if (!this.index) return null;

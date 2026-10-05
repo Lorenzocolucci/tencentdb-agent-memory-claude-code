@@ -36,6 +36,9 @@ export interface PretoolBugRow {
   project: string;
   text: string;
   entities_json: string;
+  /** For cross-session repeat counting (optional: older sources may omit them). */
+  session_key?: string;
+  ts?: string;
 }
 
 /** What the matcher needs from storage. Injectable so tests need no SQLite. */
@@ -84,7 +87,7 @@ export function createPretoolSource(db: DatabaseSync): PretoolSource {
     listBugEvents(afterId: string, limit: number): PretoolBugRow[] {
       return db
         .prepare(
-          `SELECT id, project, text, entities_json FROM events
+          `SELECT id, project, text, entities_json, session_key, ts FROM events
             WHERE type = 'bug' AND namespace = ? AND id > ?
             ORDER BY id ASC LIMIT ?`,
         )

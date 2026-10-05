@@ -64,14 +64,22 @@ export function parseFriction(text: string): FrictionParts | null {
  * bounded. "" when too short to mean anything.
  */
 export function errorPhrase(error: string): string {
-  const t = error
-    .replace(/<\/?[\w_-]+>/g, " ")
-    .toLowerCase()
+  const t = maskPaths(error.replace(/<\/?[\w_-]+>/g, " ").toLowerCase())
     .replace(/\d{4,}/g, "#")
     .replace(/\s+/g, " ")
     .trim();
   const sentence = (t.split(/(?<=[.!?])\s/)[0] ?? t).slice(0, PHRASE_CHARS).trim();
   return sentence.length >= 8 ? sentence : "";
+}
+
+/**
+ * Paths vary per worktree/temp dir while the error is the same: live 05/10/2026
+ * "This agent is isolated in the worktree C:\…\agent-ab99…" never recurred as a phrase.
+ */
+export function maskPaths(t: string): string {
+  return t
+    .replace(/[a-z]:[\\/][^\s,;'"`)]*/gi, "<path>")
+    .replace(/(?<![\w.])\/(?:[\w.-]+\/)+[\w.-]*/g, "<path>");
 }
 
 /**
@@ -84,7 +92,8 @@ export function errorPhrase(error: string): string {
  */
 export function isWeakPhrase(p: string): boolean {
   const code = p.match(/^exit code (\d+)$/);
-  if (code) return Number(code[1]) < 124;
+  // 128 is git's generic "fatal" (not a signal: those are 129+), as vague as an application code.
+  if (code) return Number(code[1]) < 124 || Number(code[1]) === 128;
   return /^pre ?tool ?use:\S* hook error/.test(p);
 }
 
