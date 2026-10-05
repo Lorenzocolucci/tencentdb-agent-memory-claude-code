@@ -27,7 +27,7 @@
 | tool lessons (`tool-lessons.ts`) | Lesson "user interaction" learned the phrase `the user doesn't want to proceed with this tool use.` — a denial, not an error; it will fire once per session after a denied Bash call. Added 05/10. | low |
 | `src/core/kb/__tests__/provenance-injection-unchanged.test.ts` | Flaky on CI (failed once on PR #33, passed on rerun and 4/4 locally): renders recall twice around `new Date()`. Added 05/10. | low |
 | Tutor a2a loop | Prompts every 5 minutes from the Tutor agent-to-agent loop are captured as conversation (5 events so far). Added 05/10. | low |
-| Grounded Trust | Dormant: last "ask Lorenzo" on 24/09. Added 05/10. | low |
+| Grounded Trust | Quiet since 24/09 — measured 05/10: NOT broken. 6 of 3.856 memories injected since 20/09 are high-stakes, all already answered by Lorenzo (4 rejected, 1 confirmed). Nothing new to ask. | ~~low~~ |
 | DeepInfra embedder | Timeouts open the circuit breaker several times a day; recall falls back to FTS meanwhile. Added 05/10. | low |
 | `src/gateway/__tests__/gateway-worker-mode.test.ts` ("heavy capture work … does not stall the HTTP loop") | Timing floor (≥360 replies) failed once on CI with 329 on PR #37, which does not touch the gateway. Flaky on slow runners. Added 05/10. | low |
 | temporal validity (superseded memories, e.g. embedder "8B" → "4B") | Detector prototyped (`C:\Users\lo\tdai-probe\supersede-measure.mts`: same versioned-identifier family, different variant, newer, same project): finds the known 8B→4B case, but **0 of 641** memories injected 03–05/10 were superseded — the relevance gate already keeps them out. Not built: revisit if the ledger shows a stale injection. Added 05/10. | low |
