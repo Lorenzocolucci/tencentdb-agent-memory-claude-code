@@ -215,7 +215,9 @@ jobs:
           # 2026-10-03: 1200 -> 1260 for Phase 3 selective recall (+26 KB of source,
           # PR #20). The tarball ships src/ AND dist/; dropping the duplicate is
           # tracked separately and should bring this back down.
-          MAX_KB=1260
+          # 2026-10-05: 1260 -> 1270 for tool-behaviour lessons (PR #33, +3 KB of
+          # source in src/ and dist/). Same duplicate-src/dist note applies.
+          MAX_KB=1270
 
           echo "📦 Package: $TGZ"
           echo "   Size: ${SIZE_KB} KB (limit: ${MAX_KB} KB)"

@@ -2,11 +2,11 @@ import http from "node:http";
 import { appendFile, mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { URL, fileURLToPath, pathToFileURL } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
+import { createReadStream, existsSync, openSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, join, parse, resolve } from "node:path";
 import { spawn } from "node:child_process";
-import { createReadStream, existsSync, openSync, readFileSync, readdirSync, statSync } from "node:fs";
 import net from "node:net";
-import { homedir } from "node:os";
 import { createInterface } from "node:readline";
 /** POST /recall client timeout. Also sent to the gateway as X-TDAI-Deadline-Ms. */
 const RECALL_TIMEOUT_MS = 4500;
@@ -416,12 +416,57 @@ function getSessionKey(cwd) {
 	return createHash("sha256").update(normalized).digest("hex").slice(0, 16);
 }
 /**
-* Human-readable project name for a working directory: the basename of the
-* resolved cwd (e.g. C:\…\tencentdb-agent-memory → "tencentdb-agent-memory").
-* Used to select per-project principles. Returns "" for a root/empty path.
+* Project name for a working directory: the name of the git REPOSITORY it belongs
+* to, so a subfolder (`C:\Shop\backend`) and a linked worktree
+* (`C:\Shop\.claude\worktrees\agent-…`, `C:\Shop-b`) are all "Shop". Outside a
+* repository it is the folder name. A repository nested inside another one
+* (`C:\Shop\frontend` with its own `.git`) belongs to the OUTER one: the product
+* is the outermost repository. A submodule is its own project. The home
+* directory and its ancestors
+* never count, so a dotfiles repo in home cannot swallow every project.
+* Used for recall scope, event tags and per-project principles.
+* Returns "" for a root/empty path.
 */
 function getProjectName(cwd) {
-	return basename(resolve(cwd));
+	const start = resolve(cwd);
+	return basename(outermostRepo(start, 0) ?? start);
+}
+/** Outermost repository directory containing `start`, or undefined. Never throws. */
+function outermostRepo(start, hops) {
+	const stop = new Set(ancestorsOf(resolve(homedir())));
+	let found;
+	for (let dir = start; !stop.has(dir);) {
+		const kind = gitKind(dir);
+		if (kind === "file") return found ?? dir;
+		if (kind === "dir") found = dir;
+		else if (kind !== void 0) found = hops < 4 ? outermostRepo(kind.main, hops + 1) ?? kind.main : dir;
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	return found;
+}
+function ancestorsOf(dir) {
+	const out = [];
+	for (let d = dir;; d = dirname(d)) {
+		out.push(d);
+		if (dirname(d) === d) return out;
+	}
+}
+/** "dir" for a repository, {main} for a linked worktree, "file" for other `.git` files. */
+function gitKind(dir) {
+	const gitPath = resolve(dir, ".git");
+	try {
+		if (!statSync(gitPath).isFile()) return "dir";
+	} catch {
+		return;
+	}
+	try {
+		const gitdir = (readFileSync(gitPath, "utf8").match(/^gitdir:\s*(.+)$/m)?.[1] ?? "").trim().split("\\").join("/");
+		const at = gitdir.lastIndexOf("/.git/worktrees/");
+		if (at > 0) return { main: resolve(gitdir.slice(0, at)) };
+	} catch {}
+	return "file";
 }
 //#endregion
 //#region lib/transcript.ts

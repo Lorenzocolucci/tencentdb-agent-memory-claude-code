@@ -21,6 +21,8 @@ export interface PretoolLessonRow {
   confidence: number;
   stance_willingness: number;
   stance_confirmed_count: number;
+  /** JSON array of the bug event ids the lesson was distilled from. */
+  evidence_event_ids_json?: string;
 }
 
 export interface PretoolEntityRow {
@@ -55,7 +57,7 @@ export function createPretoolSource(db: DatabaseSync): PretoolSource {
       return db
         .prepare(
           `SELECT id, project, domain, trigger_pattern, lesson_text, evidence_count,
-                  confidence, stance_willingness, stance_confirmed_count
+                  confidence, stance_willingness, stance_confirmed_count, evidence_event_ids_json
              FROM lessons
             WHERE namespace = ? AND superseded_by IS NULL`,
         )
