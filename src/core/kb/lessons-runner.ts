@@ -38,6 +38,8 @@ export interface DistillLessonsParams {
   embeddingReader?: EmbeddingReader;
   /** Optional sink so a capped pairwise pass is never silent. */
   logger?: { warn?(msg: string): void };
+  /** Pairwise budget for failure clustering (default MAX_PAIRWISE_BUG_EVENTS). */
+  maxPairwise?: number;
 }
 
 export interface LessonsRunStats {
@@ -216,6 +218,7 @@ export async function distillLessons(
     sinceTs: params.sinceTs,
     embeddingReader: params.embeddingReader,
     logger: params.logger,
+    maxPairwise: params.maxPairwise,
   });
   // Drop clusters that already have a lesson BEFORE applying the maxClusters
   // cap. Without this the cap always re-selected the SAME first N clusters —
