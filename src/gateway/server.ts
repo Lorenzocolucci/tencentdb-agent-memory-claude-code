@@ -548,17 +548,14 @@ export class TdaiGateway {
     // No embedding service configured at all → recall can't work → failing.
     if (!svc) return false;
 
-    // Fast path: an OPEN circuit breaker is authoritative and free.
-    const breaker = svc.getHealth?.();
-    if (breaker && !breaker.healthy) {
-      this.embeddingHealthCache = { ok: false, at: Date.now() };
-      return false;
-    }
-
-    // Serve a fresh cached result.
+    // An OPEN breaker is authoritative only while the last probe is fresh. The breaker
+    // closes on a successful call alone, and an idle gateway makes none: live 05/10/2026
+    // /health said "failing" for minutes after DeepInfra answered 200 again, because
+    // this path returned without ever probing.
+    const breakerOpen = svc.getHealth?.()?.healthy === false;
     const now = Date.now();
     if (this.embeddingHealthCache && now - this.embeddingHealthCache.at < HEALTH_EMBEDDING_TTL_MS) {
-      return this.embeddingHealthCache.ok;
+      return this.embeddingHealthCache.ok && !breakerOpen;
     }
 
     // Coalesce concurrent probes into one.
