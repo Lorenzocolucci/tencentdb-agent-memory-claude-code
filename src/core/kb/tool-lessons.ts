@@ -92,7 +92,8 @@ export function maskPaths(t: string): string {
  */
 export function isWeakPhrase(p: string): boolean {
   const code = p.match(/^exit code (\d+)$/);
-  if (code) return Number(code[1]) < 124;
+  // 128 is git's generic "fatal" (not a signal: those are 129+), as vague as an application code.
+  if (code) return Number(code[1]) < 124 || Number(code[1]) === 128;
   return /^pre ?tool ?use:\S* hook error/.test(p);
 }
 

@@ -38,12 +38,13 @@ export interface PretoolServiceDeps {
 
 export class PretoolService {
   private readonly matcher: PretoolMatcher;
-  private readonly repeats = new RepeatGuard();
+  private readonly repeats: RepeatGuard;
   private pending: PendingCounter[] = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly deps: PretoolServiceDeps) {
     this.matcher = new PretoolMatcher(deps.source, { now: deps.now, logger: deps.logger });
+    this.repeats = new RepeatGuard((key) => this.matcher.sessionsWithError(key));
   }
 
   /** Build from the live store; undefined when the store has no SQLite handle. */

@@ -20,6 +20,8 @@ import { errorPhrase, isUserDenial, isWeakPhrase } from "./tool-lessons.js";
 const MAX_SESSIONS = 200;
 const MAX_KEYS_PER_SESSION = 100;
 const MAX_INPUT_CHARS = 100;
+/** Other sessions hit by the same error that make its FIRST occurrence here worth a word. */
+export const CROSS_SESSION_MIN = 3;
 
 interface Seen {
   count: number;
@@ -68,6 +70,9 @@ export class RepeatGuard {
   /** Insertion-ordered: the oldest session is evicted first. */
   private readonly sessions = new Map<string, Map<string, Seen>>();
 
+  /** @param history sessions where an error key happened recently (from stored failures). */
+  constructor(private readonly history?: (key: string) => ReadonlySet<string>) {}
+
   /** Record a failure; the reminder text when this repeat is worth saying, else null. */
   note(call: FailedCall): string | null {
     const k = errorKey(call);
@@ -82,7 +87,7 @@ export class RepeatGuard {
     const input = inputLabel(call.toolName, call.toolInput);
     if (!prev) {
       if (seen.size < MAX_KEYS_PER_SESSION) seen.set(k.key, { count: 1, lastInput: input });
-      return null;
+      return this.knownTrap(k, call);
     }
     const count = prev.count + 1;
     seen.set(k.key, { count, lastInput: input });
@@ -91,6 +96,19 @@ export class RepeatGuard {
       `Memory (repeat guard): this is the ${ordinal(count)} time in this session that ${call.toolName} fails with ` +
       `"${k.phrase}". Previous attempt: \`${prev.lastInput}\`. Retrying the same way will fail again — ` +
       `read the whole error message and change approach.`
+    );
+  }
+
+  /** First time here, but the same error already hit other sessions: a known trap. */
+  private knownTrap(k: { key: string; phrase: string }, call: FailedCall): string | null {
+    const sessions = this.history?.(k.key);
+    if (!sessions) return null;
+    const others = sessions.size - (sessions.has(call.sessionKey) ? 1 : 0);
+    if (others < CROSS_SESSION_MIN) return null;
+    return (
+      `Memory (repeat guard): this same ${call.toolName} error ("${k.phrase}") already hit ${others} other ` +
+      `sessions in the last two weeks — a known trap, not bad luck. Read the whole error message and change ` +
+      `approach instead of retrying.`
     );
   }
 }
