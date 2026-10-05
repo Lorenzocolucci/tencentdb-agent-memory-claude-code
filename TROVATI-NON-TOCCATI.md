@@ -17,7 +17,7 @@
 | gateway lock `isPidAlive` | PID reuse can make a dead gateway look alive. | low |
 | tests using ports 18421 / 18431 | Fixed ports: parallel runs can collide. | low |
 | `src/core/kb/auto-recall.ts:904` | Leftover Chinese regex `活动时间`. | low |
-| `package.json` files | Package ships both `src/` and `dist/`; this is why the size ratchet had to go 1200 → 1260 KB. | low |
+| `package.json` files | Package ships both `src/` and `dist/` (1200 → 1285 KB by 05/10). `src/` is needed: `openclaw.extensions` loads `./index.ts`. Shrinking needs a compiled OpenClaw entry. | low |
 | distinctiveness real-vectors integration test | Opens the live DB read-write and times out when the gateway holds it. | low |
 | `claude-code-plugin/lib/session-key.ts:29` (`getProjectName`) | Project = basename of cwd: worktrees (`C:\Argus\.claude\worktrees\agent-…`) and subfolders (`C:\Tutor-Agent\backend`) get their own label, so their memories are hidden from the main repo by hard project scope. Added 04/10. **FIXED 05/10, PR #28.** | ~~med~~ |
 | recall project scope (`src/core/kb/selective-recall.ts`, `projectsConflict`) | Scope is by WHERE the conversation happened, not WHAT it is about: 118 events about Sinapsys are labelled Argus / Sofia-AI / RISTRUTTURAZIONE, so "capture inbox" asked here finds nothing. Needs a subject-aware scope design, not a blind relabel. Added 04/10. **FIXED 05/10, PR #29** (learned project identities). | ~~med~~ |
@@ -29,3 +29,5 @@
 | Tutor a2a loop | Prompts every 5 minutes from the Tutor agent-to-agent loop are captured as conversation (5 events so far). Added 05/10. | low |
 | Grounded Trust | Dormant: last "ask Lorenzo" on 24/09. Added 05/10. | low |
 | DeepInfra embedder | Timeouts open the circuit breaker several times a day; recall falls back to FTS meanwhile. Added 05/10. | low |
+| `src/gateway/__tests__/gateway-worker-mode.test.ts` ("heavy capture work … does not stall the HTTP loop") | Timing floor (≥360 replies) failed once on CI with 329 on PR #37, which does not touch the gateway. Flaky on slow runners. Added 05/10. | low |
+| temporal validity (superseded memories, e.g. embedder "8B" → "4B") | Detector prototyped (`C:\Users\lo\tdai-probe\supersede-measure.mts`: same versioned-identifier family, different variant, newer, same project): finds the known 8B→4B case, but **0 of 641** memories injected 03–05/10 were superseded — the relevance gate already keeps them out. Not built: revisit if the ledger shows a stale injection. Added 05/10. | low |
