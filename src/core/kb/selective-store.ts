@@ -20,6 +20,7 @@ import {
 import { isNoiseAttribute, spreadActivation, type WeightedNeighbor } from "./spreading-activation.js";
 import { matchedTokenCount, ownerKey, projectsConflict, withSubject } from "./selective-recall.js";
 import { ownersNamingIdentity, projectIdentityIds } from "./project-identity.js";
+import { inferredSessionProject } from "./session-project-inference.js";
 
 /** Entity types that are about the USER, not a project: shown in every project. */
 const USER_LEVEL_ENTITY_TYPES = new Set(["person", "preference"]);
@@ -49,7 +50,8 @@ function pickProject(...candidates: Array<string | null | undefined>): string {
  * Project of each owner, batched. An event belongs to its own `project` tag or, when
  * that is empty/not real, to the project its session is registered under. A fact
  * belongs to the project of the event it was extracted from, else its entity's tag.
- * Keys of the result are `kind:id`.
+ * Last resort for an untagged, unregistered session: the project its memories are
+ * about (session-project-inference.ts). Keys of the result are `kind:id`.
  */
 export function ownerProjects(
   db: DatabaseSync,
@@ -62,29 +64,30 @@ export function ownerProjects(
   for (const ids of chunks(events, IN_CHUNK)) {
     const rows = db
       .prepare(
-        `SELECT e.id AS id, e.project AS p, sp.project AS sp
+        `SELECT e.id AS id, e.project AS p, sp.project AS sp, e.session_key AS sk
            FROM events e LEFT JOIN session_projects sp ON sp.session_key = e.session_key
           WHERE e.id IN (${ids.map(() => "?").join(",")})`,
       )
-      .all(...ids) as Array<{ id: string; p: string | null; sp: string | null }>;
+      .all(...ids) as Array<{ id: string; p: string | null; sp: string | null; sk: string | null }>;
     for (const r of rows) {
-      out.set(ownerKey("event", r.id), { project: pickProject(r.p, r.sp), userLevel: false });
+      const project = pickProject(r.p, r.sp) || inferredSessionProject(db, r.sk);
+      out.set(ownerKey("event", r.id), { project, userLevel: false });
     }
   }
   for (const ids of chunks(facts, IN_CHUNK)) {
     const rows = db
       .prepare(
-        `SELECT f.id AS id, ev.project AS p, sp.project AS sp, en.project AS ep, en.type AS et
+        `SELECT f.id AS id, ev.project AS p, sp.project AS sp, en.project AS ep, en.type AS et, ev.session_key AS sk
            FROM facts f
            LEFT JOIN events ev ON ev.id = f.source_event_id
            LEFT JOIN session_projects sp ON sp.session_key = ev.session_key
            LEFT JOIN entities en ON en.id = f.entity_id
           WHERE f.id IN (${ids.map(() => "?").join(",")})`,
       )
-      .all(...ids) as Array<{ id: string; p: string | null; sp: string | null; ep: string | null; et: string | null }>;
+      .all(...ids) as Array<{ id: string; p: string | null; sp: string | null; ep: string | null; et: string | null; sk: string | null }>;
     for (const r of rows) {
       out.set(ownerKey("fact", r.id), {
-        project: pickProject(r.p, r.sp, r.ep),
+        project: pickProject(r.p, r.sp, r.ep) || inferredSessionProject(db, r.sk),
         userLevel: USER_LEVEL_ENTITY_TYPES.has(r.et ?? ""),
       });
     }
