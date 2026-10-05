@@ -10,6 +10,7 @@
 import { PretoolMatcher, type PretoolItem, type PretoolRequest } from "./pretool-match.js";
 import { createPretoolSource, getStoreDb } from "./pretool-queries.js";
 import type { PretoolSource } from "./pretool-queries.js";
+import { RepeatGuard } from "./repeat-guard.js";
 
 const TAG = "[memory-tdai][pretool]";
 /** Counter writes are flushed this long after the first pending one. */
@@ -37,6 +38,7 @@ export interface PretoolServiceDeps {
 
 export class PretoolService {
   private readonly matcher: PretoolMatcher;
+  private readonly repeats = new RepeatGuard();
   private pending: PendingCounter[] = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -61,6 +63,10 @@ export class PretoolService {
     let item: PretoolItem | null = null;
     try {
       item = this.matcher.match(req);
+      // Every failure is counted; the repeat reminder speaks only when no lesson (which
+      // carries the fix) already did.
+      const repeat = req.phase === "failure" ? this.repeats.note(req) : null;
+      if (!item && repeat) item = { severity: "warn", kind: "repeat", text: repeat };
     } catch (err) {
       this.deps.logger.warn(`${TAG} match failed (fail open): ${err instanceof Error ? err.message : String(err)}`);
       return null;

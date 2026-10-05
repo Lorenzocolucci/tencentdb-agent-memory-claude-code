@@ -64,14 +64,22 @@ export function parseFriction(text: string): FrictionParts | null {
  * bounded. "" when too short to mean anything.
  */
 export function errorPhrase(error: string): string {
-  const t = error
-    .replace(/<\/?[\w_-]+>/g, " ")
-    .toLowerCase()
+  const t = maskPaths(error.replace(/<\/?[\w_-]+>/g, " ").toLowerCase())
     .replace(/\d{4,}/g, "#")
     .replace(/\s+/g, " ")
     .trim();
   const sentence = (t.split(/(?<=[.!?])\s/)[0] ?? t).slice(0, PHRASE_CHARS).trim();
   return sentence.length >= 8 ? sentence : "";
+}
+
+/**
+ * Paths vary per worktree/temp dir while the error is the same: live 05/10/2026
+ * "This agent is isolated in the worktree C:\…\agent-ab99…" never recurred as a phrase.
+ */
+export function maskPaths(t: string): string {
+  return t
+    .replace(/[a-z]:[\\/][^\s,;'"`)]*/gi, "<path>")
+    .replace(/(?<![\w.])\/(?:[\w.-]+\/)+[\w.-]*/g, "<path>");
 }
 
 /**

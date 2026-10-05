@@ -40,7 +40,7 @@ const MAX_TEXT = 220;
 
 export type PretoolPhase = "pre" | "failure";
 export type PretoolSeverity = "warn" | "deny";
-export type PretoolKind = "lesson" | "recurring-bug";
+export type PretoolKind = "lesson" | "recurring-bug" | "repeat";
 
 export interface PretoolRequest {
   sessionKey: string;
