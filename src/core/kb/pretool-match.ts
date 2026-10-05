@@ -26,6 +26,7 @@ import { SIGNATURE_TAG_PREFIX } from "./destructive-capture.js";
 import { isRealProjectKey } from "./project-key.js";
 import { willingnessTier } from "./stance-track-record.js";
 import type { PretoolBugRow, PretoolEntityRow, PretoolLessonRow, PretoolSource } from "./pretool-queries.js";
+import { learnToolLesson, matchToolLesson, renderToolLesson, type ToolLesson } from "./tool-lessons.js";
 
 /** Index lifetime. */
 export const REFRESH_MS = 5 * 60 * 1000;
@@ -279,6 +280,20 @@ function bugGroupKeys(
   return keys;
 }
 
+/** Tool-shaped lessons learned from their evidence (suppressed stances stay silent). */
+function buildToolLessons(rows: readonly PretoolLessonRow[], evidenceText: ReadonlyMap<string, string>): ToolLesson[] {
+  const out: ToolLesson[] = [];
+  for (const r of rows) {
+    if (willingnessTier(r.stance_willingness) === "suppressed") continue;
+    const texts = parseStringArray(r.evidence_event_ids_json ?? "[]")
+      .map((id) => evidenceText.get(id))
+      .filter((t): t is string => typeof t === "string");
+    const t = learnToolLesson({ id: r.id, domain: r.domain, text: r.lesson_text, evidenceCount: r.evidence_count }, texts);
+    if (t) out.push(t);
+  }
+  return out;
+}
+
 // ── Matcher ──────────────────────────────────────────────────────────────────
 
 export interface PretoolMatcherOptions {
@@ -293,6 +308,8 @@ export class PretoolMatcher {
   private building: Promise<void> | null = null;
   /** sessionKey → "phase:id" already shown (an item speaks once per session per phase). */
   private readonly shown = new Map<string, Set<string>>();
+  /** Tool-behaviour lessons (tool-lessons.ts), rebuilt with the index. */
+  private toolLessons: ToolLesson[] = [];
   private readonly now: () => number;
   private readonly refreshMs: number;
 
@@ -333,7 +350,11 @@ export class PretoolMatcher {
     await yieldToEventLoop();
     const next: Index = new Map();
 
-    const lessons = this.source.listHeadLessons().filter((l) => isRealProjectKey(l.project));
+    const allLessons = this.source.listHeadLessons();
+    const lessons = allLessons.filter((l) => isRealProjectKey(l.project));
+    const evidenceIds = new Set<string>();
+    for (const l of allLessons) for (const id of parseStringArray(l.evidence_event_ids_json ?? "[]")) evidenceIds.add(id);
+    const evidenceText = new Map<string, string>();
     await yieldToEventLoop();
     const lessonFileIds = new Set<string>();
     for (const l of lessons) for (const id of parseTrigger(l.trigger_pattern).files) lessonFileIds.add(id);
@@ -351,9 +372,11 @@ export class PretoolMatcher {
       if (page.length === 0) break;
       after = page[page.length - 1].id;
       this.indexBugPage(next, page);
+      for (const r of page) if (evidenceIds.has(r.id)) evidenceText.set(r.id, r.text);
       if (page.length < BUG_PAGE) break;
     }
 
+    this.toolLessons = buildToolLessons(allLessons, evidenceText);
     this.index = next;
     this.builtAt = this.now();
   }
@@ -377,14 +400,18 @@ export class PretoolMatcher {
   match(req: PretoolRequest): PretoolItem | null {
     this.kickRefresh();
     if (!this.index) return null;
-    if (!isRealProjectKey(req.project)) return null;
-    const bucket = this.index.get(normalizeProjectTag(req.project));
-    if (!bucket) return null;
+    const bucket = isRealProjectKey(req.project) ? this.index.get(normalizeProjectTag(req.project)) : undefined;
 
-    for (const lesson of this.lessonCandidates(bucket, req)) {
-      const item = this.lessonItem(lesson, req);
-      if (item) return item;
+    if (bucket) {
+      for (const lesson of this.lessonCandidates(bucket, req)) {
+        const item = this.lessonItem(lesson, req);
+        if (item) return item;
+      }
     }
+    // Tool-behaviour lessons speak in every project: how a tool fails is not project data.
+    const tool = this.toolLessonItem(req);
+    if (tool) return tool;
+    if (!bucket) return null;
     const bug = this.bugItem(bucket, req);
     return bug && this.firstTime(req, bug.eventId ?? "") ? bug : null;
   }
@@ -401,6 +428,18 @@ export class PretoolMatcher {
       return err !== "" && l.errorSignatures.some((s) => errorMentionsSignature(err, s));
     });
     return hits.sort((a, b) => b.evidenceCount - a.evidenceCount || b.confidence - a.confidence);
+  }
+
+  private toolLessonItem(req: PretoolRequest): PretoolItem | null {
+    if (this.toolLessons.length === 0) return null;
+    const hit = matchToolLesson(this.toolLessons, {
+      phase: req.phase,
+      toolName: req.toolName,
+      command: bashCommand(req.toolName, req.toolInput),
+      errorText: req.errorText,
+    });
+    if (!hit || !this.firstTime(req, `tool:${hit.lesson.id}`)) return null;
+    return { severity: "warn", kind: "lesson", lessonId: hit.lesson.id, text: renderToolLesson(hit.lesson, hit.why) };
   }
 
   private lessonItem(lesson: LessonEntry, req: PretoolRequest): PretoolItem | null {
