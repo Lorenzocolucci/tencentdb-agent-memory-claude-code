@@ -179,6 +179,22 @@ riattribuite); `state.json`/`alarms.json` spostati fuori dalle cartelle BACKUP; 
 **Restano aperti:** validità nel tempo (un ricordo superato non è collegato a quello nuovo: serve disegno lato
 estrazione); il resto è in `TROVATI-NON-TOCCATI.md`.
 
+### 05/10 pomeriggio — errori degli strumenti, fughe fra progetti, solidità (PR #35–#40)
+
+| PR | Cosa | Prova |
+|---|---|---|
+| #35 | il 38% degli eventi (chat claude.ai) non aveva progetto ed era mostrato OVUNQUE: ora il progetto di una conversazione si ricava da ciò di cui parla (`session-project-inference.ts`) | 206/658 conversazioni (7.009 eventi) assegnate, 15/16 giuste su campione; dal vivo la regola Sofia «known_client» non arriva più in Sinapsys, arriva in Sofia |
+| #36 | tre falsi allarmi: testa `powershell -noprofile` troppo generica, il «no» dell'utente imparato come errore, memoria della situazione per solo tipo di compito o da un altro progetto | test |
+| #37 | **guardia delle ripetizioni** (`repeat-guard.ts`): stesso errore di uno strumento 2ª/4ª/8ª volta nella sessione → detto subito; **trappola nota**: se lo stesso errore ha già colpito ≥3 altre sessioni in 14 giorni, parla alla PRIMA volta | replay 800 errori veri (7 gg): 143 promemoria, 109 sull'errore worktree; dal vivo: «already hit 104 other sessions» |
+| #38 | distillazione consapevole degli strumenti: la lezione nomina la causa vera (timeout dello strumento, passo richiesto, blocco di un gancio) | **20 lezioni riscritte dal vivo** (backup + rollback per id in `tdai-backups/redistill-20261005`), 20/20 coerenti, 66 lezioni in testa invariate |
+| #39 | le chiamate «solo testo» al modello offrivano `read_file`: Kimi apriva un file e la risposta tornava vuota | 31 su 601 chiamate; il gruppo che falliva 2/2 ora 3/3 |
+| #40 | `/health` restava «failing» dopo che DeepInfra era tornato (interruttore aperto senza mai riprovare) | test che fallisce senza la correzione; dal vivo `embedding: ok` |
+
+**Misure:** utilità sul traffico vero dal 04/10 **59%** (45/78), silenzio 72,6%. Validità nel tempo: rilevatore
+provato (trova 8B→4B) ma **0 su 641** ricordi iniettati erano superati → non costruito. Grounded Trust: zitto
+perché non ha nulla da chiedere (6 ricordi ad alta posta su 3.856, tutti già risolti). DeepInfra: guasti di rete
+locali (DNS), si richiudono da soli.
+
 ---
 
 ## 3. Quanto sa, oggi (numeri misurati sul DB live)
