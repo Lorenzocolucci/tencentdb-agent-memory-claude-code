@@ -62,7 +62,14 @@ export const LESSON_DISTILL_SYSTEM_PROMPT =
   "- lesson_text: one or two sentences, imperative, actionable. If fixes are unknown,\n" +
   "  describe the class of failure and advise investigation.\n" +
   "- anti_patterns: short phrases of what NOT to do (may be empty).\n" +
-  "- confidence: 0..1, how sure you are this generalises across sessions.";
+  "- confidence: 0..1, how sure you are this generalises across sessions.\n" +
+  "Some classes are mistakes of the AI coding agent in using its own tools, recorded as\n" +
+  "`<Tool> failed on `<input>`: <error>`. The agent itself reads those lessons right after the\n" +
+  "same error, so the lesson is about how to use the tool, not about the project's code:\n" +
+  "name the cause the error message shows (a tool timeout killing a long command, a step the\n" +
+  "tool requires first such as reading a file before editing it, a sandbox or safety-hook\n" +
+  "restriction), and when the error states its own resolution, tell the agent to do exactly\n" +
+  "that. Never advise changing the user's scripts to cope with a limit of the agent's tool.";
 
 // ── Prompt builder ─────────────────────────────────────────────────────────────
 
