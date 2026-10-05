@@ -238,11 +238,6 @@ function createSandboxedTools(workspaceDir: string, logger?: Logger) {
   };
 }
 
-/** Read-only tool subset — used when enableTools=false to avoid empty tools rejection. */
-function createReadOnlyTools(workspaceDir: string, logger?: Logger) {
-  const all = createSandboxedTools(workspaceDir, logger);
-  return { read_file: all.read_file };
-}
 
 // ============================
 // StandaloneLLMRunner
@@ -288,16 +283,19 @@ export class StandaloneLLMRunner implements LLMRunner {
     );
 
     // Select tools based on mode — built ONCE and reused by the fallback attempt.
-    const tools = this.enableTools
-      ? createSandboxedTools(workspaceDir, this.logger)
-      : createReadOnlyTools(workspaceDir, this.logger);
+    // A text-only run offers NO tools (the field is omitted, not an empty list, which
+    // some providers reject). It used to offer read_file while stopping after one
+    // step: when Kimi chose to open a file named in the prompt, the run ended with
+    // empty text (live 05/10/2026: 31 read_file calls in 601 runs; every lesson about
+    // a hook block failed to distill, since those errors always name a script path).
+    const tools = this.enableTools ? createSandboxedTools(workspaceDir, this.logger) : undefined;
 
     // Optionally force the model to write via the write_to_file tool (L3
     // persona). toolChoice pins the first step to that tool, and stopWhen
     // halts as soon as it is called — so there is no risk of a forced-tool
     // loop. Only applies to tool-enabled runs that expose write_to_file.
     const forceWrite =
-      this.enableTools && params.forceWriteTool === true && "write_to_file" in tools;
+      this.enableTools && params.forceWriteTool === true && tools !== undefined && "write_to_file" in tools;
     if (forceWrite) {
       this.logger?.debug?.(`${TAG} Forcing write_to_file tool call (toolChoice + hasToolCall stop).`);
     }
