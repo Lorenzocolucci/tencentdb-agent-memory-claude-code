@@ -45,6 +45,24 @@ function header(tier: Exclude<MatchTier, "none">): string {
     : "🔎 Possibly related — from a loosely similar past situation (low confidence, verify before trusting):";
 }
 
+/**
+ * Fingerprints from a session of another project never match: a situation in one
+ * repo says nothing about another (live 05/10/2026: a RISTRUTTURAZIONE file surfaced
+ * while reading a Sinapsys file). Sessions with no known project stay eligible.
+ */
+export function sameProjectFingerprints(
+  fingerprints: StoredFingerprint[],
+  project: string | undefined,
+  projectOf: (sessionKey: string) => string | undefined,
+  conflict: (a: string, b: string) => boolean,
+): StoredFingerprint[] {
+  if (!project || project.trim() === "") return fingerprints;
+  return fingerprints.filter((fp) => {
+    const p = projectOf(fp.session_key) ?? "";
+    return p.trim() === "" || !conflict(p, project);
+  });
+}
+
 /** Pick the highest-scoring stored fingerprint, or null when none score > 0. */
 function bestMatch(current: Fingerprint, fingerprints: StoredFingerprint[]): { fp: StoredFingerprint; score: number } | null {
   let best: { fp: StoredFingerprint; score: number } | null = null;
