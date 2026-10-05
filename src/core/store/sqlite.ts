@@ -4491,7 +4491,7 @@ export class VectorStore implements IMemoryStore {
   /** @see IMemoryStore.runLessonDistillation */
   async runLessonDistillation(
     llmRunner: LLMRunner,
-    opts: { now: string; namespace?: string; maxClusters?: number },
+    opts: { now: string; namespace?: string; maxClusters?: number; maxPairwise?: number },
   ): Promise<{
     candidates: number;
     inserted: number;
@@ -4513,6 +4513,7 @@ export class VectorStore implements IMemoryStore {
       now: opts.now,
       namespace: opts.namespace,
       maxClusters: opts.maxClusters,
+      maxPairwise: opts.maxPairwise,
       // Pass the store's logger so a capped pairwise pass says so out loud.
       logger: this.logger,
     });

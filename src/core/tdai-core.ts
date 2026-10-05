@@ -48,6 +48,7 @@ import { inferTaskType } from "./hooks/task-type.js";
 import { buildSituationInjection } from "./hooks/fingerprint-injection.js";
 import { canonicalKey } from "./kb/kb-queries.js";
 import { buildFrictionEvent, createFrictionState, type FrictionState } from "./kb/friction-capture.js";
+import { WORKER_MAX_PAIRWISE_BUG_EVENTS } from "./kb/bug-working-set.js";
 import {
   buildDestructiveEvent,
   createDestructiveState,
@@ -904,6 +905,10 @@ export class TdaiCore {
           const stats = await store.runLessonDistillation!(runner, {
             now: new Date().toISOString(),
             maxClusters: 3,
+            // In the worker process the O(N²) pass cannot starve recall, so it sees
+            // the whole failure corpus instead of a 400-event window that froze the
+            // notebook (live 05/10: 1,095 of 1,495 bug events never examined).
+            ...(this.role === "worker" ? { maxPairwise: WORKER_MAX_PAIRWISE_BUG_EVENTS } : {}),
           });
           logDistillationLlmFailures(logger, "lessons", "lesson-distill", stats);
           if (stats.inserted > 0 || stats.superseded > 0) {

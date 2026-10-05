@@ -739,7 +739,7 @@ export interface IMemoryStore {
    */
   runLessonDistillation?(
     llmRunner: import("../types.js").LLMRunner,
-    opts: { now: string; namespace?: string; maxClusters?: number },
+    opts: { now: string; namespace?: string; maxClusters?: number; maxPairwise?: number },
   ): Promise<{
     candidates: number;
     inserted: number;

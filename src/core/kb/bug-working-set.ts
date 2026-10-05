@@ -53,6 +53,15 @@
 /** Pairwise budget. 400 keeps one pass at ~240 ms — see the table above. */
 export const MAX_PAIRWISE_BUG_EVENTS = 400;
 
+/**
+ * Budget when clustering runs in the worker process (Phase 5), where a long
+ * synchronous pass cannot starve live recall. Measured 05/10/2026: the full
+ * corpus (1,495 events) = 7.7 s and 46 clusters, 8 of them covered by no lesson,
+ * against 5 clusters / 1 uncovered inside the 400 window — the notebook had
+ * produced nothing new for a week. 2,500 ≈ 20 s worst case, still off the hot path.
+ */
+export const WORKER_MAX_PAIRWISE_BUG_EVENTS = 2500;
+
 /** Share of the budget reserved for already-covered events (anti-duplicate). */
 export const COVERED_CONTEXT_SHARE = 0.25;
 
