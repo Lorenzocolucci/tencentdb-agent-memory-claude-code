@@ -51,6 +51,11 @@ export interface IngestOptions {
   embeddingService?: EmbeddingService | undefined;
   /** When true, print what WOULD be stored but do NOT write to store or ledger. */
   dryRun: boolean;
+  /**
+   * Session-key / record-id prefix. Default "chatimport" (claude.ai export);
+   * the Claude Code history importer uses its own so the sources stay distinct.
+   */
+  keyPrefix?: string;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -63,13 +68,14 @@ export interface IngestOptions {
 export function buildL0RecordId(
   conversationUuid: string,
   messageUuid: string,
+  keyPrefix = "chatimport",
 ): string {
   const hash = crypto
     .createHash("sha1")
     .update(`${conversationUuid}|${messageUuid}`)
     .digest("hex")
     .slice(0, 12);
-  return `l0_chatimport_${hash}`;
+  return `l0_${keyPrefix}_${hash}`;
 }
 
 /**
@@ -99,8 +105,9 @@ export async function ingestConversation(
   opts: IngestOptions,
 ): Promise<IngestStats> {
   const { store, ledger, embeddingService, dryRun } = opts;
+  const keyPrefix = opts.keyPrefix ?? "chatimport";
 
-  const sessionKey = `chatimport_${conv.uuid}`;
+  const sessionKey = `${keyPrefix}_${conv.uuid}`;
   const sessionId = conv.uuid;
   const recordedAt = new Date(mapTimestamp(conv.created_at)).toISOString();
   const embeddingDims = embeddingService?.getDimensions() ?? 0;
@@ -138,7 +145,7 @@ export async function ingestConversation(
       stats.redactionApplied++;
     }
 
-    const recordId = buildL0RecordId(conv.uuid, msg.uuid);
+    const recordId = buildL0RecordId(conv.uuid, msg.uuid, keyPrefix);
     const timestamp = mapTimestamp(msg.created_at);
 
     const l0Record: L0Record = {
