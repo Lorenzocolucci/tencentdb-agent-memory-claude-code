@@ -97,6 +97,15 @@ export function containsPhrase(text: string, p: string): boolean {
   return false;
 }
 
+/**
+ * The user saying no is not a tool mistake: live 05/10/2026 a lesson learned the phrase
+ * "the user doesn't want to proceed with this tool use." and would have lectured the
+ * agent after every denied command.
+ */
+export function isUserDenial(error: string): boolean {
+  return /the user doesn't want to proceed|user rejected|user denied|permission denied by user/i.test(error);
+}
+
 const recurring = (counts: Map<string, number>, min: number): string[] =>
   [...counts].filter(([, n]) => n >= min).sort((a, b) => b[1] - a[1]).map(([k]) => k);
 
@@ -113,7 +122,7 @@ export function learnToolLesson(
   const parsed: FrictionParts[] = [];
   for (const t of evidenceTexts) {
     const f = parseFriction(t);
-    if (!f) continue;
+    if (!f || isUserDenial(f.error)) continue;
     parsed.push(f);
     bump(tools, f.tool);
     const p = errorPhrase(f.error);
@@ -154,6 +163,7 @@ function reason(l: ToolLesson, call: ToolCall): string | null {
   const head = call.toolName === "Bash" && call.command ? commandHeadOfRaw(call.command) : null;
   const sameCommand = !!head && l.commandHeads.includes(head);
   if (call.phase === "failure") {
+    if (isUserDenial(call.errorText ?? "")) return null;
     const err = errorPhrase(call.errorText ?? "");
     const raw = (call.errorText ?? "").toLowerCase().replace(/\d{4,}/g, "#").replace(/\s+/g, " ");
     const hit = l.errorPhrases.find((p) => containsPhrase(err, p) || containsPhrase(raw, p));

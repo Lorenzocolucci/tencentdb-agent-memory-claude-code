@@ -50,15 +50,24 @@ function jaccard(a: readonly string[], b: readonly string[]): number {
 export function scoreFingerprint(current: Fingerprint, stored: Fingerprint): number {
   let weighted = 0;
   let active = 0;
+  let concrete = 0;
 
   if (current.fileKeys.length > 0 || stored.fileKeys.length > 0) {
-    weighted += W_FILES * jaccard(current.fileKeys, stored.fileKeys);
+    const j = jaccard(current.fileKeys, stored.fileKeys);
+    weighted += W_FILES * j;
     active += W_FILES;
+    concrete += j;
   }
   if (current.errorSignatures.length > 0 || stored.errorSignatures.length > 0) {
-    weighted += W_ERRORS * jaccard(current.errorSignatures, stored.errorSignatures);
+    const j = jaccard(current.errorSignatures, stored.errorSignatures);
+    weighted += W_ERRORS * j;
     active += W_ERRORS;
+    concrete += j;
   }
+  // A task type is a label ("debugging"), not a situation: live 05/10/2026 two moments
+  // with no files and no errors scored 1.0 on task type alone. Without a shared file
+  // or error there is no similarity.
+  if (concrete === 0) return 0;
   if (current.taskType !== "" && stored.taskType !== "") {
     weighted += W_TASK * (current.taskType === stored.taskType ? 1 : 0);
     active += W_TASK;

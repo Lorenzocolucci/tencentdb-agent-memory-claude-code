@@ -114,11 +114,31 @@ const READONLY_HEADS: ReadonlySet<string> = new Set([
  */
 export function commandHead(normalizedLabel: string): string | null {
   const segment = normalizedLabel.split(/&&|\|\||;|\|/)[0] ?? "";
-  const tokens = segment.trim().split(/\s+/).filter((t) => t && !/^\w+=\S*$/.test(t));
+  const tokens = unwrapLauncher(segment.trim().split(/\s+/).filter((t) => t && !/^\w+=\S*$/.test(t)));
   if (tokens.length < 2) return null;
   if (READONLY_HEADS.has(tokens[0])) return null;
   if (tokens[0] === "git" && ["status", "log", "diff", "show", "branch"].includes(tokens[1])) return null;
   return tokens.slice(0, 3).join(" ");
+}
+
+const LAUNCHERS: ReadonlySet<string> = new Set(["powershell", "powershell.exe", "pwsh", "cmd", "cmd.exe", "bash", "sh"]);
+
+/**
+ * A shell launcher says nothing about the command: live 05/10/2026 the head
+ * "powershell -noprofile -command" tied a process listing to a past `New-Item
+ * -ItemType Junction` failure. Skip the launcher and its flags and use the inner
+ * command; a script run with -File keeps the script as its head.
+ */
+function unwrapLauncher(tokens: string[]): string[] {
+  if (!LAUNCHERS.has(tokens[0] ?? "")) return tokens;
+  let i = 1;
+  while (i < tokens.length && /^[-/]/.test(tokens[i]!)) {
+    if (/^-f(ile)?$/.test(tokens[i]!)) return [tokens[0]!, "-file", tokens[i + 1] ?? ""].filter(Boolean);
+    i++;
+  }
+  const inner = tokens.slice(i).map((t, k) => (k === 0 ? t.replace(/^["']/, "") : t));
+  if (inner.length > 0) inner[inner.length - 1] = inner[inner.length - 1]!.replace(/["']$/, "");
+  return inner.filter(Boolean);
 }
 
 /** Head of a raw Bash command, computed exactly like friction-capture's signature label. */

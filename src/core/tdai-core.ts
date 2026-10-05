@@ -45,7 +45,7 @@ import {
   type SessionSituation,
 } from "./hooks/session-situation.js";
 import { inferTaskType } from "./hooks/task-type.js";
-import { buildSituationInjection } from "./hooks/fingerprint-injection.js";
+import { buildSituationInjection, sameProjectFingerprints } from "./hooks/fingerprint-injection.js";
 import { canonicalKey } from "./kb/kb-queries.js";
 import { buildFrictionEvent, createFrictionState, type FrictionState } from "./kb/friction-capture.js";
 import { WORKER_MAX_PAIRWISE_BUG_EVENTS } from "./kb/bug-working-set.js";
@@ -67,7 +67,7 @@ import { CornerstoneInjectionTracker, buildCornerstones } from "./distinctivenes
 import { beginHeavyTask, endHeavyTask } from "./diagnostics/inflight-registry.js";
 import { CornerstoneSessionCache } from "./distinctiveness/cornerstone-cache.js";
 import { AskedTracker, buildGroundedTrustBlock, type AskStore } from "./kb/grounded-trust-ask.js";
-import { resolveSelective } from "./kb/selective-recall.js";
+import { projectsConflict, resolveSelective } from "./kb/selective-recall.js";
 import { performAutoCapture } from "./hooks/auto-capture.js";
 import { executeMemorySearch, formatSearchResponse } from "./tools/memory-search.js";
 import { executeConversationSearch, formatConversationSearchResponse } from "./tools/conversation-search.js";
@@ -1490,7 +1490,12 @@ export class TdaiCore {
         errorSignatures: curSit.errorSignatures,
         taskType: inferTaskType(curSit),
       };
-      const fingerprints = store.queryContextFingerprints?.(NAMESPACE, FP_QUERY_LIMIT) ?? [];
+      const fingerprints = sameProjectFingerprints(
+        store.queryContextFingerprints?.(NAMESPACE, FP_QUERY_LIMIT) ?? [],
+        project,
+        (k) => store.getSessionProject?.(k),
+        projectsConflict,
+      );
       const match = buildSituationInjection(store, current, fingerprints, owners);
       if (match) {
         blocks.push(match.block);
