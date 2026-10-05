@@ -161,6 +161,24 @@ riattribuite); `state.json`/`alarms.json` spostati fuori dalle cartelle BACKUP; 
 - **RAM:** gateway ~0,55 GB + worker ~1 GB su una macchina da 16 GB che spesso ha 1 GB libero.
 - **Utilità vera (≥ 30% usati)** si misura solo dopo giorni d'uso: `npx tsx tools/memory-verdict.mts --since 2026-10-04`.
 
+## 2-quinquies. AGGIORNAMENTO 05/10/2026 — progetto giusto, storia di Code, lezioni sugli strumenti (PR #26–#33)
+
+| PR | Cosa | Prova |
+|---|---|---|
+| #26 | gli eventi da `/observe` nascono col progetto (il 40% nasceva senza) | 1.258 eventi rietichettati (backup `tdai-backups/relabel-20261004`) |
+| #28 | progetto = repo git più esterno (sottocartelle, worktree → il repo; submodule = progetto a sé) | test plugin; rietichettatura per repo lanciata da Lorenzo |
+| #29 | filtro per ARGOMENTO: identità di progetto imparate dai dati (`project-identity.ts`) | prova dal vivo 11 domande: 8 bene (era 6/9) |
+| #30 | i riassunti "dove eravamo" non entrano più fra i ricordi normali | test |
+| #31 | import della storia di Code: `~/.claude/history.jsonl` (4.899 prompt, 27/09/2025 → 29/06/2026) + trascritti rimasti (`tools/import-code-history.mts`) | 273/273 trascritti con gli stessi confini del plugin; digest in corso (319 chiavi) |
+| #32 | il Quaderno degli Errori nel worker raggruppa TUTTO il corpus di errori (la finestra di 400 era ferma) | test; in uso dal 05/10 |
+| #33 | **lezioni sugli strumenti**: ogni lezione impara il suo grilletto dalle sue prove (strumento, errore, comando) e parla subito dopo lo stesso errore, in qualunque progetto (o prima di uno strumento esterno che fallisce spesso) | 35 lezioni con grilletto sul DB vivo; dal vivo `/pretool` Render → avviso una volta sola, `exposure_count` 0 → 1 (prima volta in assoluto) |
+
+**Misure sul traffico vero dal 04/10:** ricordi iniettati e usati **57%** (34/60; era 1,5–6%), turni silenziosi
+74,5%, righe di altri progetti 0, recall annullati 0 dal 03/10 19:42, catture fallite 0, crash del worker 0.
+
+**Restano aperti:** validità nel tempo (un ricordo superato non è collegato a quello nuovo: serve disegno lato
+estrazione); il resto è in `TROVATI-NON-TOCCATI.md`.
+
 ---
 
 ## 3. Quanto sa, oggi (numeri misurati sul DB live)
