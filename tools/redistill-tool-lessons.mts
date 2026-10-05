@@ -12,7 +12,7 @@
  * (same trigger, evidence, project) and marks the old one superseded — nothing is
  * deleted. The ids are saved to --backup so the change can be reverted by id.
  *
- *   npx tsx tools/redistill-tool-lessons.mts [--limit N] [--commit --backup FILE]
+ *   npx tsx tools/redistill-tool-lessons.mts [--limit N] [--ids id1,id2] [--commit --backup FILE]
  *
  * Reads TDAI_LLM_* from the environment like tools/lessons-run.mts; never prints the key.
  */
@@ -33,6 +33,8 @@ const args = process.argv.slice(2);
 const commit = args.includes("--commit");
 const limit = Number(args[args.indexOf("--limit") + 1]) || 15;
 const backup = args.includes("--backup") ? args[args.indexOf("--backup") + 1] : undefined;
+/** Only these lessons (e.g. retry the ones whose distillation failed). */
+const only = args.includes("--ids") ? new Set(args[args.indexOf("--ids") + 1]!.split(",")) : undefined;
 if (commit && !backup) {
   process.stderr.write("STOP: --commit needs --backup FILE (rollback by id).\n");
   process.exit(1);
@@ -73,6 +75,7 @@ const changes: Array<{ oldId: string; newId: string }> = [];
 let done = 0;
 for (const l of heads) {
   if (done >= limit) break;
+  if (only && !only.has(l.id)) continue;
   const ids = JSON.parse(l.evidence_event_ids_json || "[]") as string[];
   const texts = ids.map((id) => (evText.get(id) as { text: string } | undefined)?.text).filter((t): t is string => !!t);
   if (!learnToolLesson({ id: l.id, domain: l.domain, text: l.lesson_text, evidenceCount: l.evidence_count }, texts)) continue;
